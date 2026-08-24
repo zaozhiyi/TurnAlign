@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+build/
+dist/
+
+# Local validation and caches
+validation/
+.pip-cache/
+.test-deps/
+.wheel-test/
+demo-events.jsonl
+
+# Audio, transcripts, subtitles, and model weights stay local
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.aac
+*.ogg
+*.jsonl
+*.srt
+*.vtt
+*.pt
+*.pth
+*.bin
+*.onnx
+*.safetensors
+
+# Secrets and local configuration
+.env
+.env.*
+*.pem
+*.key
+*token*
+*secret*
+
+# Editors and operating systems
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

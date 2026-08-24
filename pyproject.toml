@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "turnalign"
+version = "0.1.0"
+description = "Model-agnostic streaming ASR orchestration primitives"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "TurnAlign contributors" }]
+dependencies = []
+
+[project.optional-dependencies]
+microphone = ["sounddevice>=0.5"]
+server = ["websockets>=14"]
+transformers = ["accelerate>=1.0", "numpy>=1.26", "transformers>=4.57"]
+faster-whisper = ["faster-whisper>=1.1", "numpy>=1.26"]
+funasr = ["funasr>=1.2", "numpy>=1.26"]
+
+[project.scripts]
+turnalign = "turnalign.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
