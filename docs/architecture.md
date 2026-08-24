@@ -4,10 +4,18 @@
 
 The core owns only data contracts and orchestration:
 
-```text
-File / microphone / WebSocket -> AudioChunk -> VAD -> ASR -> Stabilizer
-                  \-> Aligner -----\
-                  \-> Diarizer -----+-> Timeline fusion -> Event sink
+```mermaid
+flowchart LR
+    I[File / microphone / WebSocket] --> A[AudioChunk]
+    A --> V[VAD]
+    V --> R[ASR]
+    R --> S[Stabilizer]
+    A --> L[Aligner]
+    A --> D[Diarizer]
+    S --> F[Timeline fusion]
+    L --> F
+    D --> F
+    F --> E[Event sink]
 ```
 
 ASR text, word timing and speaker turns are independent tracks. A backend may

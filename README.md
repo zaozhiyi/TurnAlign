@@ -18,10 +18,18 @@
 
 ### 处理方式
 
-```text
-音频 -> VAD -> 滑动窗口 ASR -> LocalAgreement -> partial / commit / replace
-          \-> 时间戳轨道 -----------------------\
-          \-> 说话人轨道 ------------------------+-> 时间轴融合 -> JSONL / SRT / TXT
+```mermaid
+flowchart LR
+    A[音频] --> B[VAD]
+    B --> C[滑动窗口 ASR]
+    C --> D[LocalAgreement]
+    D --> E[partial / commit / replace]
+    A --> T[时间戳轨道]
+    A --> S[说话人轨道]
+    E --> F[时间轴融合]
+    T --> F
+    S --> F
+    F --> O[JSONL / SRT / TXT]
 ```
 
 - `LocalAgreement` 比较连续窗口的识别结果，只提交稳定的公共前缀，句尾继续保留为可修改文本。
@@ -139,10 +147,18 @@ TurnAlign is a model-replaceable streaming ASR orchestration prototype. It conne
 
 ### How it works
 
-```text
-Audio -> VAD -> windowed ASR -> LocalAgreement -> partial / commit / replace
-          \-> timestamp track -------------------\
-          \-> speaker track ----------------------+-> timeline fusion -> JSONL / SRT / TXT
+```mermaid
+flowchart LR
+    A[Audio] --> B[VAD]
+    B --> C[Windowed ASR]
+    C --> D[LocalAgreement]
+    D --> E[partial / commit / replace]
+    A --> T[Timestamp track]
+    A --> S[Speaker track]
+    E --> F[Timeline fusion]
+    T --> F
+    S --> F
+    F --> O[JSONL / SRT / TXT]
 ```
 
 - `LocalAgreement` compares consecutive hypotheses and commits their stable common prefix. The tail remains editable.
