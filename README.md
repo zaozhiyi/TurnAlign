@@ -70,7 +70,7 @@ flowchart LR
 - 导出 2777 个非空语音段；时间轴没有乱序和相邻重叠。
 - GLM 正文与 Paraformer 时间轴融合后得到 466 个可读段，局部字符对齐率中位数为 88.6%。
 - 公共事件校验通过，当前单元与集成测试共 41 项，其中包含滚动 partial、WebSocket 本机回环和时间戳/说话人回写测试。
-- AMD RX 7650 GRE 已完成真实硬件验证；macOS MPS 和 NVIDIA CUDA 完成设备探针与选择逻辑测试，尚未进行实体机器性能测试。
+- AMD RX 7650 GRE 已完成真实硬件验证。Apple Silicon Mac Studio 已完成 macOS 实体机器验证，PyTorch 2.13.0 MPS 设备检测、FP16 张量计算和 Transformers Whisper 端到端转录均通过。NVIDIA CUDA 目前完成设备探针与选择逻辑测试，尚未进行实体机器性能测试。
 
 详细记录见 [docs/validation.md](docs/validation.md)。
 
@@ -199,7 +199,7 @@ The test recording is 129.4 minutes of 16 kHz mono audio with background noise, 
 - The export contains 2,777 non-empty speech turns with no invalid ordering or adjacent overlap.
 - Fusion of GLM text with the Paraformer timeline produced 466 readable turns. Median local character alignment was 88.6%.
 - The common event validator passes, along with 41 unit and integration tests, including rolling partials, loopback WebSocket, and alignment/diarization replacement flow.
-- AMD RX 7650 GRE has been tested on physical hardware. macOS MPS and NVIDIA CUDA currently have probe and selection-path coverage, without physical performance benchmarks yet.
+- AMD RX 7650 GRE has been tested on physical hardware. An Apple Silicon Mac Studio has also completed physical macOS validation, including PyTorch 2.13.0 MPS detection, FP16 tensor computation, and end-to-end Transformers Whisper transcription. NVIDIA CUDA currently has probe and selection-path coverage, without physical performance benchmarks yet.
 
 See [docs/validation.md](docs/validation.md) for the full run log and metrics.
 
