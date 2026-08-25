@@ -141,3 +141,13 @@ runtime, device, precision, model revision and fallback reason.
 The online output is intentionally provisional. At utterance end and meeting end,
 the same segment IDs are revised with longer context, better alignment and global
 speaker clustering.
+
+## Offline scheduling
+
+For file transcription, CPU diarization may run concurrently with GPU/MPS ASR
+after the audio has been decoded once. CPU-only combinations remain sequential
+by default to avoid oversubscription. Paraformer alignment supports bounded
+batching after both tracks complete; the default batch of four was selected from
+full-recording benchmarks because larger batches were not monotonically faster.
+The final event reports per-stage wall time and the scheduling mode so performance
+changes remain observable without changing transcript event semantics.

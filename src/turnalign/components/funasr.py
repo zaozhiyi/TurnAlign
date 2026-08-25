@@ -196,6 +196,7 @@ class ParaformerAlignmentBackend:
         model: str = "paraformer-zh",
         device: str = "cpu",
         batch_size_s: int = 60,
+        batch_size: int = 4,
         hub: str = "ms",
         disable_update: bool = True,
         **model_options,
@@ -205,25 +206,41 @@ class ParaformerAlignmentBackend:
             model=model, device=device, hub=hub, disable_update=disable_update, **model_options
         )
         self.batch_size_s = int(batch_size_s)
+        self.batch_size = int(batch_size)
+        if self.batch_size <= 0:
+            raise ValueError("batch_size must be positive")
 
     def align(self, audio: AudioChunk, text: str) -> list[Word]:
-        if audio.sample_rate != 16_000:
+        return self.align_many([(audio, text)])[0]
+
+    def align_many(self, items: list[tuple[AudioChunk, str]]) -> list[list[Word]]:
+        if not items:
+            return []
+        if any(audio.sample_rate != 16_000 for audio, _ in items):
             raise ValueError("Paraformer alignment expects 16 kHz audio")
         result = self.model.generate(
-            input=pcm_to_float32(audio.pcm_s16le, audio.channels),
+            input=[pcm_to_float32(audio.pcm_s16le, audio.channels) for audio, _ in items],
+            batch_size=self.batch_size,
             batch_size_s=self.batch_size_s,
+            disable_pbar=True,
             sentence_timestamp=True,
             output_timestamp=True,
             return_time_stamps=True,
         )
-        item = _result_item(result)
-        return _aligned_words(
-            text,
-            str(item.get("text", "")),
-            item.get("timestamp") or item.get("timestamps") or [],
-            offset=audio.start,
-            duration=audio.duration,
-        )
+        if len(result) != len(items):
+            raise RuntimeError(
+                f"Paraformer returned {len(result)} alignment results for {len(items)} inputs"
+            )
+        aligned = []
+        for (audio, text), item in zip(items, result):
+            aligned.append(_aligned_words(
+                text,
+                str(item.get("text", "")),
+                item.get("timestamp") or item.get("timestamps") or [],
+                offset=audio.start,
+                duration=audio.duration,
+            ))
+        return aligned
 
     def close(self) -> None:
         self.model = None

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from array import array
 from collections.abc import Callable, Iterable, Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
 from time import perf_counter
 
 from .fusion import assign_speakers
@@ -189,6 +190,8 @@ def transcribe_events(
     diarizer: DiarizationBackend | None = None,
     vad_backend: VadBackend | None = None,
     vad_audit: Callable[[dict[str, object]], None] | None = None,
+    recorded_audio: list[AudioChunk] | None = None,
+    parallel_diarization: bool = False,
 ) -> Iterator[TranscriptEvent]:
     """Run either a native-streaming backend or endpointed batch backend."""
     started = perf_counter()
@@ -197,23 +200,44 @@ def transcribe_events(
     last_end = 0.0
     input_end = 0.0
     audio_seconds = 0.0
-    recorded: list[AudioChunk] = []
+    recorded: list[AudioChunk] = list(recorded_audio or [])
+    record_from_source = recorded_audio is None
     commits: list[TranscriptEvent] = []
     vad_speech_seconds = 0.0
     vad_regions = 0
     vad_forced_splits = 0
     vad_last_end = 0.0
+    diarization_seconds = 0.0
+    alignment_seconds = 0.0
+    diarization_executor: ThreadPoolExecutor | None = None
+    diarization_future: Future[list[SpeakerTurn]] | None = None
 
     def observed_chunks() -> Iterator[AudioChunk]:
         nonlocal input_end, audio_seconds
         for chunk in chunks:
             audio_seconds += chunk.duration
             input_end = max(input_end, chunk.start + chunk.duration)
-            if aligner is not None or diarizer is not None:
+            if record_from_source and (aligner is not None or diarizer is not None):
                 recorded.append(chunk)
             yield chunk
 
     source = observed_chunks()
+
+    def run_diarizer() -> list[SpeakerTurn]:
+        nonlocal diarization_seconds
+        if diarizer is None:
+            return []
+        component_started = perf_counter()
+        try:
+            return list(diarizer.diarize(iter(recorded)))
+        finally:
+            diarization_seconds = perf_counter() - component_started
+
+    if parallel_diarization:
+        if diarizer is None or recorded_audio is None:
+            raise ValueError("parallel diarization requires a diarizer and preloaded audio")
+        diarization_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="turnalign-diarizer")
+        diarization_future = diarization_executor.submit(run_diarizer)
 
     def audit_region(
         decision: str,
@@ -312,15 +336,37 @@ def transcribe_events(
                         commits.append(event)
                         index += 1
 
-        turns = list(diarizer.diarize(iter(recorded))) if diarizer is not None else []
-        for event in commits:
+        asr_seconds = perf_counter() - started
+        turns = (
+            diarization_future.result()
+            if diarization_future is not None
+            else run_diarizer()
+        )
+        aligned_words: list[list[Word]] | None = None
+        if aligner is not None:
+            alignment_started = perf_counter()
+            alignment_inputs = [
+                (_slice_audio(recorded, event.start, event.end), event.text)
+                for event in commits
+            ]
+            align_many = getattr(aligner, "align_many", None)
+            if callable(align_many):
+                aligned_words = list(align_many(alignment_inputs))
+                if len(aligned_words) != len(commits):
+                    raise RuntimeError("batch aligner returned the wrong number of results")
+            else:
+                aligned_words = [
+                    aligner.align(audio, text) for audio, text in alignment_inputs
+                ]
+            alignment_seconds = perf_counter() - alignment_started
+
+        for event_index, event in enumerate(commits):
             words = [
                 Word(word.text, word.start, word.end, word.confidence, word.speaker)
                 for word in event.words
             ]
-            if aligner is not None:
-                segment_audio = _slice_audio(recorded, event.start, event.end)
-                words = aligner.align(segment_audio, event.text)
+            if aligned_words is not None:
+                words = aligned_words[event_index]
             if turns and words:
                 words = assign_speakers(words, turns)
             speaker = _speaker_from_words(words) or _speaker_for_interval(event.start, event.end, turns)
@@ -346,6 +392,10 @@ def transcribe_events(
             "processing_seconds": round(elapsed, 3),
             "realtime_factor": round(elapsed / audio_seconds, 4) if audio_seconds else None,
             "speed_x": round(audio_seconds / elapsed, 3) if elapsed else None,
+            "asr_seconds": round(asr_seconds, 3),
+            "diarization_seconds": round(diarization_seconds, 3),
+            "alignment_seconds": round(alignment_seconds, 3),
+            "parallel_diarization": diarization_future is not None,
         }
         if vad_backend is not None:
             metadata.update({
@@ -364,6 +414,8 @@ def transcribe_events(
             metadata=metadata,
         )
     finally:
+        if diarization_executor is not None:
+            diarization_executor.shutdown(wait=True, cancel_futures=True)
         backend.close()
         for component in (vad_backend, aligner, diarizer):
             close = getattr(component, "close", None)

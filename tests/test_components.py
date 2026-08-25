@@ -6,6 +6,7 @@ from turnalign.components.energy_vad import EnergyVadBackend
 from turnalign.components.funasr import (
     CamppDiarizationBackend,
     FsmnVadBackend,
+    ParaformerAlignmentBackend,
     _aligned_words,
 )
 from turnalign.models import AudioChunk, Hypothesis, SpeechSegment
@@ -46,8 +47,10 @@ class FakeVad:
 class FakeModel:
     def __init__(self, result):
         self.result = result
+        self.options = None
 
     def generate(self, **kwargs):
+        self.options = kwargs
         return self.result
 
 
@@ -111,6 +114,20 @@ class FunAsrComponentTests(unittest.TestCase):
         self.assertTrue(all(left.end <= right.start for left, right in zip(words, words[1:])))
         self.assertGreaterEqual(words[0].start, 7.0)
         self.assertLessEqual(words[-1].end, 7.5)
+
+    def test_paraformer_batches_multiple_alignment_requests(self):
+        backend = ParaformerAlignmentBackend.__new__(ParaformerAlignmentBackend)
+        backend.model = FakeModel([
+            {"text": "A", "timestamp": [[0, 100]]},
+            {"text": "B", "timestamp": [[0, 100]]},
+        ])
+        backend.batch_size = 8
+        backend.batch_size_s = 60
+        items = [(chunk(1000, 0.0), "A"), (chunk(1000, 1.0), "B")]
+        with patch("turnalign.components.funasr.pcm_to_float32", return_value=[0.0]):
+            result = backend.align_many(items)
+        self.assertEqual([[word.text for word in words] for words in result], [["A"], ["B"]])
+        self.assertEqual(backend.model.options["batch_size"], 8)
 
     def test_campp_turns_are_merged_and_offset(self):
         backend = CamppDiarizationBackend.__new__(CamppDiarizationBackend)

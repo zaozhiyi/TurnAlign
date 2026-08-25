@@ -3,6 +3,7 @@ import unittest
 import wave
 from array import array
 from pathlib import Path
+from threading import Event
 
 from turnalign.audio import wave_chunks, write_wave
 from turnalign.models import AudioChunk, Hypothesis, SpeakerTurn, Word
@@ -51,12 +52,46 @@ class FakeAligner:
         return [Word(text, audio.start, audio.start + audio.duration)]
 
 
+class FakeBatchAligner(FakeAligner):
+    name = "fake-batch-aligner"
+
+    def __init__(self):
+        self.batch_calls = 0
+
+    def align_many(self, items):
+        self.batch_calls += 1
+        return [self.align(audio, text) for audio, text in items]
+
+
 class FakeDiarizer:
     name = "fake-diarizer"
 
     def diarize(self, chunks):
         items = list(chunks)
         yield SpeakerTurn(items[0].start, items[-1].start + items[-1].duration, "speaker-1")
+
+
+class CoordinatedBackend(FakeBatchBackend):
+    def __init__(self, diarizer_started):
+        super().__init__()
+        self.diarizer_started = diarizer_started
+
+    def transcribe(self, chunks):
+        self.assert_parallel_start()
+        yield from super().transcribe(chunks)
+
+    def assert_parallel_start(self):
+        if not self.diarizer_started.wait(timeout=1):
+            raise AssertionError("diarizer did not start before ASR")
+
+
+class CoordinatedDiarizer(FakeDiarizer):
+    def __init__(self, started):
+        self.started = started
+
+    def diarize(self, chunks):
+        self.started.set()
+        yield from super().diarize(chunks)
 
 
 class AudioTests(unittest.TestCase):
@@ -122,6 +157,30 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(events[1].speaker, "speaker-1")
         self.assertEqual(events[1].words[0].speaker, "speaker-1")
         self.assertEqual(events[-1].metadata["audio_seconds"], 0.2)
+
+    def test_batch_aligner_runs_once_for_all_commits(self):
+        aligner = FakeBatchAligner()
+        backend = FakeBatchBackend()
+        source = [chunk(1500, 0), chunk(0, 0.1), chunk(1500, 0.2), chunk(0, 0.3)]
+        events = list(transcribe_events(
+            source, backend, live=True, silence_seconds=0.1,
+            max_utterance_seconds=1, aligner=aligner,
+        ))
+        self.assertEqual(aligner.batch_calls, 1)
+        self.assertEqual([event.kind for event in events], [
+            "commit", "commit", "replace", "replace", "end",
+        ])
+
+    def test_preloaded_diarization_starts_in_parallel_with_asr(self):
+        started = Event()
+        source = [chunk(1500, 0), chunk(0, 0.1)]
+        events = list(transcribe_events(
+            iter(source), CoordinatedBackend(started), live=True,
+            silence_seconds=0.1, diarizer=CoordinatedDiarizer(started),
+            recorded_audio=source, parallel_diarization=True,
+        ))
+        self.assertTrue(events[-1].metadata["parallel_diarization"])
+        self.assertGreaterEqual(events[-1].metadata["diarization_seconds"], 0)
 
 
 if __name__ == "__main__":

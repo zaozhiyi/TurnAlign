@@ -153,7 +153,8 @@ def _write_events(events, output: Path | None) -> int:
 
 
 def transcribe_file(args) -> int:
-    backend = create_asr(args.backend, _config(args))
+    asr_config = _config(args)
+    backend = create_asr(args.backend, asr_config)
     vad_backend = None
     if args.vad_backend != "none":
         vad_options = _extra_options(args.vad_option)
@@ -161,9 +162,18 @@ def transcribe_file(args) -> int:
             vad_options.setdefault("min_silence_seconds", args.silence_seconds)
             vad_options.setdefault("max_segment_seconds", args.max_utterance_seconds)
         vad_backend = create_component("vad", args.vad_backend, vad_options)
-    aligner = create_component("alignment", args.aligner, _extra_options(args.aligner_option)) if args.aligner else None
-    diarizer = create_component("diarization", args.diarizer, _extra_options(args.diarizer_option)) if args.diarizer else None
-    chunks = file_chunks(args.source, args.chunk_ms, args.ffmpeg)
+    aligner_options = _extra_options(args.aligner_option)
+    diarizer_options = _extra_options(args.diarizer_option)
+    aligner = create_component("alignment", args.aligner, aligner_options) if args.aligner else None
+    diarizer = create_component("diarization", args.diarizer, diarizer_options) if args.diarizer else None
+    parallel_diarization = bool(args.parallel_postprocess and diarizer is not None)
+    if args.parallel_postprocess is None and diarizer is not None:
+        asr_accelerator = asr_config.device.split(":", 1)[0]
+        diarizer_device = str(diarizer_options.get("device", "cpu")).split(":", 1)[0]
+        parallel_diarization = asr_accelerator in {"mps", "cuda", "rocm"} and diarizer_device == "cpu"
+    decoded = file_chunks(args.source, args.chunk_ms, args.ffmpeg)
+    recorded_audio = list(decoded) if parallel_diarization else None
+    chunks = iter(recorded_audio) if recorded_audio is not None else decoded
     vad_output = args.vad_output
     if vad_backend is not None and vad_output is None and args.output is not None:
         vad_output = args.output.with_name(f"{args.output.stem}.vad.jsonl")
@@ -189,6 +199,8 @@ def transcribe_file(args) -> int:
                 diarizer=diarizer,
                 vad_backend=vad_backend,
                 vad_audit=write_vad_audit,
+                recorded_audio=recorded_audio,
+                parallel_diarization=parallel_diarization,
             ),
             args.output,
         )
@@ -313,6 +325,12 @@ def main() -> int:
     transcribe_parser.set_defaults(vad_backend="energy")
     transcribe_parser.add_argument("--vad-option", action="append", default=[], metavar="KEY=VALUE")
     transcribe_parser.add_argument("--vad-output", type=Path, help="VAD speech/silence audit JSONL")
+    transcribe_parser.add_argument(
+        "--parallel-postprocess",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Run CPU diarization alongside GPU ASR (default: auto by device)",
+    )
     _add_backend_arguments(transcribe_parser)
     _add_segmentation_arguments(transcribe_parser)
     _add_postprocess_arguments(transcribe_parser)
