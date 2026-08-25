@@ -62,6 +62,32 @@ flowchart LR
 - 批处理模型在麦克风和 WebSocket 模式下按滚动窗口输出 `partial`，检测到静音或达到最长片段时输出 `commit`；原生流式插件可以直接产生相同事件。
 - WebSocket 接受 PCM16 二进制帧并返回 JSON 事件。协议见 [docs/websocket.md](docs/websocket.md)。
 
+### 私有热词与上下文
+
+TurnAlign 使用同一组参数为不同 ASR 后端提供热词或上下文提示：
+
+```bash
+turnalign transcribe audio.mp3 --backend glm-asr \
+  --hotwords-file /path/to/private-phrases.txt \
+  --context-file /path/to/private-context.txt \
+  --output transcript.jsonl
+```
+
+- `--hotword PHRASE`：添加一个短语，可以重复使用。
+- `--hotwords-file PATH`：读取 UTF-8 词表，每行一个短语；忽略空行和以 `#` 开头的行。
+- `--context TEXT` / `--context-file PATH`：提供主题上下文，仅限支持 prompt 的后端。
+- `--hotword-boost NUMBER`：预留给明确支持加权热词的后端；其他后端会直接报错。
+
+| 后端 | 热词映射 | 自由上下文 |
+|---|---|---|
+| `glm-asr` | 受约束的转录 prompt | 支持 |
+| `transformers-whisper` | Whisper initial prompt | 支持 |
+| `faster-whisper` | 原生 `hotwords` | 支持，通过 `initial_prompt` |
+| `funasr` | 原生 `hotword` | 不支持 |
+| `whisper-cpp` | `--prompt` | 支持 |
+
+实际词表和上下文不会复制到 TurnAlign 事件或 WebSocket ready 消息；只记录使用方式、词条数量和是否使用上下文。不支持的组合会在加载模型权重前失败，不会静默忽略。
+
 ### 已完成的验证
 
 测试音频是一段 129.4 分钟、16 kHz 单声道录音，包含环境噪声、闲聊和两人主讨论。
@@ -72,7 +98,7 @@ flowchart LR
 - 说话人聚类得到 3 个簇：前段环境/闲聊人物 1 个，主讨论人物 2 个。
 - 导出 2777 个非空语音段；时间轴没有乱序和相邻重叠。
 - GLM 正文与 Paraformer 时间轴融合后得到 466 个可读段，局部字符对齐率中位数为 88.6%。
-- 公共事件校验通过，当前单元与集成测试共 41 项，其中包含滚动 partial、WebSocket 本机回环和时间戳/说话人回写测试。
+- 公共事件校验通过，当前单元与集成测试共 58 项，其中包含滚动 partial、WebSocket 本机回环、私有热词脱敏和时间戳/说话人回写测试。
 - AMD RX 7650 GRE 已完成真实硬件验证。Apple Silicon Mac Studio 已完成 macOS 实体机器验证，PyTorch 2.13.0 MPS 设备检测、FP16 张量计算和 Transformers Whisper 端到端转录均通过。NVIDIA CUDA 目前完成设备探针与选择逻辑测试，尚未进行实体机器性能测试。
 
 详细记录见 [docs/validation.md](docs/validation.md)。
@@ -136,8 +162,6 @@ python -m unittest discover -s tests -v
 可以通过 `--device cuda:0`、`rocm:0`、`mps` 或 `cpu` 固定设备。服务部署也可以设置 `TURNALIGN_DEVICE`。跨平台说明见 [docs/platforms.md](docs/platforms.md)，内部结构见 [docs/architecture.md](docs/architecture.md)。
 
 文件转录默认启用 `energy` VAD；只有已确认模型可接受整段输入的短音频才建议使用 `--no-vad`。指定输出文件时，VAD 审计默认写入同目录的 `*.vad.jsonl`，末尾 `end` 事件同时报告语音时长、跳过时长、语音区间数和强制切段数。完整 FunASR 后处理在 Apple Silicon 上建议让 GLM-ASR 使用 MPS，FSMN/Paraformer/CAM++ 使用 CPU。
-
-私有词表文件使用 UTF-8 编码，每行一个短语，空行和以 `#` 开头的行会被忽略。实际词表和上下文不会复制到 TurnAlign 事件；事件只记录使用方式、词条数量和是否使用上下文。GLM-ASR、Transformers Whisper、faster-whisper 和 whisper.cpp 同时接受词表与上下文，FunASR/Paraformer 接受原生热词但不接受自由上下文。数值 boost 只允许声明支持权重的后端使用。
 
 ### 在编码代理中使用
 
@@ -203,6 +227,32 @@ Model code, weights, and datasets retain their respective upstream licenses. The
 - Batch models emit rolling `partial` updates in microphone and WebSocket sessions, then `commit` after silence or a maximum utterance length. Native streaming plugins emit the same events directly.
 - WebSocket accepts PCM16 binary frames and returns JSON events. See [docs/websocket.md](docs/websocket.md).
 
+### Private hotwords and context
+
+TurnAlign uses one set of arguments to provide vocabulary or context hints to different ASR backends:
+
+```bash
+turnalign transcribe audio.mp3 --backend glm-asr \
+  --hotwords-file /path/to/private-phrases.txt \
+  --context-file /path/to/private-context.txt \
+  --output transcript.jsonl
+```
+
+- `--hotword PHRASE`: add one phrase; repeat as needed.
+- `--hotwords-file PATH`: read a UTF-8 file with one phrase per line; blank and `#` lines are ignored.
+- `--context TEXT` / `--context-file PATH`: provide topic context to prompt-capable backends.
+- `--hotword-boost NUMBER`: reserved for backends that explicitly support weighted hotwords; others fail clearly.
+
+| Backend | Hotword mapping | Free-form context |
+|---|---|---|
+| `glm-asr` | constrained transcription prompt | supported |
+| `transformers-whisper` | Whisper initial prompt | supported |
+| `faster-whisper` | native `hotwords` | supported through `initial_prompt` |
+| `funasr` | native `hotword` | unsupported |
+| `whisper-cpp` | `--prompt` | supported |
+
+TurnAlign events and WebSocket ready messages never copy the actual phrases or context. They report only the application method, phrase count, and whether context was used. Unsupported combinations fail before model weights are loaded instead of being silently ignored.
+
 ### Validation results
 
 The test recording is 129.4 minutes of 16 kHz mono audio with background noise, casual conversation, and a two-person main discussion.
@@ -213,7 +263,7 @@ The test recording is 129.4 minutes of 16 kHz mono audio with background noise, 
 - Speaker clustering produced three clusters: one for the earlier ambient/casual section and two for the main discussion.
 - The export contains 2,777 non-empty speech turns with no invalid ordering or adjacent overlap.
 - Fusion of GLM text with the Paraformer timeline produced 466 readable turns. Median local character alignment was 88.6%.
-- The common event validator passes, along with 41 unit and integration tests, including rolling partials, loopback WebSocket, and alignment/diarization replacement flow.
+- The common event validator passes, along with 58 unit and integration tests, including rolling partials, loopback WebSocket, private-hint redaction, and alignment/diarization replacement flow.
 - AMD RX 7650 GRE has been tested on physical hardware. An Apple Silicon Mac Studio has also completed physical macOS validation, including PyTorch 2.13.0 MPS detection, FP16 tensor computation, and end-to-end Transformers Whisper transcription. NVIDIA CUDA currently has probe and selection-path coverage, without physical performance benchmarks yet.
 
 See [docs/validation.md](docs/validation.md) for the full run log and metrics.
@@ -263,8 +313,6 @@ python -m unittest discover -s tests -v
 Use `--device cuda:0`, `rocm:0`, `mps`, or `cpu` to pin a target. Service deployments can also set `TURNALIGN_DEVICE`. See [docs/platforms.md](docs/platforms.md) for platform setup and [docs/architecture.md](docs/architecture.md) for the internal contracts.
 
 File transcription enables `energy` VAD by default; use `--no-vad` only for short audio that the selected model can accept in one request. With an output path, the VAD audit is written beside it as `*.vad.jsonl`, while the terminal `end` event reports speech, skipped audio, region, and forced-split totals. On Apple Silicon, the full optional pipeline is intended to run GLM-ASR on MPS and FSMN/Paraformer/CAM++ on CPU.
-
-Private vocabulary files are UTF-8 with one phrase per line; blank lines and lines beginning with `#` are ignored. TurnAlign events never copy the phrase or context values and report only the application method, phrase count, and whether context was used. GLM-ASR, Transformers Whisper, faster-whisper, and whisper.cpp accept both vocabulary and context. FunASR/Paraformer accepts native hotwords but not free-form context. Numeric boost is accepted only by backends that explicitly advertise weighted hotword support.
 
 ### Use with coding agents
 
