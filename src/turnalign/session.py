@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from array import array
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from time import perf_counter
 
 from .fusion import assign_speakers
-from .models import AudioChunk, Hypothesis, SpeakerTurn, TranscriptEvent, Word
-from .plugins import AlignmentBackend, AsrBackend, DiarizationBackend
+from .models import AudioChunk, Hypothesis, SpeakerTurn, SpeechSegment, TranscriptEvent, Word
+from .plugins import AlignmentBackend, AsrBackend, DiarizationBackend, VadBackend
 
 
 def pcm_rms(chunk: AudioChunk) -> float:
@@ -187,6 +187,8 @@ def transcribe_events(
     partial_seconds: float = 2.0,
     aligner: AlignmentBackend | None = None,
     diarizer: DiarizationBackend | None = None,
+    vad_backend: VadBackend | None = None,
+    vad_audit: Callable[[dict[str, object]], None] | None = None,
 ) -> Iterator[TranscriptEvent]:
     """Run either a native-streaming backend or endpointed batch backend."""
     started = perf_counter()
@@ -197,6 +199,10 @@ def transcribe_events(
     audio_seconds = 0.0
     recorded: list[AudioChunk] = []
     commits: list[TranscriptEvent] = []
+    vad_speech_seconds = 0.0
+    vad_regions = 0
+    vad_forced_splits = 0
+    vad_last_end = 0.0
 
     def observed_chunks() -> Iterator[AudioChunk]:
         nonlocal input_end, audio_seconds
@@ -208,6 +214,46 @@ def transcribe_events(
             yield chunk
 
     source = observed_chunks()
+
+    def audit_region(
+        decision: str,
+        start: float,
+        end: float,
+        *,
+        segment: SpeechSegment | None = None,
+    ) -> None:
+        if vad_audit is None or end <= start:
+            return
+        payload: dict[str, object] = {
+            "decision": decision,
+            "start": round(start, 6),
+            "end": round(end, 6),
+            "duration": round(end - start, 6),
+            "backend": getattr(vad_backend, "name", "energy"),
+        }
+        if segment is not None:
+            payload.update({
+                "confidence": segment.confidence,
+                "forced_split": segment.forced_split,
+                "metadata": segment.metadata,
+            })
+        vad_audit(payload)
+
+    def audited_segments() -> Iterator[list[AudioChunk]]:
+        nonlocal vad_speech_seconds, vad_regions, vad_forced_splits, vad_last_end
+        assert vad_backend is not None
+        for segment in vad_backend.segment(source):
+            if segment.start < vad_last_end:
+                raise ValueError("VAD returned overlapping or out-of-order speech segments")
+            audit_region("silence", vad_last_end, segment.start)
+            audit_region("speech", segment.start, segment.end, segment=segment)
+            vad_speech_seconds += segment.end - segment.start
+            vad_regions += 1
+            vad_forced_splits += int(segment.forced_split)
+            vad_last_end = segment.end
+            yield segment.chunks
+        audit_region("silence", vad_last_end, input_end)
+
     try:
         if backend.capabilities.streaming:
             for hypothesis in backend.transcribe(source):
@@ -243,6 +289,8 @@ def transcribe_events(
                         revision = 1
                     else:
                         revision += 1
+            elif vad_backend is not None:
+                groups = audited_segments()
             elif vad:
                 groups: Iterable[Iterable[AudioChunk]] = utterances(
                     source,
@@ -291,24 +339,33 @@ def transcribe_events(
 
         elapsed = perf_counter() - started
         end_time = max(last_end, input_end)
+        metadata = {
+            "segments": index,
+            "backend": backend.name,
+            "audio_seconds": round(audio_seconds, 3),
+            "processing_seconds": round(elapsed, 3),
+            "realtime_factor": round(elapsed / audio_seconds, 4) if audio_seconds else None,
+            "speed_x": round(audio_seconds / elapsed, 3) if elapsed else None,
+        }
+        if vad_backend is not None:
+            metadata.update({
+                "vad_backend": vad_backend.name,
+                "vad_speech_seconds": round(vad_speech_seconds, 3),
+                "vad_skipped_seconds": round(max(0.0, audio_seconds - vad_speech_seconds), 3),
+                "vad_speech_regions": vad_regions,
+                "vad_forced_splits": vad_forced_splits,
+            })
         yield TranscriptEvent(
             kind="end",
             segment_id="session",
             revision=1,
             start=end_time,
             end=end_time,
-            metadata={
-                "segments": index,
-                "backend": backend.name,
-                "audio_seconds": round(audio_seconds, 3),
-                "processing_seconds": round(elapsed, 3),
-                "realtime_factor": round(elapsed / audio_seconds, 4) if audio_seconds else None,
-                "speed_x": round(audio_seconds / elapsed, 3) if elapsed else None,
-            },
+            metadata=metadata,
         )
     finally:
         backend.close()
-        for component in (aligner, diarizer):
+        for component in (vad_backend, aligner, diarizer):
             close = getattr(component, "close", None)
             if callable(close):
                 close()

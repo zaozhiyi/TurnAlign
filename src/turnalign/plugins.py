@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Iterable, Protocol, runtime_checkable
 
-from .models import AudioChunk, Hypothesis, SpeakerTurn, Word
+from .models import AudioChunk, Hypothesis, SpeakerTurn, SpeechSegment, Word
 
 
 class Accelerator(str, Enum):
@@ -53,9 +53,9 @@ class AsrBackend(Protocol):
 class VadBackend(Protocol):
     name: str
 
-    def accept(self, chunk: AudioChunk) -> Iterable[AudioChunk]: ...
+    def segment(self, chunks: Iterable[AudioChunk]) -> Iterable[SpeechSegment]: ...
 
-    def flush(self) -> Iterable[AudioChunk]: ...
+    def close(self) -> None: ...
 
 
 @runtime_checkable

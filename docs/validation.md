@@ -78,7 +78,9 @@ UMAP/HDBSCAN clustering -> GLM-ASR text alignment.
 - Microphone capture requires a working PortAudio input device; automated tests cover PCM sources and endpointing without recording private audio.
 - LocalAgreement currently compares exact characters; punctuation normalization
   and token-aware agreement still need evaluation on actual partial hypotheses.
-- The project does not yet contain the in-process GLM/Whisper model plugins.
+- GLM/Whisper model adapters and optional FSMN-VAD, Paraformer alignment, and
+  CAM++ diarization components are now in-process and lazily loaded. The full
+  FunASR path remains offline post-processing rather than live diarization.
 - Live/online diarization and WebSocket reconnection are not yet implemented.
 - This recording has no human speaker-turn ground truth, so the run validates
   completeness and consistency but cannot report a defensible DER. Noise,

@@ -17,7 +17,8 @@ microphone = ["sounddevice>=0.5"]
 server = ["websockets>=14"]
 transformers = ["accelerate>=1.0", "numpy>=1.26", "transformers>=4.57"]
 faster-whisper = ["faster-whisper>=1.1", "numpy>=1.26"]
-funasr = ["funasr>=1.2", "numpy>=1.26"]
+funasr = ["funasr>=1.2", "numpy>=1.26", "torchaudio>=2.0"]
+funasr-pipeline = ["funasr>=1.2", "numpy>=1.26", "torchaudio>=2.0"]
 
 [project.scripts]
 turnalign = "turnalign.cli:main"

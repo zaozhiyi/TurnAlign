@@ -21,6 +21,19 @@ BUILTIN_ASR = {
     "whisper-cpp": "turnalign.backends.whisper_cpp:WhisperCppBackend",
 }
 
+BUILTIN_COMPONENTS = {
+    "vad": {
+        "energy": "turnalign.components.energy_vad:EnergyVadBackend",
+        "fsmn-vad": "turnalign.components.funasr:FsmnVadBackend",
+    },
+    "alignment": {
+        "paraformer": "turnalign.components.funasr:ParaformerAlignmentBackend",
+    },
+    "diarization": {
+        "campp": "turnalign.components.funasr:CamppDiarizationBackend",
+    },
+}
+
 
 def _import_string(value: str):
     module_name, attribute = value.split(":", 1)
@@ -39,6 +52,8 @@ def discover(kind: str) -> dict[str, Any]:
 def load(kind: str, name: str):
     if kind == "asr" and name in BUILTIN_ASR:
         return _import_string(BUILTIN_ASR[name])
+    if name in BUILTIN_COMPONENTS.get(kind, {}):
+        return _import_string(BUILTIN_COMPONENTS[kind][name])
     plugins = discover(kind)
     if name not in plugins:
         available = ", ".join(sorted(plugins)) or "none"
@@ -51,6 +66,7 @@ def available(kind: str) -> list[str]:
     names.discard("jsonl")  # legacy replay adapter, not an audio backend factory
     if kind == "asr":
         names.update(BUILTIN_ASR)
+    names.update(BUILTIN_COMPONENTS.get(kind, {}))
     return sorted(names)
 
 

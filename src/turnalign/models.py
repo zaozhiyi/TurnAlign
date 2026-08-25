@@ -32,6 +32,26 @@ class AudioChunk:
 
 
 @dataclass(slots=True)
+class SpeechSegment:
+    """One original-timeline speech region emitted by a VAD backend."""
+
+    chunks: list[AudioChunk]
+    start: float
+    end: float
+    confidence: float | None = None
+    forced_split: bool = False
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not _valid_range(self.start, self.end):
+            raise ValueError("invalid speech segment time range")
+        if not self.chunks:
+            raise ValueError("speech segment must contain audio chunks")
+        if self.confidence is not None and not 0 <= self.confidence <= 1:
+            raise ValueError("speech confidence must be between zero and one")
+
+
+@dataclass(slots=True)
 class Word:
     text: str
     start: float

@@ -136,21 +136,47 @@ def _write_events(events, output: Path | None) -> int:
 
 def transcribe_file(args) -> int:
     backend = create_asr(args.backend, _config(args))
+    vad_backend = None
+    if args.vad_backend != "none":
+        vad_options = _extra_options(args.vad_option)
+        if args.vad_backend == "energy":
+            vad_options.setdefault("min_silence_seconds", args.silence_seconds)
+            vad_options.setdefault("max_segment_seconds", args.max_utterance_seconds)
+        vad_backend = create_component("vad", args.vad_backend, vad_options)
     aligner = create_component("alignment", args.aligner, _extra_options(args.aligner_option)) if args.aligner else None
     diarizer = create_component("diarization", args.diarizer, _extra_options(args.diarizer_option)) if args.diarizer else None
     chunks = file_chunks(args.source, args.chunk_ms, args.ffmpeg)
-    return _write_events(
-        transcribe_events(
-            chunks, backend, vad=args.vad,
-            vad_threshold=args.vad_threshold,
-            silence_seconds=args.silence_seconds,
-            max_utterance_seconds=args.max_utterance_seconds,
-            partial_seconds=args.partial_seconds,
-            aligner=aligner,
-            diarizer=diarizer,
-        ),
-        args.output,
-    )
+    vad_output = args.vad_output
+    if vad_backend is not None and vad_output is None and args.output is not None:
+        vad_output = args.output.with_name(f"{args.output.stem}.vad.jsonl")
+    if vad_output is not None:
+        vad_output.parent.mkdir(parents=True, exist_ok=True)
+    audit_file = vad_output.open("w", encoding="utf-8") if vad_output is not None else None
+
+    def write_vad_audit(item: dict[str, object]) -> None:
+        if audit_file is None:
+            return
+        audit_file.write(json.dumps(item, ensure_ascii=False) + "\n")
+        audit_file.flush()
+
+    try:
+        return _write_events(
+            transcribe_events(
+                chunks, backend, vad=vad_backend is not None,
+                vad_threshold=args.vad_threshold,
+                silence_seconds=args.silence_seconds,
+                max_utterance_seconds=args.max_utterance_seconds,
+                partial_seconds=args.partial_seconds,
+                aligner=aligner,
+                diarizer=diarizer,
+                vad_backend=vad_backend,
+                vad_audit=write_vad_audit,
+            ),
+            args.output,
+        )
+    finally:
+        if audit_file is not None:
+            audit_file.close()
 
 
 def listen(args) -> int:
@@ -232,7 +258,7 @@ def main() -> int:
         default="auto",
         help="auto, cpu, cuda[:index], rocm[:index], or mps (TURNALIGN_DEVICE overrides it)",
     )
-    backends_parser = commands.add_parser("backends", help="List available built-in and plugin ASR backends")
+    backends_parser = commands.add_parser("backends", help="List available built-in and plugin components")
     backends_parser.set_defaults(command="backends")
     devices_parser = commands.add_parser("audio-devices", help="List microphone input devices")
     devices_parser.set_defaults(command="audio-devices")
@@ -247,7 +273,16 @@ def main() -> int:
     transcribe_parser.add_argument("--output", type=Path)
     transcribe_parser.add_argument("--chunk-ms", type=int, default=500)
     transcribe_parser.add_argument("--ffmpeg", default="ffmpeg")
-    transcribe_parser.add_argument("--vad", action="store_true", help="Segment the file before batch ASR")
+    vad_group = transcribe_parser.add_mutually_exclusive_group()
+    vad_group.add_argument(
+        "--vad", dest="vad_backend", action="store_const", const="energy",
+        help="Deprecated alias for --vad-backend energy",
+    )
+    vad_group.add_argument("--vad-backend", help="VAD component name (default: energy)")
+    vad_group.add_argument("--no-vad", dest="vad_backend", action="store_const", const="none")
+    transcribe_parser.set_defaults(vad_backend="energy")
+    transcribe_parser.add_argument("--vad-option", action="append", default=[], metavar="KEY=VALUE")
+    transcribe_parser.add_argument("--vad-output", type=Path, help="VAD speech/silence audit JSONL")
     _add_backend_arguments(transcribe_parser)
     _add_segmentation_arguments(transcribe_parser)
     _add_postprocess_arguments(transcribe_parser)
@@ -279,7 +314,9 @@ def main() -> int:
         print(json.dumps(runtime_report(args.device), ensure_ascii=False, indent=2))
         return 0
     if args.command == "backends":
-        print(json.dumps({"asr": available("asr")}, ensure_ascii=False, indent=2))
+        print(json.dumps({
+            kind: available(kind) for kind in ("asr", "vad", "alignment", "diarization")
+        }, ensure_ascii=False, indent=2))
         return 0
     if args.command == "audio-devices":
         print(json.dumps(input_devices(), ensure_ascii=False, indent=2))

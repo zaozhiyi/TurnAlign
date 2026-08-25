@@ -2,11 +2,39 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from turnalign import cli
 from turnalign.cli import replay, validate_events
 
 
 class CliIntegrationTests(unittest.TestCase):
+    def test_file_transcription_defaults_to_energy_vad(self):
+        captured = {}
+
+        def fake_transcribe(args):
+            captured["vad_backend"] = args.vad_backend
+            return 0
+
+        with patch.object(cli, "transcribe_file", fake_transcribe), patch(
+            "sys.argv", ["turnalign", "transcribe", "sample.wav"]
+        ):
+            self.assertEqual(cli.main(), 0)
+        self.assertEqual(captured["vad_backend"], "energy")
+
+    def test_no_vad_overrides_safe_default(self):
+        captured = {}
+
+        def fake_transcribe(args):
+            captured["vad_backend"] = args.vad_backend
+            return 0
+
+        with patch.object(cli, "transcribe_file", fake_transcribe), patch(
+            "sys.argv", ["turnalign", "transcribe", "sample.wav", "--no-vad"]
+        ):
+            self.assertEqual(cli.main(), 0)
+        self.assertEqual(captured["vad_backend"], "none")
+
     def test_replay_creates_parent_and_valid_end_event(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

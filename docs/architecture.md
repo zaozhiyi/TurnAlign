@@ -39,6 +39,12 @@ my_aligner = "my_package:MyAlignmentBackend"
 my_diarizer = "my_package:MyDiarizationBackend"
 ```
 
+VAD plugins emit original-timeline `SpeechSegment` objects rather than bare PCM
+chunks. Each segment carries its start/end, confidence when available, whether
+it was cut by the model-duration limit, and backend metadata. The file CLI
+persists both speech and inferred skipped intervals to an audit JSONL and adds
+coverage totals to the terminal event.
+
 Heavy dependencies belong to the plugin package. Importing `turnalign` must not
 initialize PyTorch, download weights, probe a GPU or contact a network service.
 
@@ -54,6 +60,17 @@ The built-in adapters demonstrate four integration styles:
 - `faster-whisper`: CTranslate2 inference with word timestamps.
 - `funasr`: FunASR `AutoModel` adapter for Paraformer, SenseVoice and compatible models.
 - `whisper-cpp`: local command-line executable and JSON result parsing.
+
+The first-party optional FunASR component set demonstrates the remaining
+contracts:
+
+- `fsmn-vad`: offline speech regions, split to the requested maximum ASR window.
+- `paraformer`: monotonic mapping from Paraformer timestamps to the final ASR text.
+- `campp`: offline speaker turns from FunASR's Paraformer/FSMN/CAM++ pipeline.
+
+They are imported lazily and require the `funasr-pipeline` extra. A session may
+use different devices per component, such as MPS for GLM-ASR and CPU for all
+three FunASR components.
 
 ## Event semantics
 

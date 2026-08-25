@@ -56,6 +56,8 @@ flowchart LR
 - 文件输入支持 PCM16 WAV；安装 FFmpeg 后可以读取 MP3、M4A 及 FFmpeg 能解码的其他格式。
 - 麦克风通过可选的 `sounddevice`/PortAudio 依赖采集，Windows、macOS 和 Linux 使用相同命令。
 - 内置 ASR 适配器包括 `glm-asr`、`transformers-whisper`、`faster-whisper`、`funasr` 和 `whisper-cpp`。第三方模型可以通过 Python entry point 注册。
+- 文件转录默认使用自适应 `energy` VAD 安全切段，并将所有语音和跳过区间写入独立审计 JSONL；也可以切换到 `fsmn-vad`。
+- 官方可选 FunASR 组件包括 FSMN-VAD、Paraformer 字词时间对齐和 CAM++ 离线说话人区分，安装后可直接通过统一 CLI 发现和调用。
 - 批处理模型在麦克风和 WebSocket 模式下按滚动窗口输出 `partial`，检测到静音或达到最长片段时输出 `commit`；原生流式插件可以直接产生相同事件。
 - WebSocket 接受 PCM16 二进制帧并返回 JSON 事件。协议见 [docs/websocket.md](docs/websocket.md)。
 
@@ -84,7 +86,7 @@ flowchart LR
 
 - 没有浏览器上传页面；文件、麦克风、CLI 和 WebSocket 已可使用。
 - `glm-asr`、`transformers-whisper`、`faster-whisper`、`funasr` 和 `whisper-cpp` 属于可选适配器，需要分别安装对应运行时或可执行文件。
-- 当前内置端点检测使用 PCM 能量阈值；复杂噪声环境建议接入 FSMN-VAD 或 Silero VAD 插件。
+- 默认 `energy` VAD 是自适应能量阈值兜底方案；复杂噪声环境建议安装并选择 `fsmn-vad`。
 - 说话人结果没有人工标注真值，暂时无法给出可靠的 DER。
 - 很短的应答、抢话和重叠语音仍可能分到相邻说话人。
 - GLM 正文按 30 秒窗口与 Paraformer 时间轴对齐，边界属于近似结果。
@@ -96,6 +98,7 @@ flowchart LR
 ```bash
 python -m pip install .
 python -m pip install ".[microphone,server,transformers]"
+python -m pip install ".[funasr-pipeline]"
 turnalign doctor --device auto
 turnalign backends
 ```
@@ -104,6 +107,9 @@ turnalign backends
 
 ```bash
 turnalign transcribe meeting.mp3 --backend glm-asr --language zh --output meeting.jsonl
+turnalign transcribe meeting.mp3 --backend glm-asr --vad-backend fsmn-vad \
+  --vad-option device=cpu --aligner paraformer --aligner-option device=cpu \
+  --diarizer campp --diarizer-option device=cpu --output meeting.jsonl
 turnalign listen --backend transformers-whisper --model openai/whisper-small --language zh
 turnalign audio-devices
 turnalign record sample.wav --duration 10
@@ -126,6 +132,8 @@ python -m unittest discover -s tests -v
 ```
 
 可以通过 `--device cuda:0`、`rocm:0`、`mps` 或 `cpu` 固定设备。服务部署也可以设置 `TURNALIGN_DEVICE`。跨平台说明见 [docs/platforms.md](docs/platforms.md)，内部结构见 [docs/architecture.md](docs/architecture.md)。
+
+文件转录默认启用 `energy` VAD；只有已确认模型可接受整段输入的短音频才建议使用 `--no-vad`。指定输出文件时，VAD 审计默认写入同目录的 `*.vad.jsonl`，末尾 `end` 事件同时报告语音时长、跳过时长、语音区间数和强制切段数。完整 FunASR 后处理在 Apple Silicon 上建议让 GLM-ASR 使用 MPS，FSMN/Paraformer/CAM++ 使用 CPU。
 
 ### 在编码代理中使用
 
@@ -185,6 +193,8 @@ Model code, weights, and datasets retain their respective upstream licenses. The
 - PCM16 WAV works through the standard library. FFmpeg enables MP3, M4A, and other formats it can decode.
 - Optional `sounddevice`/PortAudio capture provides the same microphone command on Windows, macOS, and Linux.
 - Built-in ASR adapters cover `glm-asr`, `transformers-whisper`, `faster-whisper`, `funasr`, and `whisper-cpp`. External models register through Python entry points.
+- File transcription defaults to adaptive `energy` VAD, safely segments long input, and writes every speech/skipped interval to a separate audit JSONL. `fsmn-vad` is available as an alternative.
+- First-party optional FunASR components provide FSMN-VAD, Paraformer word timing, and offline CAM++ diarization through the common CLI.
 - Batch models emit rolling `partial` updates in microphone and WebSocket sessions, then `commit` after silence or a maximum utterance length. Native streaming plugins emit the same events directly.
 - WebSocket accepts PCM16 binary frames and returns JSON events. See [docs/websocket.md](docs/websocket.md).
 
@@ -213,7 +223,7 @@ See [docs/validation.md](docs/validation.md) for the full run log and metrics.
 
 - There is no browser upload page. File input, microphone capture, CLI, and WebSocket transport are available.
 - `glm-asr`, `transformers-whisper`, `faster-whisper`, `funasr`, and `whisper-cpp` are optional adapters and require their corresponding runtime or executable.
-- The built-in endpoint detector uses a PCM energy threshold. FSMN-VAD or Silero VAD plugins are preferable in difficult noise.
+- The default adaptive energy VAD is a dependency-free fallback. Install and select `fsmn-vad` for difficult noise.
 - The speaker output has no human-labelled reference, so a reliable DER is not available.
 - Very short responses, interruptions, and overlapping speech may be assigned to a neighbouring speaker.
 - GLM text is aligned to the Paraformer timeline inside 30-second source windows, so speaker boundaries are approximate.
@@ -225,9 +235,13 @@ The core package uses only the Python standard library. Install optional feature
 ```bash
 python -m pip install .
 python -m pip install ".[microphone,server,transformers]"
+python -m pip install ".[funasr-pipeline]"
 turnalign doctor --device auto
 turnalign backends
 turnalign transcribe meeting.mp3 --backend glm-asr --language zh --output meeting.jsonl
+turnalign transcribe meeting.mp3 --backend glm-asr --vad-backend fsmn-vad \
+  --vad-option device=cpu --aligner paraformer --aligner-option device=cpu \
+  --diarizer campp --diarizer-option device=cpu --output meeting.jsonl
 turnalign listen --backend transformers-whisper --model openai/whisper-small
 turnalign serve --backend glm-asr --device auto
 ```
@@ -241,6 +255,8 @@ python -m unittest discover -s tests -v
 ```
 
 Use `--device cuda:0`, `rocm:0`, `mps`, or `cpu` to pin a target. Service deployments can also set `TURNALIGN_DEVICE`. See [docs/platforms.md](docs/platforms.md) for platform setup and [docs/architecture.md](docs/architecture.md) for the internal contracts.
+
+File transcription enables `energy` VAD by default; use `--no-vad` only for short audio that the selected model can accept in one request. With an output path, the VAD audit is written beside it as `*.vad.jsonl`, while the terminal `end` event reports speech, skipped audio, region, and forced-split totals. On Apple Silicon, the full optional pipeline is intended to run GLM-ASR on MPS and FSMN/Paraformer/CAM++ on CPU.
 
 ### Use with coding agents
 
