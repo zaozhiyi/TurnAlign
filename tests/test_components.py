@@ -1,5 +1,6 @@
 import unittest
 from array import array
+from unittest.mock import patch
 
 from turnalign.components.energy_vad import EnergyVadBackend
 from turnalign.components.funasr import (
@@ -92,7 +93,8 @@ class FunAsrComponentTests(unittest.TestCase):
         backend.batch_size_s = 300
         backend.max_segment_seconds = 2.0
         source = [chunk(1000, 10.0 + index, 1.0) for index in range(5)]
-        segments = list(backend.segment(source))
+        with patch("turnalign.components.funasr.pcm_to_float32", return_value=[0.0]):
+            segments = list(backend.segment(source))
         self.assertEqual([(item.start, item.end) for item in segments], [(11.0, 13.0), (13.0, 14.5)])
         self.assertTrue(segments[0].forced_split)
         self.assertFalse(segments[1].forced_split)
@@ -119,7 +121,8 @@ class FunAsrComponentTests(unittest.TestCase):
         ]}])
         backend.batch_size_s = 300
         backend.merge_gap_seconds = 0.2
-        turns = list(backend.diarize([chunk(1000, 5.0, 3.0)]))
+        with patch("turnalign.components.funasr.pcm_to_float32", return_value=[0.0]):
+            turns = list(backend.diarize([chunk(1000, 5.0, 3.0)]))
         self.assertEqual([(turn.start, turn.end, turn.speaker) for turn in turns], [
             (5.0, 7.0, "speaker-1"),
             (7.1, 8.0, "speaker-2"),

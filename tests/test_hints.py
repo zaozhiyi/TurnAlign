@@ -102,7 +102,8 @@ class BackendHintMappingTests(unittest.TestCase):
         backend.language = "en"
         backend.hints = AsrHints(("TERM_A", "TERM_B"), context="topic")
         backend.model = CaptureModel(([segment], info))
-        result = list(backend.transcribe([chunk()]))
+        with patch("turnalign.backends.faster_whisper.pcm_to_float32", return_value=[0.0]):
+            result = list(backend.transcribe([chunk()]))
         self.assertEqual(backend.model.options["hotwords"], "TERM_A TERM_B")
         self.assertEqual(backend.model.options["initial_prompt"], "topic")
         self.assertNotIn("TERM_A", str(result[0].metadata))
@@ -112,7 +113,8 @@ class BackendHintMappingTests(unittest.TestCase):
         backend.language = "en"
         backend.hints = AsrHints(("TERM_A", "TERM_B"))
         backend.model = CaptureModel([{"text": "ok"}])
-        result = list(backend.transcribe([chunk()]))
+        with patch("turnalign.backends.funasr.pcm_to_float32", return_value=[0.0]):
+            result = list(backend.transcribe([chunk()]))
         self.assertEqual(backend.model.options["hotword"], "TERM_A TERM_B")
         self.assertNotIn("TERM_A", str(result[0].metadata))
 
@@ -121,7 +123,8 @@ class BackendHintMappingTests(unittest.TestCase):
         backend.language = "en"
         backend.hints = AsrHints(("TERM_A",), context="topic")
         backend.pipe = CapturePipeline()
-        result = list(backend.transcribe([chunk()]))
+        with patch("turnalign.backends.transformers.pcm_to_float32", return_value=[0.0]):
+            result = list(backend.transcribe([chunk()]))
         prompt_ids = backend.pipe.generate_kwargs["prompt_ids"]
         self.assertEqual(prompt_ids.tensor_type, "pt")
         self.assertEqual(prompt_ids.device, "test-device")
