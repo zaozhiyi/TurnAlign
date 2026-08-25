@@ -129,7 +129,9 @@ class DeviceSelectionTests(unittest.TestCase):
 
     def test_mps_plan_enables_operator_fallback(self):
         mps = Device(Accelerator.MPS, True, "MPS", "mps", "Apple", "M3", "float16")
-        self.assertEqual(backend_plan(mps)["environment"]["PYTORCH_ENABLE_MPS_FALLBACK"], "1")
+        plan = backend_plan(mps)
+        self.assertEqual(plan["environment"]["PYTORCH_ENABLE_MPS_FALLBACK"], "1")
+        self.assertEqual(plan["funasr"]["device"], "cpu")
 
 
 class DoctorCliTests(unittest.TestCase):
@@ -140,7 +142,16 @@ class DoctorCliTests(unittest.TestCase):
         report = json.loads(output.getvalue())
         self.assertEqual(report["selected"]["accelerator"], "cpu")
         self.assertIn("backend_plan", report)
+        self.assertIn("execution_profile", report)
         self.assertIn("platform", report)
+
+    def test_profiles_cli_prints_effective_and_available_policies(self):
+        output = StringIO()
+        with patch("sys.argv", ["turnalign", "profiles"]), redirect_stdout(output):
+            self.assertEqual(main(), 0)
+        report = json.loads(output.getvalue())
+        self.assertIn("name", report["auto_selected"])
+        self.assertEqual(len(report["profiles"]), 6)
 
 
 if __name__ == "__main__":

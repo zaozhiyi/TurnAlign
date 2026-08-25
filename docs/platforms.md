@@ -13,6 +13,29 @@ to ASR, VAD, alignment and diarization plugins.
 | Apple Silicon | `mps` | `mps` | `float16` | Transformers, FunASR |
 | Any CPU | `cpu` | `cpu` | `float32` | ONNX Runtime, faster-whisper, Transformers |
 
+## Execution profiles
+
+Use `turnalign profiles` to inspect all policies and `turnalign doctor --device
+auto` to see the selected one. Profiles are scheduling defaults, not capability
+claims for every optional model on every GPU.
+
+- Apple MPS keeps GLM/Transformers ASR on MPS and current FunASR components on
+  CPU, overlapping diarization with ASR.
+- A single NVIDIA GPU keeps ASR and post-processing on the same CUDA device and
+  schedules stages to avoid VRAM contention.
+- Multiple NVIDIA GPUs place ASR on `cuda:0` and post-processing on `cuda:1`, so
+  the tracks can overlap without sharing one GPU.
+- ROCm Linux keeps PyTorch stages on one AMD GPU. The public profile uses
+  `rocm:0`, while PyTorch/FunASR correctly receives `cuda:0` under HIP.
+- ROCm Windows uses a conservative GPU-ASR/CPU-post-processing split because the
+  available PyTorch and ROCm component surface depends on the official hardware
+  support matrix.
+- CPU-only hosts avoid model concurrency and use a smaller alignment batch.
+
+Explicit component options always override these defaults. Re-run a representative
+recording after changing the profile because optimal batch size is hardware- and
+model-specific.
+
 PyTorch uses the `torch.cuda` namespace and `cuda:N` device strings for both
 CUDA and ROCm. TurnAlign distinguishes them with `torch.version.hip`; a Radeon
 will therefore be reported as `rocm` while model code correctly receives

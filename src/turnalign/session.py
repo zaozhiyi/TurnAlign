@@ -192,6 +192,7 @@ def transcribe_events(
     vad_audit: Callable[[dict[str, object]], None] | None = None,
     recorded_audio: list[AudioChunk] | None = None,
     parallel_diarization: bool = False,
+    execution_profile: str | None = None,
 ) -> Iterator[TranscriptEvent]:
     """Run either a native-streaming backend or endpointed batch backend."""
     started = perf_counter()
@@ -397,6 +398,8 @@ def transcribe_events(
             "alignment_seconds": round(alignment_seconds, 3),
             "parallel_diarization": diarization_future is not None,
         }
+        if execution_profile is not None:
+            metadata["execution_profile"] = execution_profile
         if vad_backend is not None:
             metadata.update({
                 "vad_backend": vad_backend.name,

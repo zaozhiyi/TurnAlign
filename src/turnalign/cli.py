@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 from pathlib import Path
 
 from .audio import file_chunks, input_devices, microphone_chunks, write_wave
@@ -11,6 +12,7 @@ from .devices import runtime_report
 from .hints import AsrHints
 from .models import TranscriptEvent
 from .plugins import AsrConfig
+from .profiles import PROFILE_NAMES, profile_catalog, select_execution_profile
 from .registry import available, create_asr, create_component
 from .server import serve
 from .session import transcribe_events
@@ -105,10 +107,10 @@ def _extra_options(items: list[str]) -> dict[str, object]:
     return result
 
 
-def _config(args) -> AsrConfig:
+def _config(args, *, device: str | None = None) -> AsrConfig:
     return AsrConfig(
         model=args.model,
-        device=_resolved_device(args.device),
+        device=device or _resolved_device(args.device),
         language=args.language,
         compute_type=args.compute_type,
         executable=getattr(args, "executable", None),
@@ -153,7 +155,12 @@ def _write_events(events, output: Path | None) -> int:
 
 
 def transcribe_file(args) -> int:
-    asr_config = _config(args)
+    profile = select_execution_profile(
+        args.execution_profile, requested_device=args.device
+    )
+    explicit_device = args.device != "auto" or "TURNALIGN_DEVICE" in os.environ
+    asr_device = _resolved_device(args.device) if explicit_device else profile.asr_device
+    asr_config = _config(args, device=asr_device)
     backend = create_asr(args.backend, asr_config)
     vad_backend = None
     if args.vad_backend != "none":
@@ -161,16 +168,21 @@ def transcribe_file(args) -> int:
         if args.vad_backend == "energy":
             vad_options.setdefault("min_silence_seconds", args.silence_seconds)
             vad_options.setdefault("max_segment_seconds", args.max_utterance_seconds)
+        elif args.vad_backend == "fsmn-vad":
+            vad_options.setdefault("device", profile.vad_device)
         vad_backend = create_component("vad", args.vad_backend, vad_options)
     aligner_options = _extra_options(args.aligner_option)
     diarizer_options = _extra_options(args.diarizer_option)
+    if args.aligner == "paraformer":
+        aligner_options.setdefault("device", profile.alignment_device)
+        aligner_options.setdefault("batch_size", profile.alignment_batch_size)
+    if args.diarizer == "campp":
+        diarizer_options.setdefault("device", profile.diarization_device)
     aligner = create_component("alignment", args.aligner, aligner_options) if args.aligner else None
     diarizer = create_component("diarization", args.diarizer, diarizer_options) if args.diarizer else None
     parallel_diarization = bool(args.parallel_postprocess and diarizer is not None)
     if args.parallel_postprocess is None and diarizer is not None:
-        asr_accelerator = asr_config.device.split(":", 1)[0]
-        diarizer_device = str(diarizer_options.get("device", "cpu")).split(":", 1)[0]
-        parallel_diarization = asr_accelerator in {"mps", "cuda", "rocm"} and diarizer_device == "cpu"
+        parallel_diarization = profile.parallel_diarization
     decoded = file_chunks(args.source, args.chunk_ms, args.ffmpeg)
     recorded_audio = list(decoded) if parallel_diarization else None
     chunks = iter(recorded_audio) if recorded_audio is not None else decoded
@@ -201,6 +213,7 @@ def transcribe_file(args) -> int:
                 vad_audit=write_vad_audit,
                 recorded_audio=recorded_audio,
                 parallel_diarization=parallel_diarization,
+                execution_profile=profile.name,
             ),
             args.output,
         )
@@ -302,6 +315,8 @@ def main() -> int:
     )
     backends_parser = commands.add_parser("backends", help="List available built-in and plugin components")
     backends_parser.set_defaults(command="backends")
+    profiles_parser = commands.add_parser("profiles", help="List cross-platform execution profiles")
+    profiles_parser.set_defaults(command="profiles")
     devices_parser = commands.add_parser("audio-devices", help="List microphone input devices")
     devices_parser.set_defaults(command="audio-devices")
     record_parser = commands.add_parser("record", help="Record microphone audio to a local WAV file")
@@ -325,6 +340,10 @@ def main() -> int:
     transcribe_parser.set_defaults(vad_backend="energy")
     transcribe_parser.add_argument("--vad-option", action="append", default=[], metavar="KEY=VALUE")
     transcribe_parser.add_argument("--vad-output", type=Path, help="VAD speech/silence audit JSONL")
+    transcribe_parser.add_argument(
+        "--execution-profile", choices=PROFILE_NAMES, default="auto",
+        help="Cross-platform device and scheduling policy (default: auto)",
+    )
     transcribe_parser.add_argument(
         "--parallel-postprocess",
         action=argparse.BooleanOptionalAction,
@@ -364,6 +383,13 @@ def main() -> int:
     if args.command == "backends":
         print(json.dumps({
             kind: available(kind) for kind in ("asr", "vad", "alignment", "diarization")
+        }, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "profiles":
+        automatic = select_execution_profile("auto")
+        print(json.dumps({
+            "auto_selected": automatic.to_dict(),
+            "profiles": profile_catalog(),
         }, ensure_ascii=False, indent=2))
         return 0
     if args.command == "audio-devices":

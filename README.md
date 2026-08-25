@@ -88,6 +88,21 @@ turnalign transcribe audio.mp3 --backend glm-asr \
 
 实际词表和上下文不会复制到 TurnAlign 事件或 WebSocket ready 消息；只记录使用方式、词条数量和是否使用上下文。不支持的组合会在加载模型权重前失败，不会静默忽略。
 
+### 跨平台执行配置
+
+`--execution-profile auto` 会根据操作系统、加速器类型和 GPU 数量选择设备、对齐批量及并行策略。`turnalign doctor` 显示当前选择，`turnalign profiles` 列出所有配置。
+
+| Profile | 适用平台 | 默认策略 |
+|---|---|---|
+| `mac-balanced` | Apple Silicon | MPS ASR + CPU 后处理并行，alignment batch 4 |
+| `cuda-single-gpu` | NVIDIA 单卡 | 所有模型使用同一 GPU，按阶段执行 |
+| `cuda-multi-gpu` | NVIDIA 多卡 | GPU 0 ASR，GPU 1 后处理，并行执行 |
+| `rocm-linux` | AMD ROCm Linux | PyTorch 模型使用同一 AMD GPU，按阶段执行 |
+| `rocm-windows` | AMD ROCm Windows | GPU ASR + 保守 CPU 后处理并行，alignment batch 1 |
+| `cpu-low-memory` | 无可用 GPU | 串行执行，alignment batch 2 |
+
+用户显式提供的 `--device`、`--vad-option device=...`、`--aligner-option device=...`、`--diarizer-option device=...`、batch 和并行开关始终优先于 profile 默认值。
+
 ### 已完成的验证
 
 测试音频是一段 129.4 分钟、16 kHz 单声道录音，包含环境噪声、闲聊和两人主讨论。
@@ -98,7 +113,7 @@ turnalign transcribe audio.mp3 --backend glm-asr \
 - 说话人聚类得到 3 个簇：前段环境/闲聊人物 1 个，主讨论人物 2 个。
 - 导出 2777 个非空语音段；时间轴没有乱序和相邻重叠。
 - GLM 正文与 Paraformer 时间轴融合后得到 466 个可读段，局部字符对齐率中位数为 88.6%。
-- 公共事件校验通过，当前单元与集成测试共 61 项，其中包含滚动 partial、WebSocket 本机回环、私有热词脱敏、并行后处理和批量时间对齐测试。
+- 公共事件校验通过，当前单元与集成测试共 70 项，其中包含滚动 partial、WebSocket 本机回环、私有热词脱敏、跨平台 profile、并行后处理和批量时间对齐测试。
 - AMD RX 7650 GRE 已完成真实硬件验证。Apple Silicon Mac Studio 已完成 macOS 实体机器验证，PyTorch 2.13.0 MPS 设备检测、FP16 张量计算和 Transformers Whisper 端到端转录均通过。NVIDIA CUDA 目前完成设备探针与选择逻辑测试，尚未进行实体机器性能测试。
 
 详细记录见 [docs/validation.md](docs/validation.md)。
@@ -127,6 +142,7 @@ python -m pip install .
 python -m pip install ".[microphone,server,transformers]"
 python -m pip install ".[funasr-pipeline]"
 turnalign doctor --device auto
+turnalign profiles
 turnalign backends
 ```
 
@@ -135,9 +151,9 @@ turnalign backends
 ```bash
 turnalign transcribe meeting.mp3 --backend glm-asr --language zh --output meeting.jsonl
 turnalign transcribe meeting.mp3 --backend glm-asr --hotwords-file /path/to/private-phrases.txt --output meeting.jsonl
-turnalign transcribe meeting.mp3 --backend glm-asr --vad-backend fsmn-vad \
-  --vad-option device=cpu --aligner paraformer --aligner-option device=cpu \
-  --diarizer campp --diarizer-option device=cpu --output meeting.jsonl
+turnalign transcribe meeting.mp3 --backend glm-asr --execution-profile auto \
+  --vad-backend fsmn-vad --aligner paraformer --diarizer campp \
+  --output meeting.jsonl
 turnalign listen --backend transformers-whisper --model openai/whisper-small --language zh
 turnalign audio-devices
 turnalign record sample.wav --duration 10
@@ -255,6 +271,21 @@ turnalign transcribe audio.mp3 --backend glm-asr \
 
 TurnAlign events and WebSocket ready messages never copy the actual phrases or context. They report only the application method, phrase count, and whether context was used. Unsupported combinations fail before model weights are loaded instead of being silently ignored.
 
+### Cross-platform execution profiles
+
+`--execution-profile auto` selects devices, alignment batches, and scheduling from the operating system, accelerator type, and GPU count. `turnalign doctor` shows the effective selection, while `turnalign profiles` lists every policy.
+
+| Profile | Target | Default policy |
+|---|---|---|
+| `mac-balanced` | Apple Silicon | MPS ASR plus parallel CPU post-processing, alignment batch 4 |
+| `cuda-single-gpu` | one NVIDIA GPU | all models on one GPU, scheduled by stage |
+| `cuda-multi-gpu` | multiple NVIDIA GPUs | GPU 0 ASR, GPU 1 post-processing, concurrent tracks |
+| `rocm-linux` | AMD ROCm on Linux | PyTorch models on one AMD GPU, scheduled by stage |
+| `rocm-windows` | AMD ROCm on Windows | GPU ASR plus conservative parallel CPU post-processing, batch 1 |
+| `cpu-low-memory` | no usable GPU | sequential execution, alignment batch 2 |
+
+Explicit `--device`, component `device=...`, batch, and parallel flags always override profile defaults.
+
 ### Validation results
 
 The test recording is 129.4 minutes of 16 kHz mono audio with background noise, casual conversation, and a two-person main discussion.
@@ -265,7 +296,7 @@ The test recording is 129.4 minutes of 16 kHz mono audio with background noise, 
 - Speaker clustering produced three clusters: one for the earlier ambient/casual section and two for the main discussion.
 - The export contains 2,777 non-empty speech turns with no invalid ordering or adjacent overlap.
 - Fusion of GLM text with the Paraformer timeline produced 466 readable turns. Median local character alignment was 88.6%.
-- The common event validator passes, along with 61 unit and integration tests, including rolling partials, loopback WebSocket, private-hint redaction, parallel post-processing, and batched alignment.
+- The common event validator passes, along with 70 unit and integration tests, including rolling partials, loopback WebSocket, private-hint redaction, cross-platform profiles, parallel post-processing, and batched alignment.
 - AMD RX 7650 GRE has been tested on physical hardware. An Apple Silicon Mac Studio has also completed physical macOS validation, including PyTorch 2.13.0 MPS detection, FP16 tensor computation, and end-to-end Transformers Whisper transcription. NVIDIA CUDA currently has probe and selection-path coverage, without physical performance benchmarks yet.
 
 See [docs/validation.md](docs/validation.md) for the full run log and metrics.
@@ -294,12 +325,13 @@ python -m pip install .
 python -m pip install ".[microphone,server,transformers]"
 python -m pip install ".[funasr-pipeline]"
 turnalign doctor --device auto
+turnalign profiles
 turnalign backends
 turnalign transcribe meeting.mp3 --backend glm-asr --language zh --output meeting.jsonl
 turnalign transcribe meeting.mp3 --backend glm-asr --hotwords-file /path/to/private-phrases.txt --output meeting.jsonl
-turnalign transcribe meeting.mp3 --backend glm-asr --vad-backend fsmn-vad \
-  --vad-option device=cpu --aligner paraformer --aligner-option device=cpu \
-  --diarizer campp --diarizer-option device=cpu --output meeting.jsonl
+turnalign transcribe meeting.mp3 --backend glm-asr --execution-profile auto \
+  --vad-backend fsmn-vad --aligner paraformer --diarizer campp \
+  --output meeting.jsonl
 turnalign listen --backend transformers-whisper --model openai/whisper-small
 turnalign serve --backend glm-asr --device auto
 ```

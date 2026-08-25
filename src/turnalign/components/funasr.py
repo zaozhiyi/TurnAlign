@@ -20,6 +20,10 @@ def _auto_model():
     return AutoModel
 
 
+def _pytorch_device(device: str) -> str:
+    return device.replace("rocm", "cuda", 1) if device.startswith("rocm") else device
+
+
 def _audio_chunk(chunks: list[AudioChunk], start: float, end: float) -> AudioChunk:
     if not chunks:
         raise ValueError("cannot slice an empty audio stream")
@@ -66,7 +70,8 @@ class FsmnVadBackend:
             raise ValueError("max_segment_seconds must be positive")
         AutoModel = _auto_model()
         self.model = AutoModel(
-            model=model, device=device, hub=hub, disable_update=disable_update, **model_options
+            model=model, device=_pytorch_device(device), hub=hub,
+            disable_update=disable_update, **model_options
         )
         self.model_id = model
         self.batch_size_s = int(batch_size_s)
@@ -203,7 +208,8 @@ class ParaformerAlignmentBackend:
     ):
         AutoModel = _auto_model()
         self.model = AutoModel(
-            model=model, device=device, hub=hub, disable_update=disable_update, **model_options
+            model=model, device=_pytorch_device(device), hub=hub,
+            disable_update=disable_update, **model_options
         )
         self.batch_size_s = int(batch_size_s)
         self.batch_size = int(batch_size)
@@ -269,7 +275,7 @@ class CamppDiarizationBackend:
             model=model,
             vad_model=vad_model,
             spk_model=spk_model,
-            device=device,
+            device=_pytorch_device(device),
             hub=hub,
             disable_update=disable_update,
             **model_options,

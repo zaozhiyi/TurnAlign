@@ -196,6 +196,14 @@ def runtime_report(requested: str | Accelerator = Accelerator.AUTO) -> dict[str,
     devices = detect_devices()
     selected = select_device(requested, devices=devices)
     torch = _optional_import("torch")
+    from .profiles import select_execution_profile
+
+    profile = select_execution_profile(
+        "auto",
+        requested_device=requested.value if isinstance(requested, Accelerator) else requested,
+        devices=devices,
+        system=platform.system(),
+    )
     return {
         "platform": {
             "system": platform.system(),
@@ -207,6 +215,7 @@ def runtime_report(requested: str | Accelerator = Accelerator.AUTO) -> dict[str,
         "requested": requested.value if isinstance(requested, Accelerator) else requested,
         "selected": selected.to_dict(),
         "backend_plan": backend_plan(selected),
+        "execution_profile": profile.to_dict(),
         "devices": [device.to_dict() for device in devices],
     }
 
@@ -230,10 +239,14 @@ def backend_plan(device: Device) -> dict[str, Any]:
     elif device.accelerator is Accelerator.CUDA:
         plan["recommended_engines"] = ["faster-whisper", "transformers", "funasr-pytorch"]
     elif device.accelerator is Accelerator.MPS:
+        plan["funasr"]["device"] = "cpu"
         plan["recommended_engines"] = ["transformers", "funasr-pytorch"]
         plan["unsupported_engines"] = ["faster-whisper/CTranslate2 GPU"]
         plan["environment"] = {"PYTORCH_ENABLE_MPS_FALLBACK": "1"}
-        plan["notes"] = ["Fallback lets unsupported MPS operators run on CPU instead of aborting."]
+        plan["notes"] = [
+            "Fallback lets unsupported MPS operators run on CPU instead of aborting.",
+            "The balanced profile keeps current FunASR components on CPU while ASR uses MPS.",
+        ]
     else:
         plan["recommended_engines"] = ["onnxruntime", "faster-whisper", "transformers", "funasr-pytorch"]
         plan["notes"] = ["Use int8 where the chosen CPU backend and model support it."]

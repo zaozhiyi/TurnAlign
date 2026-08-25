@@ -151,3 +151,10 @@ batching after both tracks complete; the default batch of four was selected from
 full-recording benchmarks because larger batches were not monotonically faster.
 The final event reports per-stage wall time and the scheduling mode so performance
 changes remain observable without changing transcript event semantics.
+
+Device-aware execution profiles sit above backend configuration. They provide
+platform defaults only: explicit ASR or component devices, batch sizes, and
+parallel flags retain precedence. Auto selection distinguishes Apple MPS,
+single- and multi-GPU NVIDIA CUDA, AMD ROCm on Linux versus Windows, and CPU-only
+hosts. ROCm is exposed as `rocm:N` at the CLI boundary and normalized to PyTorch's
+intentional `cuda:N` HIP device syntax inside components.
