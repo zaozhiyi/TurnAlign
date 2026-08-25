@@ -58,6 +58,7 @@ flowchart LR
 - 内置 ASR 适配器包括 `glm-asr`、`transformers-whisper`、`faster-whisper`、`funasr` 和 `whisper-cpp`。第三方模型可以通过 Python entry point 注册。
 - 文件转录默认使用自适应 `energy` VAD 安全切段，并将所有语音和跳过区间写入独立审计 JSONL；也可以切换到 `fsmn-vad`。
 - 官方可选 FunASR 组件包括 FSMN-VAD、Paraformer 字词时间对齐和 CAM++ 离线说话人区分，安装后可直接通过统一 CLI 发现和调用。
+- 用户可以通过 `--hotword`、`--hotwords-file`、`--context` 或 `--context-file` 提供本地私有词表与主题上下文。TurnAlign 会按后端映射到 GLM prompt、Whisper prompt 或 FunASR/faster-whisper 原生热词接口。
 - 批处理模型在麦克风和 WebSocket 模式下按滚动窗口输出 `partial`，检测到静音或达到最长片段时输出 `commit`；原生流式插件可以直接产生相同事件。
 - WebSocket 接受 PCM16 二进制帧并返回 JSON 事件。协议见 [docs/websocket.md](docs/websocket.md)。
 
@@ -107,6 +108,7 @@ turnalign backends
 
 ```bash
 turnalign transcribe meeting.mp3 --backend glm-asr --language zh --output meeting.jsonl
+turnalign transcribe meeting.mp3 --backend glm-asr --hotwords-file /path/to/private-phrases.txt --output meeting.jsonl
 turnalign transcribe meeting.mp3 --backend glm-asr --vad-backend fsmn-vad \
   --vad-option device=cpu --aligner paraformer --aligner-option device=cpu \
   --diarizer campp --diarizer-option device=cpu --output meeting.jsonl
@@ -134,6 +136,8 @@ python -m unittest discover -s tests -v
 可以通过 `--device cuda:0`、`rocm:0`、`mps` 或 `cpu` 固定设备。服务部署也可以设置 `TURNALIGN_DEVICE`。跨平台说明见 [docs/platforms.md](docs/platforms.md)，内部结构见 [docs/architecture.md](docs/architecture.md)。
 
 文件转录默认启用 `energy` VAD；只有已确认模型可接受整段输入的短音频才建议使用 `--no-vad`。指定输出文件时，VAD 审计默认写入同目录的 `*.vad.jsonl`，末尾 `end` 事件同时报告语音时长、跳过时长、语音区间数和强制切段数。完整 FunASR 后处理在 Apple Silicon 上建议让 GLM-ASR 使用 MPS，FSMN/Paraformer/CAM++ 使用 CPU。
+
+私有词表文件使用 UTF-8 编码，每行一个短语，空行和以 `#` 开头的行会被忽略。实际词表和上下文不会复制到 TurnAlign 事件；事件只记录使用方式、词条数量和是否使用上下文。GLM-ASR、Transformers Whisper、faster-whisper 和 whisper.cpp 同时接受词表与上下文，FunASR/Paraformer 接受原生热词但不接受自由上下文。数值 boost 只允许声明支持权重的后端使用。
 
 ### 在编码代理中使用
 
@@ -195,6 +199,7 @@ Model code, weights, and datasets retain their respective upstream licenses. The
 - Built-in ASR adapters cover `glm-asr`, `transformers-whisper`, `faster-whisper`, `funasr`, and `whisper-cpp`. External models register through Python entry points.
 - File transcription defaults to adaptive `energy` VAD, safely segments long input, and writes every speech/skipped interval to a separate audit JSONL. `fsmn-vad` is available as an alternative.
 - First-party optional FunASR components provide FSMN-VAD, Paraformer word timing, and offline CAM++ diarization through the common CLI.
+- Users can provide local private vocabulary or topic context with `--hotword`, `--hotwords-file`, `--context`, or `--context-file`. TurnAlign maps the same contract to GLM prompts, Whisper prompts, or native FunASR/faster-whisper hotwords.
 - Batch models emit rolling `partial` updates in microphone and WebSocket sessions, then `commit` after silence or a maximum utterance length. Native streaming plugins emit the same events directly.
 - WebSocket accepts PCM16 binary frames and returns JSON events. See [docs/websocket.md](docs/websocket.md).
 
@@ -239,6 +244,7 @@ python -m pip install ".[funasr-pipeline]"
 turnalign doctor --device auto
 turnalign backends
 turnalign transcribe meeting.mp3 --backend glm-asr --language zh --output meeting.jsonl
+turnalign transcribe meeting.mp3 --backend glm-asr --hotwords-file /path/to/private-phrases.txt --output meeting.jsonl
 turnalign transcribe meeting.mp3 --backend glm-asr --vad-backend fsmn-vad \
   --vad-option device=cpu --aligner paraformer --aligner-option device=cpu \
   --diarizer campp --diarizer-option device=cpu --output meeting.jsonl
@@ -257,6 +263,8 @@ python -m unittest discover -s tests -v
 Use `--device cuda:0`, `rocm:0`, `mps`, or `cpu` to pin a target. Service deployments can also set `TURNALIGN_DEVICE`. See [docs/platforms.md](docs/platforms.md) for platform setup and [docs/architecture.md](docs/architecture.md) for the internal contracts.
 
 File transcription enables `energy` VAD by default; use `--no-vad` only for short audio that the selected model can accept in one request. With an output path, the VAD audit is written beside it as `*.vad.jsonl`, while the terminal `end` event reports speech, skipped audio, region, and forced-split totals. On Apple Silicon, the full optional pipeline is intended to run GLM-ASR on MPS and FSMN/Paraformer/CAM++ on CPU.
+
+Private vocabulary files are UTF-8 with one phrase per line; blank lines and lines beginning with `#` are ignored. TurnAlign events never copy the phrase or context values and report only the application method, phrase count, and whether context was used. GLM-ASR, Transformers Whisper, faster-whisper, and whisper.cpp accept both vocabulary and context. FunASR/Paraformer accepts native hotwords but not free-form context. Numeric boost is accepted only by backends that explicitly advertise weighted hotword support.
 
 ### Use with coding agents
 

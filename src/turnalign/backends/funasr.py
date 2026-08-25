@@ -12,6 +12,7 @@ class FunAsrBackend:
     capabilities = BackendCapabilities(
         streaming=False,
         word_timestamps=False,
+        hotwords=True,
         languages=("zh", "en", "yue", "ja", "ko"),
         accelerators=(Accelerator.CUDA, Accelerator.ROCM, Accelerator.CPU),
     )
@@ -31,6 +32,7 @@ class FunAsrBackend:
         options = dict(config.extra or {})
         self.model = AutoModel(model=config.model or "paraformer-zh", device=device, **options)
         self.language = config.language
+        self.hints = config.hints
 
     @staticmethod
     def _cuda_available() -> bool:
@@ -46,14 +48,23 @@ class FunAsrBackend:
             return
         if sample_rate != 16_000:
             raise ValueError("FunASR backend expects 16 kHz audio")
-        result = self.model.generate(input=pcm_to_float32(data, channels))
+        generate_options = {"input": pcm_to_float32(data, channels)}
+        if self.hints.hotwords:
+            generate_options["hotword"] = " ".join(self.hints.hotwords)
+        result = self.model.generate(**generate_options)
         duration = len(data) / (2 * channels * sample_rate)
         for item in result or []:
             text = str(item.get("text", "")).strip()
             if text:
                 yield Hypothesis(
                     text, offset, offset + duration, language=self.language, final=True,
-                    metadata={"funasr_timestamp": item.get("timestamp")},
+                    metadata={
+                        "funasr_timestamp": item.get("timestamp"),
+                        **(
+                            self.hints.private_metadata("funasr-hotword")
+                            if self.hints.active else {}
+                        ),
+                    },
                 )
 
     def close(self) -> None:

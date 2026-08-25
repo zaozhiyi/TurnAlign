@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from turnalign import cli
@@ -9,6 +10,20 @@ from turnalign.cli import replay, validate_events
 
 
 class CliIntegrationTests(unittest.TestCase):
+    def test_private_hint_files_are_loaded_without_becoming_output_configuration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            hotwords = root / "hotwords.txt"
+            context = root / "context.txt"
+            hotwords.write_text("TERM_A\n# ignored\nTERM_B\n", encoding="utf-8")
+            context.write_text("topic", encoding="utf-8")
+            hints = cli._hints(SimpleNamespace(
+                hotword=[], hotwords_file=[hotwords], context=None,
+                context_file=context, hotword_boost=None,
+            ))
+            self.assertEqual(hints.hotwords, ("TERM_A", "TERM_B"))
+            self.assertEqual(hints.context, "topic")
+
     def test_file_transcription_defaults_to_energy_vad(self):
         captured = {}
 

@@ -72,6 +72,14 @@ def available(kind: str) -> list[str]:
 
 def create_asr(name: str, config: AsrConfig):
     implementation = load("asr", name)
+    capabilities = getattr(implementation, "capabilities", None)
+    if capabilities is not None:
+        if config.hints.hotwords and not capabilities.hotwords:
+            raise ValueError(f"ASR backend {name!r} does not support hotwords")
+        if config.hints.context and not capabilities.context_prompt:
+            raise ValueError(f"ASR backend {name!r} does not support context prompts")
+        if config.hints.boost is not None and not capabilities.hotword_boost:
+            raise ValueError(f"ASR backend {name!r} does not support numeric hotword boost")
     factory = getattr(implementation, "create", None)
     if callable(factory):
         return factory(config)

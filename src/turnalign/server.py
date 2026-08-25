@@ -8,6 +8,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from .audio import file_chunks
+from .hints import AsrHints
 from .models import AudioChunk
 from .plugins import AsrConfig
 from .registry import create_asr, create_component
@@ -44,6 +45,13 @@ async def serve(
                 await websocket.send(_json({"type": "error", "message": "first message type must be start"}))
                 return
             backend_name = str(request.get("backend") or default_backend)
+            raw_hotwords = request.get("hotwords") or []
+            if isinstance(raw_hotwords, str):
+                raw_hotwords = [raw_hotwords]
+            if not isinstance(raw_hotwords, list) or not all(
+                isinstance(item, str) for item in raw_hotwords
+            ):
+                raise ValueError("hotwords must be a JSON array of strings")
             sample_rate = int(request.get("sample_rate", 16_000))
             channels = int(request.get("channels", 1))
             if sample_rate <= 0 or channels <= 0:
@@ -55,6 +63,11 @@ async def serve(
                 compute_type=request.get("compute_type"),
                 executable=request.get("executable"),
                 model_path=request.get("model_path"),
+                hints=AsrHints(
+                    hotwords=tuple(raw_hotwords),
+                    context=request.get("context"),
+                    boost=request.get("hotword_boost"),
+                ),
             )
             incoming: queue.Queue[AudioChunk | None] = queue.Queue(maxsize=128)
             outgoing: asyncio.Queue[dict[str, object] | None] = asyncio.Queue(maxsize=128)
@@ -119,12 +132,16 @@ async def serve(
 
             thread = threading.Thread(target=worker, name="turnalign-session", daemon=True)
             thread.start()
+            public_config = {key: value for key, value in asdict(config).items() if value is not None}
+            public_config.pop("hints", None)
+            if config.hints.active:
+                public_config["hints"] = config.hints.private_metadata("backend-selected")
             await websocket.send(_json({
                 "type": "ready",
                 "backend": backend_name,
                 "sample_rate": sample_rate,
                 "channels": channels,
-                "config": {key: value for key, value in asdict(config).items() if value is not None},
+                "config": public_config,
             }))
 
             async def send_events() -> None:

@@ -13,6 +13,7 @@ class FasterWhisperBackend:
         streaming=False,
         word_timestamps=True,
         hotwords=True,
+        context_prompt=True,
         accelerators=(Accelerator.CUDA, Accelerator.CPU),
     )
 
@@ -29,6 +30,7 @@ class FasterWhisperBackend:
             device = "cpu"
         compute_type = config.compute_type or ("float16" if device == "cuda" else "int8")
         self.language = config.language
+        self.hints = config.hints
         self.model = WhisperModel(config.model or "small", device=device, compute_type=compute_type)
 
     def transcribe(self, chunks: Iterable[AudioChunk]) -> Iterable[Hypothesis]:
@@ -38,7 +40,16 @@ class FasterWhisperBackend:
         audio = pcm_to_float32(data, channels)
         if sample_rate != 16_000:
             raise ValueError("faster-whisper backend expects 16 kHz audio")
-        segments, info = self.model.transcribe(audio, language=self.language, word_timestamps=True, vad_filter=False)
+        options = {
+            "language": self.language,
+            "word_timestamps": True,
+            "vad_filter": False,
+        }
+        if self.hints.hotwords:
+            options["hotwords"] = " ".join(self.hints.hotwords)
+        if self.hints.context:
+            options["initial_prompt"] = self.hints.context
+        segments, info = self.model.transcribe(audio, **options)
         for segment in segments:
             words = [
                 Word(item.word, offset + item.start, offset + item.end, getattr(item, "probability", None))
@@ -47,6 +58,10 @@ class FasterWhisperBackend:
             yield Hypothesis(
                 segment.text.strip(), offset + segment.start, offset + segment.end,
                 words=words, language=getattr(info, "language", self.language), final=True,
+                metadata=(
+                    self.hints.private_metadata("faster-whisper-native")
+                    if self.hints.active else {}
+                ),
             )
 
     def close(self) -> None:

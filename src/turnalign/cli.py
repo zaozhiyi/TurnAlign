@@ -8,6 +8,7 @@ from pathlib import Path
 from .audio import file_chunks, input_devices, microphone_chunks, write_wave
 from .backends.jsonl import JsonlBackend
 from .devices import runtime_report
+from .hints import AsrHints
 from .models import TranscriptEvent
 from .plugins import AsrConfig
 from .registry import available, create_asr, create_component
@@ -113,6 +114,23 @@ def _config(args) -> AsrConfig:
         executable=getattr(args, "executable", None),
         model_path=getattr(args, "model_path", None),
         extra=_extra_options(args.backend_option),
+        hints=_hints(args),
+    )
+
+
+def _hints(args) -> AsrHints:
+    hotwords = list(getattr(args, "hotword", []) or [])
+    for path in getattr(args, "hotwords_file", []) or []:
+        with path.open("r", encoding="utf-8-sig") as source:
+            hotwords.extend(line.strip() for line in source)
+    context = getattr(args, "context", None)
+    context_file = getattr(args, "context_file", None)
+    if context_file is not None:
+        context = context_file.read_text(encoding="utf-8-sig")
+    return AsrHints(
+        hotwords=tuple(hotwords),
+        context=context,
+        boost=getattr(args, "hotword_boost", None),
     )
 
 
@@ -219,6 +237,18 @@ def _add_backend_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--executable", help="Executable used by command-based backends")
     parser.add_argument("--model-path", help="Local model path used by command-based backends")
     parser.add_argument("--backend-option", action="append", default=[], metavar="KEY=VALUE")
+    parser.add_argument("--hotword", action="append", default=[], help="Private phrase hint; repeat as needed")
+    parser.add_argument(
+        "--hotwords-file", action="append", default=[], type=Path,
+        help="UTF-8 file with one private phrase per line",
+    )
+    context_group = parser.add_mutually_exclusive_group()
+    context_group.add_argument("--context", help="Private topic context for prompt-capable ASR")
+    context_group.add_argument("--context-file", type=Path, help="UTF-8 private topic context file")
+    parser.add_argument(
+        "--hotword-boost", type=float,
+        help="Numeric boost for backends that explicitly support weighted hotwords",
+    )
 
 
 def _add_segmentation_arguments(parser: argparse.ArgumentParser) -> None:

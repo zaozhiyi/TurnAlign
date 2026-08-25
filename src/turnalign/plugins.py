@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Iterable, Protocol, runtime_checkable
 
 from .models import AudioChunk, Hypothesis, SpeakerTurn, SpeechSegment, Word
+from .hints import AsrHints
 
 
 class Accelerator(str, Enum):
@@ -22,6 +23,8 @@ class BackendCapabilities:
     streaming: bool = False
     word_timestamps: bool = False
     hotwords: bool = False
+    context_prompt: bool = False
+    hotword_boost: bool = False
     languages: tuple[str, ...] = ()
     accelerators: tuple[Accelerator, ...] = (Accelerator.CPU,)
 
@@ -37,6 +40,7 @@ class AsrConfig:
     executable: str | None = None
     model_path: str | None = None
     extra: dict[str, Any] | None = None
+    hints: AsrHints = field(default_factory=AsrHints)
 
 
 @runtime_checkable

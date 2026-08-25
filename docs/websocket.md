@@ -12,6 +12,8 @@ The first frame must be JSON text:
   "type": "start",
   "backend": "glm-asr",
   "model": "zai-org/GLM-ASR-Nano-2512",
+  "hotwords": ["PHRASE_A", "PHRASE_B"],
+  "context": "optional private topic context",
   "language": "zh",
   "device": "rocm:0",
   "sample_rate": 16000,
@@ -26,6 +28,11 @@ The first frame must be JSON text:
 
 The server replies with `{"type":"ready", ...}` after the worker starts. Model
 loading may continue until the first audio segment is decoded.
+
+`hotwords` must be a JSON array of strings. `context` is optional and is rejected
+when the selected backend does not advertise prompt support. The ready message
+and transcript events report hint counts and application method only; they never
+echo the private values.
 
 ## Audio and output
 

@@ -72,6 +72,23 @@ They are imported lazily and require the `funasr-pipeline` extra. A session may
 use different devices per component, such as MPS for GLM-ASR and CPU for all
 three FunASR components.
 
+## ASR hints and private context
+
+`AsrHints` is the backend-neutral contract for optional phrases, free-form topic
+context, and a future numeric boost. Backends declare `hotwords`,
+`context_prompt`, and `hotword_boost` capabilities before model construction, so
+unsupported combinations fail without loading model weights.
+
+- GLM-ASR compiles phrases and context into a bounded transcription prompt.
+- Transformers Whisper and whisper.cpp receive initial prompt text.
+- faster-whisper receives native `hotwords` plus `initial_prompt`.
+- FunASR receives its native `hotword` generation option.
+
+Event metadata contains only the hint method, phrase count, context-present flag,
+and boost-present flag. It must never contain the actual private values. Plugin
+authors should preserve this redaction rule even when an upstream runtime uses a
+different request schema.
+
 ## Event semantics
 
 - `partial`: visible low-latency hypothesis; replaceable.

@@ -45,9 +45,12 @@ class WebSocketTests(unittest.IsolatedAsyncioTestCase):
                     await websocket.send(json.dumps({
                         "type": "start", "backend": "fake",
                         "sample_rate": 16_000, "channels": 1,
+                        "hotwords": ["PRIVATE_TERM"],
                     }))
                     ready = json.loads(await websocket.recv())
                     self.assertEqual(ready["type"], "ready")
+                    self.assertEqual(ready["config"]["hints"]["hotword_count"], 1)
+                    self.assertNotIn("PRIVATE_TERM", json.dumps(ready))
                     pcm = array("h", [1500] * 1600 + [0] * 12_800).tobytes()
                     await websocket.send(pcm)
                     await websocket.send(json.dumps({"type": "end"}))
