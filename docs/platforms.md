@@ -58,11 +58,13 @@ The JSON contains `selected` plus a `backend_plan`. Service deployments can set
 one explicit value:
 
 ```bash
-export TURNALIGN_DEVICE=cpu        # auto, cpu, cuda[:N], rocm[:N], mps
+export TURNALIGN_DEVICE=cpu        # auto, cpu, cuda[:N], rocm[:N], mps; vulkan[:N] for whisper-cpp
 ```
 
-An explicit unavailable device fails fast. `auto` prefers CUDA, ROCm, MPS and
-then CPU, restricted by the selected plugin's declared capabilities.
+An explicitly unavailable device handled by `doctor` fails fast. `whisper.cpp`
+Vulkan devices are not probed by `doctor`; their availability is confirmed only
+when the external executable starts. `auto` prefers CUDA, ROCm, MPS and then
+CPU, restricted by the selected plugin's declared capabilities.
 
 ## whisper.cpp Vulkan
 
@@ -88,6 +90,18 @@ unknown backend options fail before launching the subprocess. On Windows the
 subprocess runs below normal priority. Device numbering and stability belong to
 the selected executable and driver, so verify the device name and a short
 representative recording before starting a long job.
+
+The 2026-08-27 Windows follow-up pinned the unsigned
+`lemonade-sdk/whisper.cpp-rocm` v1.8.4 Vulkan asset by SHA-256 before running it:
+
+| Device | Result | Claim boundary |
+|---|---|---|
+| AMD integrated GPU, `vulkan:1` | TurnAlign E2E passed; RTF 0.9579; event validation passed | `small-q5_1` text quality was poor; no WER/CER |
+| RX 7650 GRE, `vulkan:0` | Failed twice with `0xC0000409` | Specific to the pinned downstream build and current driver |
+| Alternate v1.8.4.1 build | Not run | Incomplete download was removed |
+
+This verifies the integrated-GPU execution path only. It does not establish
+Vulkan transcript quality or general compatibility for other builds and GPUs.
 
 ## macOS / Apple Silicon
 
@@ -143,6 +157,19 @@ usable, or when explicitly requested. If ONNX Runtime is installed, `doctor`
 also reports available execution providers. Prefer quantized/int8 models only
 when the chosen model and backend explicitly support them.
 
+On the tested Windows host, faster-whisper Medium INT8 with four threads, VAD,
+and `BelowNormal` processed a 120-second sample at about 4.27x real time while
+whole-system CPU averaged 42.03%. A 12-thread configuration had saturated the
+CPU and is not the recommended fallback.
+
+DirectML is not a built-in TurnAlign backend. An out-of-tree experiment on the
+pinned PyTorch/torch-directml/Transformers stack found that structured
+generation output and its `.sequences` field are required; the raw Tensor path
+materialized incorrectly as `[0, 0]`. FP16 short samples then ran on the AMD
+integrated GPU and RX 7650 GRE, while integrated-GPU FP32 text remained
+unreliable. Treat this as version-specific adapter evidence, not a generic
+DirectML support claim.
+
 ## Plugin integration
 
 A plugin should call `select_device` with its capability list, then consume
@@ -166,11 +193,17 @@ startup error instead of a silent CPU fallback.
 ## Validation matrix
 
 - Real AMD ROCm run: RX 7650 GRE, Windows, full ASR + diarization workload.
+- Real Windows whisper.cpp Vulkan run: AMD integrated GPU, `vulkan:1`, short
+  TurnAlign E2E with event validation; transcript quality not accepted.
+- Real Windows CPU fallback run: faster-whisper Medium INT8, four threads,
+  VAD, and below-normal process priority.
+- Out-of-tree DirectML short-sample A/B: structured FP16 generation ran on both
+  AMD GPUs; no DirectML adapter ships in this repository.
 - Simulated hardware tests: two NVIDIA GPUs, two AMD GPUs, Apple MPS and CPU.
 - Selection tests: automatic priority, plugin capability filtering, explicit
   index, environment override and unavailable-device failure.
 - CLI test: `doctor` returns parseable JSON with a backend plan.
 
-Physical Mac and NVIDIA performance runs are still required before publishing
-platform-specific throughput claims; their control paths are covered without
-pretending a simulated probe is a hardware benchmark.
+A physical NVIDIA performance run is still required before publishing CUDA
+throughput claims. The physical Mac result is summarized in the README; the
+remaining simulated control paths are not presented as hardware benchmarks.

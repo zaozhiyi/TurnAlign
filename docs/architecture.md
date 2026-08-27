@@ -121,7 +121,7 @@ accelerators and accepts an explicit user override. Recommended implementations:
 | Platform | Preferred runtime | Fallback |
 |---|---|---|
 | NVIDIA Windows/Linux | CUDA PyTorch or TensorRT | CPU/ONNX |
-| AMD Windows | ROCm PyTorch where supported | CPU/ONNX or DirectML plugin |
+| AMD Windows | ROCm PyTorch where supported | CPU/ONNX; DirectML requires an external experimental adapter and the structured-generation workaround documented in [validation.md](validation.md) |
 | AMD Linux | ROCm PyTorch | CPU/ONNX |
 | Apple Silicon | Metal/MPS or CoreML | CPU/ONNX |
 | Intel/portable CPU | ONNX Runtime/OpenVINO | native CPU |

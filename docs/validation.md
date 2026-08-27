@@ -1,11 +1,15 @@
 # Local validation report
 
-Date: 2026-08-24
+Initial full-workload date: 2026-08-24
+Windows low-load backend follow-up: 2026-08-27
 Host: Windows, AMD RX 7650 GRE; core tests do not require a GPU.
 
 ## Automated checks
 
-- 41 unit/integration tests pass, including rolling batch-model partials, a loopback WebSocket session, and alignment/diarization replacement flow.
+- 75 unit/integration tests pass, one optional test is skipped by environment,
+  and 10 subtests cover rolling batch-model partials, a loopback WebSocket
+  session, alignment/diarization replacement flow, private-hint redaction,
+  execution profiles, and whisper.cpp Vulkan argument constraints.
 - All source and test modules pass `compileall`.
 - GLM-ASR full transcript: 259 commits plus one `end` event; validation passes.
 - Whisper Medium GPU full transcript: 259 commits plus one `end` event; validation passes.
@@ -26,6 +30,55 @@ Host: Windows, AMD RX 7650 GRE; core tests do not require a GPU.
 - CPU is always available; explicit selection, multi-GPU index selection,
   environment override, backend capability filtering and failure on unavailable
   accelerators all pass.
+
+## Windows low-load backend follow-up
+
+The follow-up host also has an AMD Ryzen 5 5600GT integrated Radeon. It reports
+about 4,079 MiB of dedicated GPU memory and 14,282 MiB of shared system memory.
+The shared amount is addressable system RAM, not equivalent-bandwidth VRAM.
+
+### whisper.cpp Vulkan
+
+The unsigned `lemonade-sdk/whisper.cpp-rocm` v1.8.4 Windows Vulkan asset was
+pinned to SHA-256
+`e0d20a0f92e31b98adc0faf71172efc810b701e6391a9d858ca045bff26f77cd`.
+The `ggml-small-q5_1.bin` model was pinned to revision
+`5359861c739e955e79d9a303bcbc70fb988958b1` and SHA-256
+`ae85e4a935d7a567bd102fe55afc16bb595bdb618e11b2fc7591bc08120411bb`.
+
+- Direct `whisper-cli -dev 1` on the integrated GPU completed in 4.301 seconds.
+- TurnAlign `--device vulkan:1` completed end to end at RTF 0.9579. Whole-system
+  CPU averaged 12.63%, peaked at 18.83%, and event validation passed.
+- The short `small-q5_1` transcript was poor and there is no human reference,
+  so this is execution-path evidence rather than a WER/CER or quality result.
+- RX 7650 GRE `-dev 0` failed twice with `0xC0000409`, with Flash Attention both
+  enabled and disabled. This failure is scoped to the pinned downstream build
+  and current driver rather than generalized to every Vulkan build.
+
+### DirectML experiment outside TurnAlign
+
+TurnAlign does not ship a DirectML adapter. A separate A/B used PyTorch
+2.4.1+cpu, torch-directml 0.2.5.dev240914, and Transformers 4.57.6. On this
+stack, accepting the raw `model.generate()` Tensor materialized `[0, 0]` and
+decoded as punctuation. Setting `return_dict_in_generate=True` and reading
+`.sequences` restored a structurally valid sequence.
+
+- Integrated Radeon FP16: 3.916 seconds, RTF 0.9138.
+- RX 7650 GRE FP16: 1.450 seconds, RTF 0.3383.
+- Integrated Radeon FP32: 5.090 seconds, RTF 1.1876, but semantically unreliable
+  text and therefore not recommended.
+
+The FP16 runs prove that the integrated GPU is not limited to its roughly 4 GiB
+dedicated allocation, but they are short-sample, version-specific runtime
+evidence without an accuracy reference. They are not a TurnAlign supported
+backend claim.
+
+### CPU fallback
+
+The existing 120-second faster-whisper Medium INT8 run used four threads, VAD,
+and Windows `BelowNormal`. It reached about 4.27x real time with 42.03% average
+whole-system CPU. A 12-thread configuration had saturated the CPU, so the
+follow-up did not rerun that high-load setting.
 
 ## Full diarization run
 

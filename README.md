@@ -114,7 +114,11 @@ turnalign transcribe audio.mp3 --backend glm-asr \
 - 导出 2777 个非空语音段；时间轴没有乱序和相邻重叠。
 - GLM 正文与 Paraformer 时间轴融合后得到 466 个可读段，局部字符对齐率中位数为 88.6%。
 - 公共事件校验通过；当前单元与集成测试为 75 项通过、1 项按环境跳过，另含 10 个子测试，其中覆盖滚动 partial、WebSocket 本机回环、私有热词脱敏、跨平台 profile、并行后处理、批量时间对齐和 whisper.cpp Vulkan 参数约束。
-- AMD RX 7650 GRE 已完成真实硬件验证。Apple Silicon Mac Studio 已完成 macOS 实体机器验证，PyTorch 2.13.0 MPS 设备检测、FP16 张量计算和 Transformers Whisper 端到端转录均通过。NVIDIA CUDA 目前完成设备探针与选择逻辑测试，尚未进行实体机器性能测试。
+- AMD RX 7650 GRE + PyTorch ROCm 已完成真实全链路硬件验证；该结论不涵盖同一显卡的 DirectML 或 Vulkan 路径。
+- Windows AMD 核显上的 `whisper.cpp` Vulkan 已完成 TurnAlign 短样本端到端验证：固定 v1.8.4 下游包使用 `vulkan:1`，RTF 为 0.9579，整机 CPU 平均 12.63%、峰值 18.83%，事件校验通过。但 `small-q5_1` 文本质量较差且没有人工真值；RX 7650 GRE 使用同一包的 `vulkan:0` 两次均以 `0xC0000409` 崩溃。因此这里只验证核显执行链路，不宣称 Vulkan 转写质量或独显兼容性。
+- 仓库外 DirectML A/B 在固定 PyTorch 2.4.1、torch-directml 0.2.5.dev240914、Transformers 4.57.6 组合下确认：必须读取结构化生成结果的 `.sequences`，才能避开裸 Tensor 被错误物化为 `[0, 0]` 的问题。修复后核显与 RX 7650 GRE 的 FP16 短样本可运行；核显 FP32 文本仍不可靠。TurnAlign 当前不内置 DirectML 适配器，因此这不是受支持后端的验收声明。
+- CPU-only 保留既有 faster-whisper Medium INT8、4 线程、VAD 开启和 Windows `BelowNormal` 的 120 秒实测结果（约 4.27 倍实时、整机 CPU 平均 42.03%）；本轮没有重跑会占满 CPU 的 12 线程方案。
+- Apple Silicon Mac Studio 已完成 macOS 实体机器验证，PyTorch 2.13.0 MPS 设备检测、FP16 张量计算和 Transformers Whisper 端到端转录均通过。NVIDIA CUDA 目前完成设备探针与选择逻辑测试，尚未进行实体机器性能测试。
 
 详细记录见 [docs/validation.md](docs/validation.md)。
 
@@ -132,6 +136,7 @@ turnalign transcribe audio.mp3 --backend glm-asr \
 - 说话人结果没有人工标注真值，暂时无法给出可靠的 DER。
 - 很短的应答、抢话和重叠语音仍可能分到相邻说话人。
 - GLM 正文按 30 秒窗口与 Paraformer 时间轴对齐，边界属于近似结果。
+- Vulkan 的设备稳定性取决于具体可执行包、驱动和 GPU；本机核显短样本可运行不代表质量合格，固定 v1.8.4 包的 RX 7650 GRE 路径未通过。
 
 ### 快速开始
 
@@ -180,6 +185,8 @@ python -m unittest discover -s tests -v
 ```
 
 可以通过 `--device cuda:0`、`rocm:0`、`mps` 或 `cpu` 固定通用设备。`whisper-cpp` 还支持显式 `--device vulkan:N`，索引直接映射到该可执行文件报告的 Vulkan 设备；这条路径不会由 `doctor` 自动探测。服务部署也可以设置 `TURNALIGN_DEVICE`。跨平台说明见 [docs/platforms.md](docs/platforms.md)，内部结构见 [docs/architecture.md](docs/architecture.md)。
+
+`vulkan:N` 映射已在本机 AMD 核显上完成 TurnAlign 端到端验证，但设备可运行不代表转写质量合格，不同 Vulkan 构建和 GPU 必须分别复测。本机 RX 7650 GRE 使用所固定的 v1.8.4 下游包会崩溃。
 
 文件转录默认启用 `energy` VAD；只有已确认模型可接受整段输入的短音频才建议使用 `--no-vad`。指定输出文件时，VAD 审计默认写入同目录的 `*.vad.jsonl`，末尾 `end` 事件同时报告语音时长、跳过时长、语音区间数和强制切段数。完整 FunASR 后处理在 Apple Silicon 上建议让 GLM-ASR 使用 MPS，FSMN/Paraformer/CAM++ 使用 CPU。
 
@@ -301,7 +308,11 @@ The test recording is 129.4 minutes of 16 kHz mono audio with background noise, 
 - The export contains 2,777 non-empty speech turns with no invalid ordering or adjacent overlap.
 - Fusion of GLM text with the Paraformer timeline produced 466 readable turns. Median local character alignment was 88.6%.
 - The common event validator passes; 75 unit and integration tests pass, one is skipped by environment, and 10 subtests cover rolling partials, loopback WebSocket, private-hint redaction, cross-platform profiles, parallel post-processing, batched alignment, and whisper.cpp Vulkan argument constraints.
-- AMD RX 7650 GRE has been tested on physical hardware. An Apple Silicon Mac Studio has also completed physical macOS validation, including PyTorch 2.13.0 MPS detection, FP16 tensor computation, and end-to-end Transformers Whisper transcription. NVIDIA CUDA currently has probe and selection-path coverage, without physical performance benchmarks yet.
+- AMD RX 7650 GRE plus PyTorch ROCm has completed a real full-pipeline hardware run; this claim does not cover DirectML or Vulkan on the same GPU.
+- `whisper.cpp` Vulkan has completed a short TurnAlign end-to-end run on the Windows AMD integrated GPU. With the pinned downstream v1.8.4 build and `vulkan:1`, RTF was 0.9579, whole-system CPU averaged 12.63% and peaked at 18.83%, and event validation passed. The `small-q5_1` text was poor and had no human reference; the same build crashed twice with `0xC0000409` on RX 7650 GRE `vulkan:0`. This verifies only the integrated-GPU execution path, not Vulkan transcript quality or discrete-GPU compatibility.
+- An out-of-tree DirectML A/B on pinned PyTorch 2.4.1, torch-directml 0.2.5.dev240914, and Transformers 4.57.6 found that callers must read `.sequences` from structured generation output to avoid a raw Tensor being materialized as `[0, 0]`. FP16 short samples then ran on both AMD GPUs, while integrated-GPU FP32 text remained unreliable. TurnAlign does not ship a DirectML adapter, so this is runtime evidence rather than supported-backend acceptance.
+- The existing CPU-only result uses faster-whisper Medium INT8, four threads, VAD, and Windows `BelowNormal` on a 120-second sample (about 4.27x real time and 42.03% average whole-system CPU). The CPU-saturating 12-thread configuration was not rerun.
+- An Apple Silicon Mac Studio has completed physical macOS validation, including PyTorch 2.13.0 MPS detection, FP16 tensor computation, and end-to-end Transformers Whisper transcription. NVIDIA CUDA currently has probe and selection-path coverage, without physical performance benchmarks yet.
 
 See [docs/validation.md](docs/validation.md) for the full run log and metrics.
 
@@ -319,6 +330,7 @@ See [docs/validation.md](docs/validation.md) for the full run log and metrics.
 - The speaker output has no human-labelled reference, so a reliable DER is not available.
 - Very short responses, interruptions, and overlapping speech may be assigned to a neighbouring speaker.
 - GLM text is aligned to the Paraformer timeline inside 30-second source windows, so speaker boundaries are approximate.
+- Vulkan device stability is specific to the executable build, driver, and GPU. A runnable integrated-GPU short sample is not a quality result, and the pinned v1.8.4 build did not pass on the RX 7650 GRE.
 
 ### Quick start
 
@@ -353,6 +365,8 @@ python -m unittest discover -s tests -v
 ```
 
 Use `--device cuda:0`, `rocm:0`, `mps`, or `cpu` to pin a general target. The `whisper-cpp` backend also accepts an explicit `--device vulkan:N`; the index maps directly to the Vulkan device reported by that executable and is not auto-detected by `doctor`. Service deployments can also set `TURNALIGN_DEVICE`. See [docs/platforms.md](docs/platforms.md) for platform setup and [docs/architecture.md](docs/architecture.md) for the internal contracts.
+
+The `vulkan:N` mapping has completed a TurnAlign end-to-end run on the tested AMD integrated GPU, but a runnable device is not a transcript-quality result and every Vulkan build/GPU pair must be retested. The pinned downstream v1.8.4 build crashes on this host's RX 7650 GRE.
 
 File transcription enables `energy` VAD by default; use `--no-vad` only for short audio that the selected model can accept in one request. With an output path, the VAD audit is written beside it as `*.vad.jsonl`, while the terminal `end` event reports speech, skipped audio, region, and forced-split totals. On Apple Silicon, the full optional pipeline is intended to run GLM-ASR on MPS and FSMN/Paraformer/CAM++ on CPU.
 
