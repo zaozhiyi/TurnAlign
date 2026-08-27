@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 from pathlib import Path
 
 from .audio import file_chunks, input_devices, microphone_chunks, write_wave
@@ -83,15 +84,41 @@ def validate_events(source: Path) -> int:
     return 0
 
 
+def _effective_device(requested: str) -> str:
+    return os.environ.get("TURNALIGN_DEVICE", requested).strip().lower()
+
+
 def _resolved_device(requested: str) -> str:
-    if requested != "auto":
-        return requested
+    effective = _effective_device(requested)
+    if effective != "auto":
+        return effective
     selected = runtime_report("auto")["selected"]
     accelerator = selected["accelerator"]
     if accelerator in {"cuda", "rocm"}:
         index = str(selected["device"]).split(":")[-1]
         return f"{accelerator}:{index}"
     return accelerator
+
+
+def _profile_requested_device(backend: str, requested: str) -> str:
+    """Use conservative post-processing defaults for explicit whisper.cpp Vulkan."""
+
+    normalized = _effective_device(requested)
+    if backend == "whisper-cpp" and re.fullmatch(r"vulkan(?::\d+)?", normalized):
+        return "cpu"
+    return requested
+
+
+def _profile_name(backend: str, requested_profile: str, requested_device: str) -> str:
+    """Avoid generic device probing for whisper.cpp-owned Vulkan devices."""
+
+    if (
+        requested_profile == "auto"
+        and backend == "whisper-cpp"
+        and re.fullmatch(r"vulkan(?::\d+)?", _effective_device(requested_device))
+    ):
+        return "cpu-low-memory"
+    return requested_profile
 
 
 def _extra_options(items: list[str]) -> dict[str, object]:
@@ -156,7 +183,8 @@ def _write_events(events, output: Path | None) -> int:
 
 def transcribe_file(args) -> int:
     profile = select_execution_profile(
-        args.execution_profile, requested_device=args.device
+        _profile_name(args.backend, args.execution_profile, args.device),
+        requested_device=_profile_requested_device(args.backend, args.device),
     )
     explicit_device = args.device != "auto" or "TURNALIGN_DEVICE" in os.environ
     asr_device = _resolved_device(args.device) if explicit_device else profile.asr_device
@@ -257,7 +285,11 @@ def _add_backend_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--backend", default="transformers-whisper", choices=available("asr"))
     parser.add_argument("--model")
     parser.add_argument("--language")
-    parser.add_argument("--device", default="auto")
+    parser.add_argument(
+        "--device",
+        default="auto",
+        help="auto, cpu, cuda[:index], rocm[:index], mps, or whisper-cpp vulkan[:index]",
+    )
     parser.add_argument("--compute-type")
     parser.add_argument("--executable", help="Executable used by command-based backends")
     parser.add_argument("--model-path", help="Local model path used by command-based backends")

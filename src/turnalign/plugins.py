@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Iterable, Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
-from .models import AudioChunk, Hypothesis, SpeakerTurn, SpeechSegment, Word
 from .hints import AsrHints
+from .models import AudioChunk, Hypothesis, SpeakerTurn, SpeechSegment, Word
 
 
 class Accelerator(str, Enum):
@@ -13,6 +14,7 @@ class Accelerator(str, Enum):
     CPU = "cpu"
     CUDA = "cuda"
     ROCM = "rocm"
+    VULKAN = "vulkan"
     MPS = "mps"
     COREML = "coreml"
     ONNX = "onnx"

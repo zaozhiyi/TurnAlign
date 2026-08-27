@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,9 +8,87 @@ from unittest.mock import patch
 
 from turnalign import cli
 from turnalign.cli import replay, validate_events
+from turnalign.devices import Device
+from turnalign.plugins import Accelerator
+from turnalign.profiles import select_execution_profile
 
 
 class CliIntegrationTests(unittest.TestCase):
+    @patch.dict(os.environ, {}, clear=True)
+    def test_whisper_cpp_vulkan_uses_cpu_profile_without_hiding_asr_device(self):
+        devices = [Device(
+            accelerator=Accelerator.CPU,
+            available=True,
+            runtime="native",
+            device="cpu",
+            vendor="test",
+            name="test CPU",
+            dtype="float32",
+        )]
+        requested = cli._profile_requested_device("whisper-cpp", "vulkan:1")
+        self.assertEqual(requested, "cpu")
+        self.assertEqual(cli._profile_requested_device("whisper-cpp", "vulkan:0"), "cpu")
+        self.assertEqual(
+            cli._profile_requested_device("whisper-cpp", " Vulkan:1 "), "cpu"
+        )
+        self.assertEqual(cli._profile_requested_device("whisper-cpp", "vulkan"), "cpu")
+        self.assertEqual(
+            cli._profile_name("whisper-cpp", "auto", "vulkan:1"),
+            "cpu-low-memory",
+        )
+        self.assertEqual(cli._resolved_device("vulkan:1"), "vulkan:1")
+        self.assertEqual(
+            select_execution_profile(
+                "auto", requested_device=requested, devices=devices, system="Windows"
+            ).name,
+            "cpu-low-memory",
+        )
+        with self.assertRaisesRegex(RuntimeError, "does not support requested accelerator"):
+            select_execution_profile(
+                "auto",
+                requested_device=cli._profile_requested_device(
+                    "transformers-whisper", "vulkan:1"
+                ),
+                devices=devices,
+                system="Windows",
+            )
+
+    def test_whisper_cpp_vulkan_environment_reaches_backend_without_generic_probe(self):
+        captured = {}
+
+        def fake_profile(name, *, requested_device):
+            captured["profile_name"] = name
+            captured["profile_device"] = requested_device
+            return SimpleNamespace(asr_device="cpu")
+
+        def fake_create(name, config):
+            captured["backend"] = name
+            captured["asr_device"] = config.device
+            raise RuntimeError("backend-created")
+
+        args = SimpleNamespace(
+            execution_profile="auto",
+            backend="whisper-cpp",
+            device="auto",
+            model=None,
+            language="zh",
+            compute_type=None,
+            executable="whisper-cli",
+            model_path="model.bin",
+            backend_option=[],
+        )
+        with patch.dict(os.environ, {"TURNALIGN_DEVICE": "vulkan:1"}), patch.object(
+            cli, "select_execution_profile", side_effect=fake_profile
+        ), patch.object(cli, "create_asr", side_effect=fake_create), self.assertRaisesRegex(
+            RuntimeError, "backend-created"
+        ):
+            cli.transcribe_file(args)
+
+        self.assertEqual(captured["profile_name"], "cpu-low-memory")
+        self.assertEqual(captured["profile_device"], "cpu")
+        self.assertEqual(captured["backend"], "whisper-cpp")
+        self.assertEqual(captured["asr_device"], "vulkan:1")
+
     def test_private_hint_files_are_loaded_without_becoming_output_configuration(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

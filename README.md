@@ -14,7 +14,7 @@
 - 固定长度切片可能截断句子，前后窗口也可能生成重复内容。
 - 说话人识别需要一段声音才能建立声纹，短插话和重叠说话容易错分。
 - 正文、字词时间戳和说话人标签往往来自不同模型，三条结果需要重新对齐。
-- CUDA、ROCm、MPS 和 CPU 后端的设备名称、精度和可用算子有差异。
+- CUDA、ROCm、MPS、CPU 以及 whisper.cpp Vulkan 运行时的设备名称、精度和可用算子有差异。
 
 ### 处理方式
 
@@ -113,7 +113,7 @@ turnalign transcribe audio.mp3 --backend glm-asr \
 - 说话人聚类得到 3 个簇：前段环境/闲聊人物 1 个，主讨论人物 2 个。
 - 导出 2777 个非空语音段；时间轴没有乱序和相邻重叠。
 - GLM 正文与 Paraformer 时间轴融合后得到 466 个可读段，局部字符对齐率中位数为 88.6%。
-- 公共事件校验通过，当前单元与集成测试共 70 项，其中包含滚动 partial、WebSocket 本机回环、私有热词脱敏、跨平台 profile、并行后处理和批量时间对齐测试。
+- 公共事件校验通过；当前单元与集成测试为 75 项通过、1 项按环境跳过，另含 10 个子测试，其中覆盖滚动 partial、WebSocket 本机回环、私有热词脱敏、跨平台 profile、并行后处理、批量时间对齐和 whisper.cpp Vulkan 参数约束。
 - AMD RX 7650 GRE 已完成真实硬件验证。Apple Silicon Mac Studio 已完成 macOS 实体机器验证，PyTorch 2.13.0 MPS 设备检测、FP16 张量计算和 Transformers Whisper 端到端转录均通过。NVIDIA CUDA 目前完成设备探针与选择逻辑测试，尚未进行实体机器性能测试。
 
 详细记录见 [docs/validation.md](docs/validation.md)。
@@ -154,6 +154,10 @@ turnalign transcribe meeting.mp3 --backend glm-asr --hotwords-file /path/to/priv
 turnalign transcribe meeting.mp3 --backend glm-asr --execution-profile auto \
   --vad-backend fsmn-vad --aligner paraformer --diarizer campp \
   --output meeting.jsonl
+turnalign transcribe meeting.wav --backend whisper-cpp \
+  --executable /path/to/whisper-cli --model-path /path/to/model.bin \
+  --device vulkan:1 --backend-option threads=2 \
+  --backend-option flash_attention=false --output meeting.jsonl
 turnalign listen --backend transformers-whisper --model openai/whisper-small --language zh
 turnalign audio-devices
 turnalign record sample.wav --duration 10
@@ -175,7 +179,7 @@ python -m turnalign.cli validate-events demo-events.jsonl
 python -m unittest discover -s tests -v
 ```
 
-可以通过 `--device cuda:0`、`rocm:0`、`mps` 或 `cpu` 固定设备。服务部署也可以设置 `TURNALIGN_DEVICE`。跨平台说明见 [docs/platforms.md](docs/platforms.md)，内部结构见 [docs/architecture.md](docs/architecture.md)。
+可以通过 `--device cuda:0`、`rocm:0`、`mps` 或 `cpu` 固定通用设备。`whisper-cpp` 还支持显式 `--device vulkan:N`，索引直接映射到该可执行文件报告的 Vulkan 设备；这条路径不会由 `doctor` 自动探测。服务部署也可以设置 `TURNALIGN_DEVICE`。跨平台说明见 [docs/platforms.md](docs/platforms.md)，内部结构见 [docs/architecture.md](docs/architecture.md)。
 
 文件转录默认启用 `energy` VAD；只有已确认模型可接受整段输入的短音频才建议使用 `--no-vad`。指定输出文件时，VAD 审计默认写入同目录的 `*.vad.jsonl`，末尾 `end` 事件同时报告语音时长、跳过时长、语音区间数和强制切段数。完整 FunASR 后处理在 Apple Silicon 上建议让 GLM-ASR 使用 MPS，FSMN/Paraformer/CAM++ 使用 CPU。
 
@@ -197,7 +201,7 @@ TurnAlign is a model-replaceable streaming ASR orchestration prototype. It conne
 - Fixed-size chunks may cut through a sentence, while overlapping windows may repeat text.
 - Speaker identification needs enough speech to form an embedding. Short interjections and overlapping speech remain difficult.
 - Text, word timing, and speaker labels often come from separate models and need to be aligned again.
-- CUDA, ROCm, MPS, and CPU runtimes use different device names, precisions, and operator sets.
+- CUDA, ROCm, MPS, CPU, and whisper.cpp Vulkan runtimes use different device names, precisions, and operator sets.
 
 ### How it works
 
@@ -296,7 +300,7 @@ The test recording is 129.4 minutes of 16 kHz mono audio with background noise, 
 - Speaker clustering produced three clusters: one for the earlier ambient/casual section and two for the main discussion.
 - The export contains 2,777 non-empty speech turns with no invalid ordering or adjacent overlap.
 - Fusion of GLM text with the Paraformer timeline produced 466 readable turns. Median local character alignment was 88.6%.
-- The common event validator passes, along with 70 unit and integration tests, including rolling partials, loopback WebSocket, private-hint redaction, cross-platform profiles, parallel post-processing, and batched alignment.
+- The common event validator passes; 75 unit and integration tests pass, one is skipped by environment, and 10 subtests cover rolling partials, loopback WebSocket, private-hint redaction, cross-platform profiles, parallel post-processing, batched alignment, and whisper.cpp Vulkan argument constraints.
 - AMD RX 7650 GRE has been tested on physical hardware. An Apple Silicon Mac Studio has also completed physical macOS validation, including PyTorch 2.13.0 MPS detection, FP16 tensor computation, and end-to-end Transformers Whisper transcription. NVIDIA CUDA currently has probe and selection-path coverage, without physical performance benchmarks yet.
 
 See [docs/validation.md](docs/validation.md) for the full run log and metrics.
@@ -332,6 +336,10 @@ turnalign transcribe meeting.mp3 --backend glm-asr --hotwords-file /path/to/priv
 turnalign transcribe meeting.mp3 --backend glm-asr --execution-profile auto \
   --vad-backend fsmn-vad --aligner paraformer --diarizer campp \
   --output meeting.jsonl
+turnalign transcribe meeting.wav --backend whisper-cpp \
+  --executable /path/to/whisper-cli --model-path /path/to/model.bin \
+  --device vulkan:1 --backend-option threads=2 \
+  --backend-option flash_attention=false --output meeting.jsonl
 turnalign listen --backend transformers-whisper --model openai/whisper-small
 turnalign serve --backend glm-asr --device auto
 ```
@@ -344,7 +352,7 @@ python -m turnalign.cli doctor --device auto
 python -m unittest discover -s tests -v
 ```
 
-Use `--device cuda:0`, `rocm:0`, `mps`, or `cpu` to pin a target. Service deployments can also set `TURNALIGN_DEVICE`. See [docs/platforms.md](docs/platforms.md) for platform setup and [docs/architecture.md](docs/architecture.md) for the internal contracts.
+Use `--device cuda:0`, `rocm:0`, `mps`, or `cpu` to pin a general target. The `whisper-cpp` backend also accepts an explicit `--device vulkan:N`; the index maps directly to the Vulkan device reported by that executable and is not auto-detected by `doctor`. Service deployments can also set `TURNALIGN_DEVICE`. See [docs/platforms.md](docs/platforms.md) for platform setup and [docs/architecture.md](docs/architecture.md) for the internal contracts.
 
 File transcription enables `energy` VAD by default; use `--no-vad` only for short audio that the selected model can accept in one request. With an output path, the VAD audit is written beside it as `*.vad.jsonl`, while the terminal `end` event reports speech, skipped audio, region, and forced-split totals. On Apple Silicon, the full optional pipeline is intended to run GLM-ASR on MPS and FSMN/Paraformer/CAM++ on CPU.
 

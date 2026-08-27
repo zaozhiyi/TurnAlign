@@ -64,6 +64,31 @@ export TURNALIGN_DEVICE=cpu        # auto, cpu, cuda[:N], rocm[:N], mps
 An explicit unavailable device fails fast. `auto` prefers CUDA, ROCm, MPS and
 then CPU, restricted by the selected plugin's declared capabilities.
 
+## whisper.cpp Vulkan
+
+Vulkan selection is owned by the external `whisper.cpp` executable rather than
+PyTorch, so `turnalign doctor` does not auto-detect or rank these devices. Pin
+the index printed by `whisper-cli --help` (or its device-listing output) with
+the `whisper-cpp` backend:
+
+```bash
+turnalign transcribe sample.wav --backend whisper-cpp \
+  --executable /path/to/whisper-cli --model-path /path/to/model.bin \
+  --device vulkan:1 --backend-option threads=2 \
+  --backend-option flash_attention=false --output events.jsonl
+```
+
+`TURNALIGN_DEVICE=vulkan:1` is equivalent for `whisper-cpp` listen or service
+deployments. It does not make Vulkan available to PyTorch-based backends or to
+the `doctor` probe.
+
+TurnAlign maps `vulkan:N` only to the native `-dev N` argument. Thread counts
+are limited to 1 through 64, `flash_attention` must be a JSON boolean, and
+unknown backend options fail before launching the subprocess. On Windows the
+subprocess runs below normal priority. Device numbering and stability belong to
+the selected executable and driver, so verify the device name and a short
+representative recording before starting a long job.
+
 ## macOS / Apple Silicon
 
 Use a native arm64 Python environment, install a current macOS PyTorch build,
