@@ -30,15 +30,29 @@ async def main() -> None:
                 "channels": source.getnchannels(),
             }))
             print(await socket.recv())
+            can_send = asyncio.Event()
+            can_send.set()
+
+            async def receive() -> None:
+                async for message in socket:
+                    print(message)
+                    payload = json.loads(message)
+                    if payload.get("type") == "flow_control":
+                        if payload.get("action") == "pause":
+                            can_send.clear()
+                        elif payload.get("action") == "resume":
+                            can_send.set()
+                    if payload.get("kind") == "end":
+                        return
+
+            receiver = asyncio.create_task(receive())
             frames = max(1, source.getframerate() // 10)
             while data := source.readframes(frames):
+                await can_send.wait()
                 await socket.send(data)
                 await asyncio.sleep(len(data) / (2 * source.getnchannels() * source.getframerate()))
             await socket.send(json.dumps({"type": "end"}))
-            async for message in socket:
-                print(message)
-                if json.loads(message).get("kind") == "end":
-                    break
+            await receiver
 
 
 if __name__ == "__main__":

@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
+from ..hints import glm_transcription_prompt, whisper_initial_prompt
 from ..models import AudioChunk, Hypothesis, Word
 from ..plugins import Accelerator, AsrConfig, BackendCapabilities
-from ..hints import glm_transcription_prompt, whisper_initial_prompt
 from .common import collect_pcm, pcm_to_float32
 
 

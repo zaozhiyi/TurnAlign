@@ -5,17 +5,18 @@ from typing import Any
 
 from .plugins import AsrConfig
 
-
 ENTRY_POINT_GROUPS = {
     "asr": "turnalign.backends",
     "vad": "turnalign.vad",
     "alignment": "turnalign.alignment",
     "diarization": "turnalign.diarization",
+    "online_diarization": "turnalign.online_diarization",
 }
 
 BUILTIN_ASR = {
     "faster-whisper": "turnalign.backends.faster_whisper:FasterWhisperBackend",
     "funasr": "turnalign.backends.funasr:FunAsrBackend",
+    "funasr-streaming": "turnalign.backends.funasr_streaming:FunAsrStreamingBackend",
     "glm-asr": "turnalign.backends.transformers:GlmAsrBackend",
     "transformers-whisper": "turnalign.backends.transformers:TransformersWhisperBackend",
     "whisper-cpp": "turnalign.backends.whisper_cpp:WhisperCppBackend",

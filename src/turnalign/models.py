@@ -109,12 +109,27 @@ class TranscriptEvent:
     words: list[Word] = field(default_factory=list)
     speaker: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    protocol_version: int = 1
+    session_id: str | None = None
+    sequence: int | None = None
+    source_timestamp: float | None = None
+    acknowledged_sequence: int | None = None
 
     def __post_init__(self) -> None:
         if not self.segment_id:
             raise ValueError("segment_id must not be empty")
         if self.revision < 1:
             raise ValueError("revision must be at least 1")
+        if self.protocol_version < 1:
+            raise ValueError("protocol_version must be at least 1")
+        if self.sequence is not None and self.sequence < 0:
+            raise ValueError("sequence must be non-negative")
+        if self.acknowledged_sequence is not None and self.acknowledged_sequence < 0:
+            raise ValueError("acknowledged_sequence must be non-negative")
+        if self.source_timestamp is not None and (
+            not isfinite(self.source_timestamp) or self.source_timestamp < 0
+        ):
+            raise ValueError("source_timestamp must be non-negative")
         if not _valid_range(self.start, self.end):
             raise ValueError("invalid event time range")
 
@@ -122,7 +137,7 @@ class TranscriptEvent:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, item: dict[str, Any]) -> "TranscriptEvent":
+    def from_dict(cls, item: dict[str, Any]) -> TranscriptEvent:
         data = dict(item)
         data["words"] = [word if isinstance(word, Word) else Word(**word) for word in data.get("words", [])]
         return cls(**data)

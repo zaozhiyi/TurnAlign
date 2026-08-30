@@ -1,11 +1,11 @@
 import unittest
 
-from turnalign.fusion import assign_speakers
 from turnalign.backends.jsonl import JsonlBackend
+from turnalign.fusion import assign_speakers
 from turnalign.models import AudioChunk, SpeakerTurn, TranscriptEvent, Word
 from turnalign.plugins import AsrBackend
-from turnalign.stabilizer import LocalAgreement, common_prefix
 from turnalign.registry import discover
+from turnalign.stabilizer import LocalAgreement, common_prefix
 from turnalign.validation import EventStreamValidator
 
 
@@ -27,6 +27,24 @@ class StabilizerTests(unittest.TestCase):
         state.update("产品经理")
         result = state.update("产品经理讨论")
         self.assertEqual(result.committed_delta, "产品")
+
+    def test_punctuation_spacing_and_case_do_not_rollback_stable_text(self):
+        state = LocalAgreement()
+        state.update("Hello, world")
+        result = state.update("hello world again")
+        self.assertEqual(state.committed, "Hello, world")
+        self.assertEqual(result.partial, " again")
+
+    def test_divergent_tail_is_not_committed(self):
+        state = LocalAgreement()
+        state.update("今天猫")
+        result = state.update("今天狗")
+        self.assertEqual(state.committed, "今天")
+        self.assertEqual(result.committed_delta, "今天")
+        self.assertEqual(result.partial, "狗")
+        final = state.update("今天狗终", final=True)
+        self.assertEqual(final.committed_delta, "狗终")
+        self.assertEqual(state.committed, "今天狗终")
 
     def test_final_flushes_tail(self):
         state = LocalAgreement()
@@ -72,8 +90,21 @@ class ModelTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             Word("x", float("nan"), 1.0)
 
+    def test_negative_protocol_sequence_fails(self):
+        with self.assertRaisesRegex(ValueError, "sequence"):
+            TranscriptEvent("partial", "s", 1, 0, 1, sequence=-1)
+
 
 class ValidationTests(unittest.TestCase):
+    def test_partial_commit_replace_end_sequence(self):
+        validator = EventStreamValidator()
+        validator.accept(TranscriptEvent("partial", "s1", 1, 0, 0.5, "hel"))
+        validator.accept(TranscriptEvent("partial", "s1", 2, 0, 0.8, "hello"))
+        validator.accept(TranscriptEvent("commit", "s1", 3, 0, 1, "hello"))
+        validator.accept(TranscriptEvent("replace", "s1", 4, 0, 1, "Hello"))
+        validator.accept(TranscriptEvent("end", "session", 1, 1, 1))
+        self.assertTrue(validator.ended)
+
     def test_commit_replace_end_sequence(self):
         validator = EventStreamValidator()
         validator.accept(TranscriptEvent("commit", "s1", 1, 0, 1, "a"))
@@ -97,6 +128,48 @@ class ValidationTests(unittest.TestCase):
         validator.accept(TranscriptEvent("commit", "s", 1, 0, 3))
         with self.assertRaisesRegex(ValueError, "precedes"):
             validator.accept(TranscriptEvent("end", "session", 1, 2, 2))
+
+    def test_end_rejects_uncommitted_partial(self):
+        validator = EventStreamValidator()
+        validator.accept(TranscriptEvent("partial", "s", 1, 0, 1, "draft"))
+        with self.assertRaisesRegex(ValueError, "open partial"):
+            validator.accept(TranscriptEvent("end", "session", 1, 1, 1))
+
+    def test_partial_cannot_follow_commit(self):
+        validator = EventStreamValidator()
+        validator.accept(TranscriptEvent("commit", "s", 1, 0, 1))
+        with self.assertRaisesRegex(ValueError, "commit -> partial"):
+            validator.accept(TranscriptEvent("partial", "s", 2, 0, 1))
+
+    def test_speaker_merge_requires_explicit_mapping(self):
+        validator = EventStreamValidator()
+        with self.assertRaisesRegex(ValueError, "from_speaker"):
+            validator.accept(TranscriptEvent("speaker_merge", "merge", 1, 0, 1))
+        validator.accept(TranscriptEvent(
+            "speaker_merge",
+            "merge",
+            1,
+            0,
+            1,
+            metadata={"from_speaker": "temp-1", "to_speaker": "speaker-1"},
+        ))
+
+    def test_protocol_and_event_sequence_stay_consistent(self):
+        validator = EventStreamValidator()
+        validator.accept(TranscriptEvent(
+            "commit", "s1", 1, 0, 1,
+            session_id="session-1", sequence=0,
+        ))
+        with self.assertRaisesRegex(ValueError, "contiguous"):
+            validator.accept(TranscriptEvent(
+                "commit", "s2", 1, 1, 2,
+                session_id="session-1", sequence=2,
+            ))
+        with self.assertRaisesRegex(ValueError, "session_id"):
+            validator.accept(TranscriptEvent(
+                "commit", "s2", 1, 1, 2,
+                session_id="session-2", sequence=1,
+            ))
 
 
 class RegistryTests(unittest.TestCase):

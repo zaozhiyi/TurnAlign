@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-
 MAX_HOTWORDS = 128
 MAX_HOTWORD_CHARS = 80
 MAX_CONTEXT_CHARS = 2_000

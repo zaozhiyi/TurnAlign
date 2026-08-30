@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import platform
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, replace
-from typing import Iterable
 
 from .devices import Device, detect_devices, select_device
 from .plugins import Accelerator

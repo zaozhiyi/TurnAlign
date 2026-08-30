@@ -27,6 +27,10 @@ class BackendCapabilities:
     hotwords: bool = False
     context_prompt: bool = False
     hotword_boost: bool = False
+    min_chunk_ms: int | None = None
+    lookahead_ms: int = 0
+    external_vad: bool = True
+    state_serialization: bool = False
     languages: tuple[str, ...] = ()
     accelerators: tuple[Accelerator, ...] = (Accelerator.CPU,)
 
@@ -51,6 +55,42 @@ class AsrBackend(Protocol):
     capabilities: BackendCapabilities
 
     def transcribe(self, chunks: Iterable[AudioChunk]) -> Iterable[Hypothesis]: ...
+
+    def close(self) -> None: ...
+
+
+@runtime_checkable
+class StreamingAsrSession(Protocol):
+    """Per-audio-stream state owned separately from a shared model."""
+
+    def accept_audio(self, chunk: AudioChunk) -> Iterable[Hypothesis]: ...
+
+    def finish(self) -> Iterable[Hypothesis]: ...
+
+    def cancel(self) -> None: ...
+
+    def close(self) -> None: ...
+
+
+@runtime_checkable
+class StatefulStreamingAsrBackend(AsrBackend, Protocol):
+    def start_session(self) -> StreamingAsrSession: ...
+
+
+@runtime_checkable
+class OnlineDiarizationSession(Protocol):
+    def accept_audio(self, chunk: AudioChunk) -> Iterable[SpeakerTurn]: ...
+
+    def finish(self) -> Iterable[SpeakerTurn]: ...
+
+    def close(self) -> None: ...
+
+
+@runtime_checkable
+class OnlineDiarizationBackend(Protocol):
+    name: str
+
+    def start_session(self) -> OnlineDiarizationSession: ...
 
     def close(self) -> None: ...
 

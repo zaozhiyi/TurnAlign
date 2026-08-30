@@ -129,6 +129,35 @@ class CliIntegrationTests(unittest.TestCase):
             self.assertEqual(cli.main(), 0)
         self.assertEqual(captured["vad_backend"], "none")
 
+    def test_listen_accepts_explicit_second_pass_backend(self):
+        captured = {}
+
+        def fake_listen(args):
+            captured["backend"] = args.refinement_backend
+            captured["model"] = args.refinement_model
+            captured["online_diarizer"] = args.online_diarizer
+            return 0
+
+        with patch.object(cli, "listen", fake_listen), patch(
+            "sys.argv",
+            [
+                "turnalign",
+                "listen",
+                "--refinement-backend",
+                "funasr",
+                "--refinement-model",
+                "paraformer-zh",
+                "--online-diarizer",
+                "custom-online-speaker",
+            ],
+        ):
+            self.assertEqual(cli.main(), 0)
+        self.assertEqual(captured, {
+            "backend": "funasr",
+            "model": "paraformer-zh",
+            "online_diarizer": "custom-online-speaker",
+        })
+
     def test_replay_creates_parent_and_valid_end_event(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

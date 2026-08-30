@@ -6,10 +6,11 @@ Host: Windows, AMD RX 7650 GRE; core tests do not require a GPU.
 
 ## Automated checks
 
-- 75 unit/integration tests pass, one optional test is skipped by environment,
-  and 10 subtests cover rolling batch-model partials, a loopback WebSocket
-  session, alignment/diarization replacement flow, private-hint redaction,
-  execution profiles, and whisper.cpp Vulkan argument constraints.
+- The full unit/integration suite covers rolling batch partials, stateful
+  incremental FunASR calls, two-pass segment replacement, disk-backed audio
+  slicing, loopback WebSocket initialization/policy/model reuse,
+  alignment/diarization replacement, private-hint redaction, execution profiles,
+  and whisper.cpp Vulkan argument constraints.
 - All source and test modules pass `compileall`.
 - GLM-ASR full transcript: 259 commits plus one `end` event; validation passes.
 - Whisper Medium GPU full transcript: 259 commits plus one `end` event; validation passes.
@@ -18,6 +19,11 @@ Host: Windows, AMD RX 7650 GRE; core tests do not require a GPU.
 - A dependency-free `py3-none-any` wheel builds successfully.
 - The rebuilt wheel installs into a clean target directory and its packaged
   `doctor --device cpu` command returns a valid runtime plan.
+- `turnalign evaluate reference.jsonl hypothesis.jsonl` reports CER, WER,
+  permutation-invariant speaker error, segment counts, and revision updates per
+  segment. The speaker metric is a single-active-speaker interval score, not a
+  collar/overlap-aware pyannote DER. Dataset-specific thresholds still require
+  labelled audio.
 
 ## Cross-platform device matrix
 
@@ -112,7 +118,8 @@ UMAP/HDBSCAN clustering -> GLM-ASR text alignment.
 4. JSONL input is streamed line by line instead of loaded fully into memory.
 5. Invalid `NaN`/infinite timestamps, incomplete PCM frames and reversed ranges
    are rejected.
-6. Event validation rejects stale revisions, unknown replacements, reused IDs,
+6. Event validation accepts the legal `partial -> commit -> replace` lifecycle
+   and rejects stale revisions, unknown replacements, illegal transitions,
    out-of-order commits, early end events and events after session end.
 7. Equal speaker-overlap ties now use diarization confidence deterministically.
 8. JSONL parse failures include source path and line number.
@@ -129,12 +136,20 @@ UMAP/HDBSCAN clustering -> GLM-ASR text alignment.
 ## Known limitations
 
 - Microphone capture requires a working PortAudio input device; automated tests cover PCM sources and endpointing without recording private audio.
-- LocalAgreement currently compares exact characters; punctuation normalization
-  and token-aware agreement still need evaluation on actual partial hypotheses.
+- LocalAgreement is connected to the rolling batch live path. It ignores
+  punctuation, spacing, and case while locating the stable prefix; token-aware
+  agreement still needs evaluation on actual partial hypotheses.
 - GLM/Whisper model adapters and optional FSMN-VAD, Paraformer alignment, and
   CAM++ diarization components are now in-process and lazily loaded. The full
   FunASR path remains offline post-processing rather than live diarization.
-- Live/online diarization and WebSocket reconnection are not yet implemented.
+- An online diarization session contract and provisional event labelling are
+  implemented, but no built-in online speaker model has a defensible DER yet.
+- The common timeline and alignment slices are disk-backed and bounded in
+  batches. Current FSMN-VAD and CAM++ runtimes still require a full float array
+  because their upstream offline API is not incremental.
+- WebSocket v1 supports in-process resume, event replay, and disk-backed audio
+  continuation. Durable recovery after server process loss is not yet
+  implemented.
 - This recording has no human speaker-turn ground truth, so the run validates
   completeness and consistency but cannot report a defensible DER. Noise,
   overlapped speech and short interjections may still be misclustered.
