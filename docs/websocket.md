@@ -1,64 +1,155 @@
-# WebSocket protocol
+# WebSocket protocol v1
 
-The server is local-only by default (`127.0.0.1`). One connection represents one
-audio session. Audio is never uploaded by the TurnAlign core.
+The server binds to `127.0.0.1` by default. One connection represents one audio
+session. TurnAlign does not upload audio to a third-party service.
 
-## Start
+## Trust boundary
 
-The first frame must be JSON text:
+The default server policy accepts only the backend and model selected by the
+server operator. Client-controlled executable paths, model paths, aligners and
+diarizers are rejected unless the corresponding `turnalign serve --allow-*`
+option is set. Binding to a non-loopback address requires `--allow-remote`.
+
+For a non-local deployment, terminate TLS and enforce rate limits at a trusted
+reverse proxy. TurnAlign can additionally require a start-message token loaded
+from an environment variable:
+
+```bash
+export TURNALIGN_AUTH_TOKEN='replace-me'
+turnalign serve --allow-remote --auth-token-env TURNALIGN_AUTH_TOKEN
+```
+
+Do not put a literal token in shell history.
+
+## Start and ready
+
+The first frame must be a JSON object:
 
 ```json
 {
   "type": "start",
   "backend": "glm-asr",
   "model": "zai-org/GLM-ASR-Nano-2512",
+  "auth": "required only when configured by the server",
   "hotwords": ["PHRASE_A", "PHRASE_B"],
   "context": "optional private topic context",
   "language": "zh",
-  "device": "rocm:0",
   "sample_rate": 16000,
   "channels": 1,
-  "aligner": "my-aligner-plugin",
-  "diarizer": "my-diarizer-plugin",
   "silence_seconds": 0.7,
   "partial_seconds": 2.0,
   "max_utterance_seconds": 20
 }
 ```
 
-The server replies with `{"type":"ready", ...}` after the worker starts. Model
-loading may continue until the first audio segment is decoded.
+`ready` is sent only after the selected model and allowed components have loaded
+successfully:
 
-`hotwords` must be a JSON array of strings. `context` is optional and is rejected
-when the selected backend does not advertise prompt support. The ready message
-and transcript events report hint counts and application method only; they never
-echo the private values.
+```json
+{
+  "type": "ready",
+  "protocol_version": 1,
+  "session_id": "uuid",
+  "model_loaded": true,
+  "backend": "glm-asr",
+  "sample_rate": 16000,
+  "channels": 1,
+  "config": {},
+  "capabilities": {}
+}
+```
 
-## Audio and output
+If initialization fails, the server sends an error and never sends `ready`.
+Private hotword/context values are never copied into ready, event or error
+messages; only counts and usage flags are exposed.
 
-Send signed 16-bit little-endian PCM as binary frames. Each frame must contain
-complete samples and may contain no more than ten seconds of audio. The server
-returns TurnAlign JSON events (`partial`, `commit`, `replace`, `speaker_merge`,
-and `end`) as text frames.
+## Audio, framing and flow control
 
-When alignment or diarization plugins are selected, low-latency commits are sent
-first. After input finishes, enriched segments use `replace` with the same
-`segment_id` and a higher revision. The terminal `end` event includes audio
-duration, processing duration, real-time factor, and processing speed.
+Send signed 16-bit little-endian PCM as binary frames. A client frame must contain
+complete samples and cannot exceed ten seconds. The server re-frames all accepted
+input into fixed 20–100 ms internal chunks, so client frame size does not change
+VAD boundaries. The final remainder on an explicit `end` may be shorter than
+20 ms; an unacknowledged remainder is resent by the client after disconnect.
 
-Finish the session with:
+When the input queue is under pressure the server may send:
+
+```json
+{"type":"flow_control","action":"pause","queue_depth":96}
+```
+
+Clients must pause audio transmission until a matching `action:"resume"` message
+arrives. If the queue remains full, the session fails with a structured error
+instead of silently dropping PCM. Revisable `partial` events may be coalesced
+under output pressure; `commit`, `replace` and `end` are retained.
+
+Finish or cancel with:
 
 ```json
 {"type":"end"}
+{"type":"cancel"}
 ```
 
-Errors are returned as `{"type":"error","message":"..."}`. Do not expose the
-development server to an untrusted network: client-selected model identifiers
-may trigger model downloads, and command backends can reference server-local
-executables or model paths.
+`ping` receives `pong`.
 
-## Agent use
+## Transcript events
 
-Codex, Claude Code and other coding agents can call the CLI directly or implement
-this small protocol. JSONL stdout is stable enough for shell pipelines; WebSocket
-is intended for long-running applications and remote audio producers.
+The server returns `partial`, `commit`, `replace`, `speaker_merge`, and `end`
+events. Every event includes `protocol_version`, `session_id`, an event
+`sequence`, and the latest `acknowledged_sequence` for accepted internal audio.
+
+The legal segment lifecycle is:
+
+```text
+new -> partial -> partial -> commit -> replace -> replace
+new -> commit -> replace
+```
+
+`speaker_merge` contains distinct `metadata.from_speaker` and
+`metadata.to_speaker`. Post-processing always reuses the first-pass
+`segment_id`, increments `revision`, and does not append a duplicate segment.
+
+The `end` metadata includes audio and processing time, real-time factor, source
+frame/byte counts, normalized internal chunk count, queue peak, backpressure
+count and dropped-partial count.
+
+## Disconnect recovery
+
+Every accepted internal audio chunk is appended to a disk-backed in-process
+recovery timeline. After each binary client frame the server returns:
+
+```json
+{
+  "type": "audio_ack",
+  "session_id": "uuid",
+  "acknowledged_sequence": 12,
+  "buffered_bytes": 0
+}
+```
+
+After an unexpected disconnect, reconnect with the same configuration:
+
+```json
+{
+  "type": "start",
+  "backend": "glm-asr",
+  "resume_session_id": "uuid",
+  "acknowledged_event_sequence": 8
+}
+```
+
+The server replays stored events after sequence 8, reprocesses accepted audio
+after the last committed boundary, continues audio/event/segment sequences, and
+preserves the same session ID. An open partial is recovery-committed before new
+segments begin, avoiding duplicate IDs or revision rollback.
+
+Recovery is scoped to the lifetime of the server process and a bounded
+128-session store. Clients must retain source audio for process crashes or
+server replacement; durable cross-process recovery remains planned.
+
+Errors use:
+
+```json
+{"type":"error","code":"invalid_request","message":"..."}
+```
+
+Internal paths and backend exception details are redacted by default.

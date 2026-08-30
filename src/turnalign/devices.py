@@ -3,8 +3,9 @@ from __future__ import annotations
 import importlib
 import os
 import platform
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
-from typing import Any, Iterable, Protocol
+from typing import Any, Protocol
 
 from .plugins import Accelerator
 
@@ -40,7 +41,7 @@ class Device:
 def _optional_import(name: str) -> Any | None:
     try:
         return importlib.import_module(name)
-    except Exception:
+    except Exception:  # noqa: BLE001 - broken optional runtimes must not break doctor
         # A partially installed ML runtime often raises a DLL/driver RuntimeError
         # rather than ImportError. Doctor must still be able to report CPU.
         return None

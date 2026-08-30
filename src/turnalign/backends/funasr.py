@@ -39,7 +39,7 @@ class FunAsrBackend:
         try:
             import torch
             return bool(torch.cuda.is_available())
-        except Exception:
+        except Exception:  # noqa: BLE001 - optional torch runtimes fail in many ways
             return False
 
     def transcribe(self, chunks: Iterable[AudioChunk]) -> Iterable[Hypothesis]:

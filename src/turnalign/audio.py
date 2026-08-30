@@ -4,9 +4,12 @@ import math
 import queue
 import shutil
 import subprocess
+import tempfile
+import threading
 import wave
 from collections.abc import Iterator
 from pathlib import Path
+from typing import BinaryIO
 
 from .models import AudioChunk
 
@@ -16,6 +19,119 @@ def _chunk_bytes(sample_rate: int, channels: int, chunk_ms: int) -> int:
         raise ValueError("chunk_ms must be positive")
     frames = max(1, round(sample_rate * chunk_ms / 1000))
     return frames * channels * 2
+
+
+class AudioTimeline:
+    """Disk-backed, timestamp-addressable PCM timeline.
+
+    Audio bytes never accumulate in a Python list. Timestamp-based reads are
+    direct file seeks, so extracting many transcript segments does not rescan
+    all preceding chunks.
+    """
+
+    def __init__(self) -> None:
+        self._file: BinaryIO = tempfile.TemporaryFile(mode="w+b")  # noqa: SIM115
+        self._lock = threading.RLock()
+        self.sample_rate: int | None = None
+        self.channels: int | None = None
+        self.start: float | None = None
+        self.end: float = 0.0
+        self.chunk_count = 0
+        self._closed = False
+
+    @property
+    def duration(self) -> float:
+        return max(0.0, self.end - (self.start or 0.0))
+
+    @property
+    def frame_bytes(self) -> int:
+        if self.channels is None:
+            raise ValueError("audio timeline is empty")
+        return self.channels * 2
+
+    def append(self, chunk: AudioChunk) -> None:
+        if self._closed:
+            raise ValueError("audio timeline is closed")
+        if self.sample_rate is None:
+            self.sample_rate = chunk.sample_rate
+            self.channels = chunk.channels
+            self.start = chunk.start
+            self.end = chunk.start
+        elif (chunk.sample_rate, chunk.channels) != (self.sample_rate, self.channels):
+            raise ValueError("audio format changed while recording timeline")
+        assert self.start is not None
+        frame_seconds = 1 / chunk.sample_rate
+        if chunk.start < self.end - frame_seconds:
+            raise ValueError("audio timeline chunks must not overlap or move backwards")
+        offset = round((chunk.start - self.start) * chunk.sample_rate) * self.frame_bytes
+        with self._lock:
+            self._file.seek(offset)
+            self._file.write(chunk.pcm_s16le)
+            self._file.flush()
+        self.end = max(self.end, chunk.start + chunk.duration)
+        self.chunk_count += 1
+
+    def slice(self, start: float, end: float) -> AudioChunk:
+        if end < start:
+            raise ValueError("audio slice end must not precede start")
+        if self.sample_rate is None or self.channels is None or self.start is None:
+            return AudioChunk(b"", max(0.0, start))
+        bounded_start = max(start, self.start)
+        bounded_end = min(end, self.end)
+        if bounded_end <= bounded_start:
+            return AudioChunk(b"", max(0.0, bounded_start), self.sample_rate, self.channels)
+        first = round((bounded_start - self.start) * self.sample_rate) * self.frame_bytes
+        last = round((bounded_end - self.start) * self.sample_rate) * self.frame_bytes
+        with self._lock:
+            self._file.seek(first)
+            data = self._file.read(last - first)
+        return AudioChunk(data, bounded_start, self.sample_rate, self.channels)
+
+    def iter_chunks(
+        self,
+        chunk_ms: int = 500,
+        *,
+        start: float | None = None,
+        end: float | None = None,
+    ) -> Iterator[AudioChunk]:
+        if self.sample_rate is None or self.channels is None or self.start is None:
+            return
+        size = _chunk_bytes(self.sample_rate, self.channels, chunk_ms)
+        bounded_start = max(self.start, self.start if start is None else start)
+        bounded_end = min(self.end, self.end if end is None else end)
+        offset = round((bounded_start - self.start) * self.sample_rate) * self.frame_bytes
+        final_offset = round((bounded_end - self.start) * self.sample_rate) * self.frame_bytes
+        while offset < final_offset:
+            with self._lock:
+                self._file.seek(offset)
+                data = self._file.read(min(size, final_offset - offset))
+            if not data:
+                break
+            start = self.start + offset / (self.sample_rate * self.frame_bytes)
+            yield AudioChunk(data, start, self.sample_rate, self.channels)
+            offset += len(data)
+
+    @classmethod
+    def from_chunks(cls, chunks: Iterator[AudioChunk]) -> AudioTimeline:
+        timeline = cls()
+        try:
+            for chunk in chunks:
+                timeline.append(chunk)
+            return timeline
+        except BaseException:
+            timeline.close()
+            raise
+
+    def close(self) -> None:
+        if not self._closed:
+            self._file.close()
+            self._closed = True
+
+    def __enter__(self) -> AudioTimeline:  # noqa: PYI034
+        return self
+
+    def __exit__(self, *_errors: object) -> None:
+        self.close()
 
 
 def wave_chunks(path: Path, chunk_ms: int = 500) -> Iterator[AudioChunk]:

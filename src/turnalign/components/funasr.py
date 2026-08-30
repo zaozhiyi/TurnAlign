@@ -4,6 +4,7 @@ import re
 from collections.abc import Iterable, Iterator
 from difflib import SequenceMatcher
 
+from ..audio import AudioTimeline
 from ..backends.common import collect_pcm, pcm_to_float32
 from ..models import AudioChunk, SpeakerTurn, SpeechSegment, Word
 
@@ -22,27 +23,6 @@ def _auto_model():
 
 def _pytorch_device(device: str) -> str:
     return device.replace("rocm", "cuda", 1) if device.startswith("rocm") else device
-
-
-def _audio_chunk(chunks: list[AudioChunk], start: float, end: float) -> AudioChunk:
-    if not chunks:
-        raise ValueError("cannot slice an empty audio stream")
-    sample_rate, channels = chunks[0].sample_rate, chunks[0].channels
-    frame_bytes = channels * 2
-    output = bytearray()
-    for chunk in chunks:
-        if (chunk.sample_rate, chunk.channels) != (sample_rate, channels):
-            raise ValueError("audio format changed before component processing")
-        overlap_start = max(start, chunk.start)
-        overlap_end = min(end, chunk.start + chunk.duration)
-        if overlap_end <= overlap_start:
-            continue
-        first = round((overlap_start - chunk.start) * sample_rate) * frame_bytes
-        last = round((overlap_end - chunk.start) * sample_rate) * frame_bytes
-        output.extend(chunk.pcm_s16le[first:last])
-    if not output:
-        raise ValueError("component returned an empty audio region")
-    return AudioChunk(bytes(output), start, sample_rate, channels)
 
 
 def _result_item(result) -> dict:
@@ -78,38 +58,41 @@ class FsmnVadBackend:
         self.max_segment_seconds = float(max_segment_seconds)
 
     def segment(self, chunks: Iterable[AudioChunk]) -> Iterator[SpeechSegment]:
-        items = list(chunks)
-        data, sample_rate, channels, offset = collect_pcm(items)
-        if not data:
-            return
-        if sample_rate != 16_000:
-            raise ValueError("FSMN-VAD expects 16 kHz audio")
-        result = self.model.generate(
-            input=pcm_to_float32(data, channels), batch_size_s=self.batch_size_s
-        )
-        regions = _result_item(result).get("value") or []
-        duration = len(data) / (2 * channels * sample_rate)
-        previous_end = 0.0
-        for raw in sorted(regions, key=lambda item: float(item[0]) if item else 0.0):
-            if not isinstance(raw, (list, tuple)) or len(raw) < 2:
-                continue
-            start = max(previous_end, min(duration, float(raw[0]) / 1000.0))
-            end = max(start, min(duration, float(raw[1]) / 1000.0))
-            while end > start:
-                piece_end = min(end, start + self.max_segment_seconds)
-                forced = piece_end < end
-                absolute_start = offset + start
-                absolute_end = offset + piece_end
-                audio = _audio_chunk(items, absolute_start, absolute_end)
-                yield SpeechSegment(
-                    chunks=[audio],
-                    start=absolute_start,
-                    end=absolute_end,
-                    forced_split=forced,
-                    metadata={"model": self.model_id, "source_region_ms": list(raw[:2])},
-                )
-                start = piece_end
-            previous_end = max(previous_end, end)
+        with AudioTimeline.from_chunks(iter(chunks)) as timeline:
+            if timeline.start is None or timeline.sample_rate is None or timeline.channels is None:
+                return
+            if timeline.sample_rate != 16_000:
+                raise ValueError("FSMN-VAD expects 16 kHz audio")
+            full_audio = timeline.slice(timeline.start, timeline.end)
+            result = self.model.generate(
+                input=pcm_to_float32(full_audio.pcm_s16le, timeline.channels),
+                batch_size_s=self.batch_size_s,
+            )
+            regions = _result_item(result).get("value") or []
+            duration = timeline.duration
+            previous_end = 0.0
+            for raw in sorted(regions, key=lambda item: float(item[0]) if item else 0.0):
+                if not isinstance(raw, (list, tuple)) or len(raw) < 2:
+                    continue
+                start = max(previous_end, min(duration, float(raw[0]) / 1000.0))
+                end = max(start, min(duration, float(raw[1]) / 1000.0))
+                while end > start:
+                    piece_end = min(end, start + self.max_segment_seconds)
+                    forced = piece_end < end
+                    absolute_start = timeline.start + start
+                    absolute_end = timeline.start + piece_end
+                    audio = timeline.slice(absolute_start, absolute_end)
+                    if not audio.pcm_s16le:
+                        raise ValueError("component returned an empty audio region")
+                    yield SpeechSegment(
+                        chunks=[audio],
+                        start=absolute_start,
+                        end=absolute_end,
+                        forced_split=forced,
+                        metadata={"model": self.model_id, "source_region_ms": list(raw[:2])},
+                    )
+                    start = piece_end
+                previous_end = max(previous_end, end)
 
     def close(self) -> None:
         self.model = None

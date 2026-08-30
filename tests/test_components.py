@@ -1,5 +1,6 @@
 import unittest
 from array import array
+from itertools import pairwise
 from unittest.mock import patch
 
 from turnalign.components.energy_vad import EnergyVadBackend
@@ -111,7 +112,7 @@ class FunAsrComponentTests(unittest.TestCase):
             duration=0.5,
         )
         self.assertEqual("".join(word.text for word in words), "你好，世界")
-        self.assertTrue(all(left.end <= right.start for left, right in zip(words, words[1:])))
+        self.assertTrue(all(left.end <= right.start for left, right in pairwise(words)))
         self.assertGreaterEqual(words[0].start, 7.0)
         self.assertLessEqual(words[-1].end, 7.5)
 

@@ -1,0 +1,53 @@
+from __future__ import annotations
+
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
+
+from .audio import AudioTimeline
+from .models import AudioChunk, TranscriptEvent
+from .offline import OfflineRefinementPipeline
+from .realtime import RealtimePipeline
+
+
+@dataclass(slots=True)
+class TwoPassPipeline:
+    """Record once, emit a realtime draft, then refine the same segments."""
+
+    realtime: RealtimePipeline
+    offline: OfflineRefinementPipeline
+
+    def events(self, chunks: Iterable[AudioChunk]) -> Iterator[TranscriptEvent]:
+        commits: list[TranscriptEvent] = []
+        refinement_error: BaseException | None = None
+        with AudioTimeline() as timeline:
+            for event in self.realtime.events(
+                chunks,
+                recorded_timeline=timeline,
+                emit_end=False,
+            ):
+                if event.kind == "commit":
+                    commits.append(event)
+                yield event
+            try:
+                yield from self.offline.refine(timeline, commits)
+            except Exception as error:  # noqa: BLE001 - refinement is fail-open by design
+                refinement_error = error
+            yield TranscriptEvent(
+                kind="end",
+                segment_id="session",
+                revision=1,
+                start=timeline.end,
+                end=timeline.end,
+                metadata={
+                    "segments": len(commits),
+                    "passes": 2,
+                    "recording_storage": "disk-timeline",
+                    "refinement_status": (
+                        "failed" if refinement_error is not None else "complete"
+                    ),
+                    "refinement_error_type": (
+                        type(refinement_error).__name__
+                        if refinement_error is not None else None
+                    ),
+                },
+            )

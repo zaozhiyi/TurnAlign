@@ -5,15 +5,28 @@ import asyncio
 import json
 import os
 import re
+from dataclasses import replace
 from pathlib import Path
 
-from .audio import file_chunks, input_devices, microphone_chunks, write_wave
+from .audio import (
+    AudioTimeline,
+    file_chunks,
+    input_devices,
+    microphone_chunks,
+    write_wave,
+)
 from .backends.jsonl import JsonlBackend
 from .devices import runtime_report
+from .evaluation import evaluate_events
+from .exporters import render_srt, render_text
 from .hints import AsrHints
 from .models import TranscriptEvent
+from .offline import OfflineRefinementPipeline
+from .pipelines import TwoPassPipeline
 from .plugins import AsrConfig
+from .policy import ServerPolicy
 from .profiles import PROFILE_NAMES, profile_catalog, select_execution_profile
+from .realtime import RealtimePipeline
 from .registry import available, create_asr, create_component
 from .server import serve
 from .session import transcribe_events
@@ -81,6 +94,25 @@ def validate_events(source: Path) -> int:
     if not validator.ended:
         raise ValueError(f"{source}: missing end event")
     print(json.dumps({"status": "ok", "events": count, "commits": commits}, ensure_ascii=False))
+    return 0
+
+
+def _read_events(source: Path) -> list[TranscriptEvent]:
+    events = []
+    with source.open("r", encoding="utf-8-sig") as input_file:
+        for line_number, line in enumerate(input_file, 1):
+            if not line.strip():
+                continue
+            try:
+                events.append(TranscriptEvent.from_dict(json.loads(line)))
+            except (TypeError, ValueError, json.JSONDecodeError) as error:
+                raise ValueError(f"{source}:{line_number}: {error}") from error
+    return events
+
+
+def evaluate_files(reference: Path, hypothesis: Path) -> int:
+    report = evaluate_events(_read_events(reference), _read_events(hypothesis))
+    print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
     return 0
 
 
@@ -163,7 +195,19 @@ def _hints(args) -> AsrHints:
     )
 
 
-def _write_events(events, output: Path | None) -> int:
+def _write_events(events, output: Path | None, output_format: str = "jsonl") -> int:
+    if output_format != "jsonl":
+        rendered = (
+            render_srt(events)
+            if output_format == "srt"
+            else render_text(events)
+        )
+        if output:
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(rendered, encoding="utf-8")
+        else:
+            print(rendered, end="")
+        return 0
     if output:
         output.parent.mkdir(parents=True, exist_ok=True)
     destination = output.open("w", encoding="utf-8") if output else None
@@ -212,8 +256,8 @@ def transcribe_file(args) -> int:
     if args.parallel_postprocess is None and diarizer is not None:
         parallel_diarization = profile.parallel_diarization
     decoded = file_chunks(args.source, args.chunk_ms, args.ffmpeg)
-    recorded_audio = list(decoded) if parallel_diarization else None
-    chunks = iter(recorded_audio) if recorded_audio is not None else decoded
+    recorded_timeline = AudioTimeline.from_chunks(decoded) if parallel_diarization else None
+    chunks = recorded_timeline.iter_chunks(args.chunk_ms) if recorded_timeline is not None else decoded
     vad_output = args.vad_output
     if vad_backend is not None and vad_output is None and args.output is not None:
         vad_output = args.output.with_name(f"{args.output.stem}.vad.jsonl")
@@ -239,21 +283,30 @@ def transcribe_file(args) -> int:
                 diarizer=diarizer,
                 vad_backend=vad_backend,
                 vad_audit=write_vad_audit,
-                recorded_audio=recorded_audio,
+                recorded_timeline=recorded_timeline,
                 parallel_diarization=parallel_diarization,
                 execution_profile=profile.name,
             ),
             args.output,
+            args.output_format,
         )
     finally:
         if audit_file is not None:
             audit_file.close()
+        if recorded_timeline is not None:
+            recorded_timeline.close()
 
 
 def listen(args) -> int:
-    backend = create_asr(args.backend, _config(args))
+    config = _config(args)
+    backend = create_asr(args.backend, config)
     aligner = create_component("alignment", args.aligner, _extra_options(args.aligner_option)) if args.aligner else None
     diarizer = create_component("diarization", args.diarizer, _extra_options(args.diarizer_option)) if args.diarizer else None
+    online_diarizer = create_component(
+        "online_diarization",
+        args.online_diarizer,
+        _extra_options(args.online_diarizer_option),
+    ) if args.online_diarizer else None
     if args.warmup_file:
         try:
             list(backend.transcribe(file_chunks(args.warmup_file, args.chunk_ms, args.ffmpeg)))
@@ -267,18 +320,40 @@ def listen(args) -> int:
         chunk_ms=args.chunk_ms,
         duration=args.duration,
     )
-    return _write_events(
-        transcribe_events(
-            chunks, backend, live=True,
+    if args.refinement_backend:
+        refinement_backend = create_asr(
+            args.refinement_backend,
+            replace(config, model=args.refinement_model),
+        )
+        events = TwoPassPipeline(
+            RealtimePipeline(
+                backend,
+                vad_threshold=args.vad_threshold,
+                silence_seconds=args.silence_seconds,
+                max_utterance_seconds=args.max_utterance_seconds,
+                partial_seconds=args.partial_seconds,
+                online_diarizer=online_diarizer,
+            ),
+            OfflineRefinementPipeline(
+                refinement_backend,
+                aligner=aligner,
+                diarizer=diarizer,
+            ),
+        ).events(chunks)
+    else:
+        events = transcribe_events(
+            chunks,
+            backend,
+            live=True,
             vad_threshold=args.vad_threshold,
             silence_seconds=args.silence_seconds,
             max_utterance_seconds=args.max_utterance_seconds,
             partial_seconds=args.partial_seconds,
             aligner=aligner,
             diarizer=diarizer,
-        ),
-        args.output,
-    )
+            online_diarizer=online_diarizer,
+        )
+    return _write_events(events, args.output, args.output_format)
 
 
 def _add_backend_arguments(parser: argparse.ArgumentParser) -> None:
@@ -320,6 +395,13 @@ def _add_postprocess_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--aligner-option", action="append", default=[], metavar="KEY=VALUE")
     parser.add_argument("--diarizer", help="Diarization plugin entry-point name")
     parser.add_argument("--diarizer-option", action="append", default=[], metavar="KEY=VALUE")
+    parser.add_argument("--online-diarizer", help="Online diarization plugin entry-point name")
+    parser.add_argument(
+        "--online-diarizer-option",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+    )
 
 
 def _input_device(value: str | None) -> int | str | None:
@@ -339,6 +421,12 @@ def main() -> int:
     replay_parser.add_argument("--output", type=Path)
     validate_parser = commands.add_parser("validate-events", help="Validate a common event JSONL file")
     validate_parser.add_argument("source", type=Path)
+    evaluate_parser = commands.add_parser(
+        "evaluate",
+        help="Compare reference and hypothesis event JSONL",
+    )
+    evaluate_parser.add_argument("reference", type=Path)
+    evaluate_parser.add_argument("hypothesis", type=Path)
     doctor_parser = commands.add_parser("doctor", help="Detect and select the local inference device")
     doctor_parser.add_argument(
         "--device",
@@ -360,6 +448,11 @@ def main() -> int:
     transcribe_parser = commands.add_parser("transcribe", help="Transcribe a local audio file")
     transcribe_parser.add_argument("source", type=Path)
     transcribe_parser.add_argument("--output", type=Path)
+    transcribe_parser.add_argument(
+        "--output-format",
+        choices=("jsonl", "srt", "txt"),
+        default="jsonl",
+    )
     transcribe_parser.add_argument("--chunk-ms", type=int, default=500)
     transcribe_parser.add_argument("--ffmpeg", default="ffmpeg")
     vad_group = transcribe_parser.add_mutually_exclusive_group()
@@ -387,12 +480,23 @@ def main() -> int:
     _add_postprocess_arguments(transcribe_parser)
     listen_parser = commands.add_parser("listen", help="Transcribe the local microphone until Ctrl+C")
     listen_parser.add_argument("--output", type=Path)
+    listen_parser.add_argument(
+        "--output-format",
+        choices=("jsonl", "srt", "txt"),
+        default="jsonl",
+    )
     listen_parser.add_argument("--input-device")
     listen_parser.add_argument("--sample-rate", type=int, default=16_000)
     listen_parser.add_argument("--chunk-ms", type=int, default=100)
     listen_parser.add_argument("--duration", type=float)
     listen_parser.add_argument("--warmup-file", type=Path)
     listen_parser.add_argument("--ffmpeg", default="ffmpeg")
+    listen_parser.add_argument(
+        "--refinement-backend",
+        choices=available("asr"),
+        help="Optional second-pass ASR backend run after recording",
+    )
+    listen_parser.add_argument("--refinement-model")
     _add_backend_arguments(listen_parser)
     _add_segmentation_arguments(listen_parser)
     _add_postprocess_arguments(listen_parser)
@@ -404,17 +508,58 @@ def main() -> int:
     serve_parser.add_argument("--device", default="auto")
     serve_parser.add_argument("--warmup-file", type=Path)
     serve_parser.add_argument("--ffmpeg", default="ffmpeg")
+    serve_parser.add_argument(
+        "--allow-backend",
+        action="append",
+        default=[],
+        choices=available("asr"),
+        help="Additional backend clients may request; repeat as needed",
+    )
+    serve_parser.add_argument(
+        "--allow-model",
+        action="append",
+        default=[],
+        help="Additional model identifier clients may request; repeat as needed",
+    )
+    serve_parser.add_argument(
+        "--allow-component",
+        action="append",
+        default=[],
+        help="Alignment or diarization component clients may request",
+    )
+    serve_parser.add_argument("--allow-client-paths", action="store_true")
+    serve_parser.add_argument("--allow-component-options", action="store_true")
+    serve_parser.add_argument(
+        "--allow-remote",
+        action="store_true",
+        help="Allow binding beyond localhost; deploy TLS/auth in front",
+    )
+    serve_parser.add_argument(
+        "--auth-token-env",
+        help="Environment variable containing the required start-message auth token",
+    )
+    serve_parser.add_argument("--max-session-seconds", type=float, default=14_400.0)
+    serve_parser.add_argument("--internal-chunk-ms", type=int, default=100)
     args = parser.parse_args()
     if args.command == "replay":
         return replay(args.source, args.output)
     if args.command == "validate-events":
         return validate_events(args.source)
+    if args.command == "evaluate":
+        return evaluate_files(args.reference, args.hypothesis)
     if args.command == "doctor":
         print(json.dumps(runtime_report(args.device), ensure_ascii=False, indent=2))
         return 0
     if args.command == "backends":
         print(json.dumps({
-            kind: available(kind) for kind in ("asr", "vad", "alignment", "diarization")
+            kind: available(kind)
+            for kind in (
+                "asr",
+                "vad",
+                "alignment",
+                "diarization",
+                "online_diarization",
+            )
         }, ensure_ascii=False, indent=2))
         return 0
     if args.command == "profiles":
@@ -441,10 +586,30 @@ def main() -> int:
         except KeyboardInterrupt:
             return 130
     if args.command == "serve":
+        auth_token = None
+        if args.auth_token_env:
+            auth_token = os.environ.get(args.auth_token_env)
+            if not auth_token:
+                raise ValueError(
+                    f"authentication token environment variable is empty: {args.auth_token_env}"
+                )
+        policy = ServerPolicy(
+            allowed_backends=frozenset({args.backend, *args.allow_backend}),
+            allowed_models=frozenset(
+                model for model in [args.model, *args.allow_model] if model
+            ),
+            allowed_components=frozenset(args.allow_component),
+            allow_client_paths=args.allow_client_paths,
+            allow_component_options=args.allow_component_options,
+            allow_remote=args.allow_remote,
+            auth_token=auth_token,
+            max_session_seconds=args.max_session_seconds,
+        )
         asyncio.run(serve(
             args.host, args.port, default_backend=args.backend,
             default_model=args.model, default_device=_resolved_device(args.device),
             warmup_file=args.warmup_file, ffmpeg=args.ffmpeg,
+            policy=policy, internal_chunk_ms=args.internal_chunk_ms,
         ))
         return 0
     return 2

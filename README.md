@@ -45,7 +45,7 @@ flowchart LR
 | GLM-ASR-Nano-2512 | 当前实验的中文正文识别 |
 | OpenAI Whisper Medium + Hugging Face Transformers | 对照转录和 GPU 性能测试 |
 | FunASR | FSMN-VAD、Paraformer 时间戳与转录、CAM++ 说话人声纹 |
-| UMAP + HDBSCAN | 长录音的全局说话人聚类 |
+| UMAP + HDBSCAN | 仓库外长录音验证中的全局说话人聚类（非内置运行时） |
 | PyTorch | CUDA、ROCm 和 MPS 推理接口 |
 | ONNX Runtime | CPU 和可选执行 Provider 的接口预留 |
 
@@ -55,12 +55,13 @@ flowchart LR
 
 - 文件输入支持 PCM16 WAV；安装 FFmpeg 后可以读取 MP3、M4A 及 FFmpeg 能解码的其他格式。
 - 麦克风通过可选的 `sounddevice`/PortAudio 依赖采集，Windows、macOS 和 Linux 使用相同命令。
-- 内置 ASR 适配器包括 `glm-asr`、`transformers-whisper`、`faster-whisper`、`funasr` 和 `whisper-cpp`。第三方模型可以通过 Python entry point 注册。
+- 内置 ASR 适配器包括 `glm-asr`、`transformers-whisper`、`faster-whisper`、`funasr`、原生增量 `funasr-streaming` 和 `whisper-cpp`。第三方模型可以通过 Python entry point 注册。
 - 文件转录默认使用自适应 `energy` VAD 安全切段，并将所有语音和跳过区间写入独立审计 JSONL；也可以切换到 `fsmn-vad`。
 - 官方可选 FunASR 组件包括 FSMN-VAD、Paraformer 字词时间对齐和 CAM++ 离线说话人区分，安装后可直接通过统一 CLI 发现和调用。
 - 用户可以通过 `--hotword`、`--hotwords-file`、`--context` 或 `--context-file` 提供本地私有词表与主题上下文。TurnAlign 会按后端映射到 GLM prompt、Whisper prompt 或 FunASR/faster-whisper 原生热词接口。
 - 批处理模型在麦克风和 WebSocket 模式下按滚动窗口输出 `partial`，检测到静音或达到最长片段时输出 `commit`；原生流式插件可以直接产生相同事件。
-- WebSocket 接受 PCM16 二进制帧并返回 JSON 事件。协议见 [docs/websocket.md](docs/websocket.md)。
+- `RealtimePipeline` 与 `OfflineRefinementPipeline` 可以组成两遍处理：第一遍同步写入磁盘音频时间线，第二遍使用同一 `segment_id` 修正文稿、时间和说话人。
+- WebSocket 接受 PCM16 二进制帧并统一重分帧；模型加载成功后才返回 `ready`，默认禁止客户端指定任意模型路径或可执行文件。协议见 [docs/websocket.md](docs/websocket.md)。
 
 ### 私有热词与上下文
 
@@ -113,7 +114,7 @@ turnalign transcribe audio.mp3 --backend glm-asr \
 - 说话人聚类得到 3 个簇：前段环境/闲聊人物 1 个，主讨论人物 2 个。
 - 导出 2777 个非空语音段；时间轴没有乱序和相邻重叠。
 - GLM 正文与 Paraformer 时间轴融合后得到 466 个可读段，局部字符对齐率中位数为 88.6%。
-- 公共事件校验通过；当前单元与集成测试为 75 项通过、1 项按环境跳过，另含 10 个子测试，其中覆盖滚动 partial、WebSocket 本机回环、私有热词脱敏、跨平台 profile、并行后处理、批量时间对齐和 whisper.cpp Vulkan 参数约束。
+- 公共事件校验覆盖 `partial → commit → replace` 状态机；自动化测试覆盖原生增量流式、两遍处理、磁盘时间线、WebSocket 初始化/策略/模型复用、私有热词脱敏、跨平台 profile、并行后处理、批量时间对齐和 whisper.cpp Vulkan 参数约束。
 - AMD RX 7650 GRE + PyTorch ROCm 已完成真实全链路硬件验证；该结论不涵盖同一显卡的 DirectML 或 Vulkan 路径。
 - Windows AMD 核显上的 `whisper.cpp` Vulkan 已完成 TurnAlign 短样本端到端验证：固定 v1.8.4 下游包使用 `vulkan:1`，RTF 为 0.9579，整机 CPU 平均 12.63%、峰值 18.83%，事件校验通过。但 `small-q5_1` 文本质量较差且没有人工真值；RX 7650 GRE 使用同一包的 `vulkan:0` 两次均以 `0xC0000409` 崩溃。因此这里只验证核显执行链路，不宣称 Vulkan 转写质量或独显兼容性。
 - 仓库外 DirectML A/B 在固定 PyTorch 2.4.1、torch-directml 0.2.5.dev240914、Transformers 4.57.6 组合下确认：必须读取结构化生成结果的 `.sequences`，才能避开裸 Tensor 被错误物化为 `[0, 0]` 的问题。修复后核显与 RX 7650 GRE 的 FP16 短样本可运行；核显 FP32 文本仍不可靠。TurnAlign 当前不内置 DirectML 适配器，因此这不是受支持后端的验收声明。
@@ -135,6 +136,9 @@ turnalign transcribe audio.mp3 --backend glm-asr \
 - 默认 `energy` VAD 是自适应能量阈值兜底方案；复杂噪声环境建议安装并选择 `fsmn-vad`。
 - 说话人结果没有人工标注真值，暂时无法给出可靠的 DER。
 - 很短的应答、抢话和重叠语音仍可能分到相邻说话人。
+- 在线说话人会话接口已经存在，但仓库尚未内置经过人工 DER 验证的在线说话人模型；CAM++ 仍用于离线全局修正。
+- WebSocket v1 可在同一服务进程内按 `session_id` 断线续传并重放未确认事件；跨进程恢复仍需客户端保留源音频。
+- 公共音频时间线和对齐切片已磁盘化并有界分批；当前 FSMN-VAD/CAM++ 上游离线 API 仍会为模型生成完整浮点输入。
 - GLM 正文按 30 秒窗口与 Paraformer 时间轴对齐，边界属于近似结果。
 - Vulkan 的设备稳定性取决于具体可执行包、驱动和 GPU；本机核显短样本可运行不代表质量合格，固定 v1.8.4 包的 RX 7650 GRE 路径未通过。
 
@@ -164,9 +168,15 @@ turnalign transcribe meeting.wav --backend whisper-cpp \
   --device vulkan:1 --backend-option threads=2 \
   --backend-option flash_attention=false --output meeting.jsonl
 turnalign listen --backend transformers-whisper --model openai/whisper-small --language zh
+turnalign listen --backend funasr-streaming --model paraformer-zh-streaming --language zh
+turnalign listen --backend funasr-streaming --refinement-backend funasr \
+  --refinement-model paraformer-zh --aligner paraformer --diarizer campp
 turnalign audio-devices
 turnalign record sample.wav --duration 10
 turnalign serve --backend glm-asr --device auto
+# 非本机部署必须显式 --allow-remote，并建议配置反向代理 TLS 与认证：
+TURNALIGN_AUTH_TOKEN=replace-me turnalign serve --backend glm-asr \
+  --allow-remote --auth-token-env TURNALIGN_AUTH_TOKEN
 python examples/websocket_file_client.py sample.wav --backend glm-asr --language zh
 ```
 
@@ -181,6 +191,7 @@ python -m turnalign.cli replay `
   --output demo-events.jsonl
 
 python -m turnalign.cli validate-events demo-events.jsonl
+python -m turnalign.cli evaluate reference.jsonl hypothesis.jsonl
 python -m unittest discover -s tests -v
 ```
 
@@ -239,7 +250,7 @@ flowchart LR
 | GLM-ASR-Nano-2512 | Chinese transcript text in the current experiment |
 | OpenAI Whisper Medium + Hugging Face Transformers | Reference transcript and GPU performance comparison |
 | FunASR | FSMN-VAD, Paraformer timestamps/transcript, and CAM++ speaker embeddings |
-| UMAP + HDBSCAN | Global speaker clustering for long recordings |
+| UMAP + HDBSCAN | Out-of-tree long-recording validation, not a built-in runtime |
 | PyTorch | CUDA, ROCm, and MPS inference interface |
 | ONNX Runtime | Reserved CPU and optional execution-provider interface |
 
@@ -249,12 +260,13 @@ Model code, weights, and datasets retain their respective upstream licenses. The
 
 - PCM16 WAV works through the standard library. FFmpeg enables MP3, M4A, and other formats it can decode.
 - Optional `sounddevice`/PortAudio capture provides the same microphone command on Windows, macOS, and Linux.
-- Built-in ASR adapters cover `glm-asr`, `transformers-whisper`, `faster-whisper`, `funasr`, and `whisper-cpp`. External models register through Python entry points.
+- Built-in ASR adapters cover `glm-asr`, `transformers-whisper`, `faster-whisper`, `funasr`, native incremental `funasr-streaming`, and `whisper-cpp`. External models register through Python entry points.
 - File transcription defaults to adaptive `energy` VAD, safely segments long input, and writes every speech/skipped interval to a separate audit JSONL. `fsmn-vad` is available as an alternative.
 - First-party optional FunASR components provide FSMN-VAD, Paraformer word timing, and offline CAM++ diarization through the common CLI.
 - Users can provide local private vocabulary or topic context with `--hotword`, `--hotwords-file`, `--context`, or `--context-file`. TurnAlign maps the same contract to GLM prompts, Whisper prompts, or native FunASR/faster-whisper hotwords.
 - Batch models emit rolling `partial` updates in microphone and WebSocket sessions, then `commit` after silence or a maximum utterance length. Native streaming plugins emit the same events directly.
-- WebSocket accepts PCM16 binary frames and returns JSON events. See [docs/websocket.md](docs/websocket.md).
+- `RealtimePipeline` and `OfflineRefinementPipeline` form an optional two-pass path: the first pass records to a disk timeline and the second revises text, timing, and speakers under the same `segment_id`.
+- WebSocket normalizes PCM16 client frames, waits for successful model loading before `ready`, and rejects arbitrary client paths by default. See [docs/websocket.md](docs/websocket.md).
 
 ### Private hotwords and context
 
@@ -307,7 +319,7 @@ The test recording is 129.4 minutes of 16 kHz mono audio with background noise, 
 - Speaker clustering produced three clusters: one for the earlier ambient/casual section and two for the main discussion.
 - The export contains 2,777 non-empty speech turns with no invalid ordering or adjacent overlap.
 - Fusion of GLM text with the Paraformer timeline produced 466 readable turns. Median local character alignment was 88.6%.
-- The common event validator passes; 75 unit and integration tests pass, one is skipped by environment, and 10 subtests cover rolling partials, loopback WebSocket, private-hint redaction, cross-platform profiles, parallel post-processing, batched alignment, and whisper.cpp Vulkan argument constraints.
+- The common validator covers the `partial -> commit -> replace` lifecycle. Automated tests cover native incremental streaming, two-pass refinement, disk-backed audio, WebSocket initialization/policy/model reuse, private-hint redaction, cross-platform profiles, parallel post-processing, batched alignment, and whisper.cpp Vulkan constraints.
 - AMD RX 7650 GRE plus PyTorch ROCm has completed a real full-pipeline hardware run; this claim does not cover DirectML or Vulkan on the same GPU.
 - `whisper.cpp` Vulkan has completed a short TurnAlign end-to-end run on the Windows AMD integrated GPU. With the pinned downstream v1.8.4 build and `vulkan:1`, RTF was 0.9579, whole-system CPU averaged 12.63% and peaked at 18.83%, and event validation passed. The `small-q5_1` text was poor and had no human reference; the same build crashed twice with `0xC0000409` on RX 7650 GRE `vulkan:0`. This verifies only the integrated-GPU execution path, not Vulkan transcript quality or discrete-GPU compatibility.
 - An out-of-tree DirectML A/B on pinned PyTorch 2.4.1, torch-directml 0.2.5.dev240914, and Transformers 4.57.6 found that callers must read `.sequences` from structured generation output to avoid a raw Tensor being materialized as `[0, 0]`. FP16 short samples then ran on both AMD GPUs, while integrated-GPU FP32 text remained unreliable. TurnAlign does not ship a DirectML adapter, so this is runtime evidence rather than supported-backend acceptance.
@@ -329,6 +341,9 @@ See [docs/validation.md](docs/validation.md) for the full run log and metrics.
 - The default adaptive energy VAD is a dependency-free fallback. Install and select `fsmn-vad` for difficult noise.
 - The speaker output has no human-labelled reference, so a reliable DER is not available.
 - Very short responses, interruptions, and overlapping speech may be assigned to a neighbouring speaker.
+- The online diarization session contract is implemented, but the repository does not yet ship an online speaker model validated against human-labelled DER; CAM++ remains an offline refinement component.
+- WebSocket v1 resumes by `session_id` and replays unacknowledged events within the same server process; clients still retain source audio for cross-process recovery.
+- The common timeline and alignment slices are disk-backed and bounded in batches; current upstream FSMN-VAD/CAM++ offline APIs still materialize one full float input for the model.
 - GLM text is aligned to the Paraformer timeline inside 30-second source windows, so speaker boundaries are approximate.
 - Vulkan device stability is specific to the executable build, driver, and GPU. A runnable integrated-GPU short sample is not a quality result, and the pinned v1.8.4 build did not pass on the RX 7650 GRE.
 
@@ -353,6 +368,9 @@ turnalign transcribe meeting.wav --backend whisper-cpp \
   --device vulkan:1 --backend-option threads=2 \
   --backend-option flash_attention=false --output meeting.jsonl
 turnalign listen --backend transformers-whisper --model openai/whisper-small
+turnalign listen --backend funasr-streaming --model paraformer-zh-streaming
+turnalign listen --backend funasr-streaming --refinement-backend funasr \
+  --refinement-model paraformer-zh --aligner paraformer --diarizer campp
 turnalign serve --backend glm-asr --device auto
 ```
 
@@ -361,6 +379,7 @@ Run from source:
 ```bash
 export PYTHONPATH="$PWD/src"
 python -m turnalign.cli doctor --device auto
+python -m turnalign.cli evaluate reference.jsonl hypothesis.jsonl
 python -m unittest discover -s tests -v
 ```
 

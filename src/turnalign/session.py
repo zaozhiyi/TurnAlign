@@ -3,11 +3,27 @@ from __future__ import annotations
 from array import array
 from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
+from threading import Event
 from time import perf_counter
 
+from .audio import AudioTimeline
 from .fusion import assign_speakers
-from .models import AudioChunk, Hypothesis, SpeakerTurn, SpeechSegment, TranscriptEvent, Word
-from .plugins import AlignmentBackend, AsrBackend, DiarizationBackend, VadBackend
+from .models import (
+    AudioChunk,
+    Hypothesis,
+    SpeakerTurn,
+    SpeechSegment,
+    TranscriptEvent,
+    Word,
+)
+from .plugins import (
+    AlignmentBackend,
+    AsrBackend,
+    DiarizationBackend,
+    OnlineDiarizationBackend,
+    VadBackend,
+)
+from .stabilizer import LocalAgreement
 
 
 def pcm_rms(chunk: AudioChunk) -> float:
@@ -140,25 +156,6 @@ def _event(hypothesis: Hypothesis, index: int, revision: int = 1) -> TranscriptE
     )
 
 
-def _slice_audio(chunks: list[AudioChunk], start: float, end: float) -> AudioChunk:
-    if not chunks:
-        return AudioChunk(b"", start)
-    sample_rate, channels = chunks[0].sample_rate, chunks[0].channels
-    output = bytearray()
-    frame_bytes = channels * 2
-    for chunk in chunks:
-        if (chunk.sample_rate, chunk.channels) != (sample_rate, channels):
-            raise ValueError("audio format changed before post-processing")
-        overlap_start = max(start, chunk.start)
-        overlap_end = min(end, chunk.start + chunk.duration)
-        if overlap_end <= overlap_start:
-            continue
-        first = round((overlap_start - chunk.start) * sample_rate) * frame_bytes
-        last = round((overlap_end - chunk.start) * sample_rate) * frame_bytes
-        output.extend(chunk.pcm_s16le[first:last])
-    return AudioChunk(bytes(output), start, sample_rate, channels)
-
-
 def _speaker_for_interval(start: float, end: float, turns: list[SpeakerTurn]) -> str | None:
     best = (0.0, "")
     for turn in turns:
@@ -191,18 +188,39 @@ def transcribe_events(
     vad_backend: VadBackend | None = None,
     vad_audit: Callable[[dict[str, object]], None] | None = None,
     recorded_audio: list[AudioChunk] | None = None,
+    recorded_timeline: AudioTimeline | None = None,
     parallel_diarization: bool = False,
     execution_profile: str | None = None,
+    cancel_event: Event | None = None,
+    close_backend: bool = True,
+    emit_end: bool = True,
+    online_diarizer: OnlineDiarizationBackend | None = None,
+    segment_index_start: int = 0,
 ) -> Iterator[TranscriptEvent]:
     """Run either a native-streaming backend or endpointed batch backend."""
     started = perf_counter()
-    index = 0
+    if segment_index_start < 0:
+        raise ValueError("segment_index_start must be non-negative")
+    index = segment_index_start
     revision = 1
     last_end = 0.0
     input_end = 0.0
     audio_seconds = 0.0
-    recorded: list[AudioChunk] = list(recorded_audio or [])
-    record_from_source = recorded_audio is None
+    needs_recording = (
+        aligner is not None
+        or diarizer is not None
+        or recorded_timeline is not None
+    )
+    timeline = recorded_timeline
+    owns_timeline = False
+    if needs_recording and timeline is None:
+        timeline = AudioTimeline()
+        owns_timeline = True
+        for recorded_chunk in recorded_audio or []:
+            timeline.append(recorded_chunk)
+    record_from_source = needs_recording and recorded_audio is None and (
+        recorded_timeline is None or recorded_timeline.chunk_count == 0
+    )
     commits: list[TranscriptEvent] = []
     vad_speech_seconds = 0.0
     vad_regions = 0
@@ -212,15 +230,35 @@ def transcribe_events(
     alignment_seconds = 0.0
     diarization_executor: ThreadPoolExecutor | None = None
     diarization_future: Future[list[SpeakerTurn]] | None = None
+    online_session = online_diarizer.start_session() if online_diarizer is not None else None
+    online_turns: list[SpeakerTurn] = []
 
     def observed_chunks() -> Iterator[AudioChunk]:
         nonlocal input_end, audio_seconds
         for chunk in chunks:
+            if cancel_event is not None and cancel_event.is_set():
+                return
             audio_seconds += chunk.duration
             input_end = max(input_end, chunk.start + chunk.duration)
-            if record_from_source and (aligner is not None or diarizer is not None):
-                recorded.append(chunk)
+            if record_from_source:
+                assert timeline is not None
+                timeline.append(chunk)
+            if online_session is not None:
+                online_turns.extend(online_session.accept_audio(chunk))
             yield chunk
+
+    def decorate_online(event: TranscriptEvent) -> TranscriptEvent:
+        if not online_turns:
+            return event
+        if event.words:
+            event.words = assign_speakers(event.words, online_turns)
+        event.speaker = (
+            _speaker_from_words(event.words)
+            or _speaker_for_interval(event.start, event.end, online_turns)
+        )
+        if event.speaker is not None:
+            event.metadata["speaker_provisional"] = True
+        return event
 
     source = observed_chunks()
 
@@ -228,15 +266,16 @@ def transcribe_events(
         nonlocal diarization_seconds
         if diarizer is None:
             return []
+        assert timeline is not None
         component_started = perf_counter()
         try:
-            return list(diarizer.diarize(iter(recorded)))
+            return list(diarizer.diarize(timeline.iter_chunks()))
         finally:
             diarization_seconds = perf_counter() - component_started
 
     if parallel_diarization:
-        if diarizer is None or recorded_audio is None:
-            raise ValueError("parallel diarization requires a diarizer and preloaded audio")
+        if diarizer is None or timeline is None or timeline.chunk_count == 0:
+            raise ValueError("parallel diarization requires a diarizer and preloaded audio timeline")
         diarization_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="turnalign-diarizer")
         diarization_future = diarization_executor.submit(run_diarizer)
 
@@ -281,10 +320,31 @@ def transcribe_events(
 
     try:
         if backend.capabilities.streaming:
-            for hypothesis in backend.transcribe(source):
+            streaming_session = None
+            start_session = getattr(backend, "start_session", None)
+            if callable(start_session):
+                streaming_session = start_session()
+
+            def streaming_hypotheses() -> Iterator[Hypothesis]:
+                if streaming_session is None:
+                    yield from backend.transcribe(source)
+                    return
+                try:
+                    for source_chunk in source:
+                        if cancel_event is not None and cancel_event.is_set():
+                            streaming_session.cancel()
+                            return
+                        yield from streaming_session.accept_audio(source_chunk)
+                    yield from streaming_session.finish()
+                finally:
+                    streaming_session.close()
+
+            for hypothesis in streaming_hypotheses():
+                if cancel_event is not None and cancel_event.is_set():
+                    break
                 if not hypothesis.text:
                     continue
-                event = _event(hypothesis, index, revision)
+                event = decorate_online(_event(hypothesis, index, revision))
                 last_end = max(last_end, event.end)
                 yield event
                 if hypothesis.final:
@@ -295,6 +355,7 @@ def transcribe_events(
                     revision += 1
         else:
             if live:
+                agreement = LocalAgreement()
                 for group, final in live_windows(
                     source,
                     threshold=vad_threshold,
@@ -302,16 +363,25 @@ def transcribe_events(
                     max_seconds=max_utterance_seconds,
                     partial_seconds=partial_seconds,
                 ):
+                    if cancel_event is not None and cancel_event.is_set():
+                        break
                     hypothesis = _merge_hypotheses(backend.transcribe(group), final)
                     if hypothesis is None:
                         continue
-                    event = _event(hypothesis, index, revision)
+                    stabilized = agreement.update(hypothesis.text, final=final)
+                    if final:
+                        hypothesis.text = stabilized.replace or agreement.committed
+                    else:
+                        hypothesis.text = agreement.committed + stabilized.partial
+                    hypothesis.metadata["stabilized"] = True
+                    event = decorate_online(_event(hypothesis, index, revision))
                     last_end = max(last_end, event.end)
                     yield event
                     if final:
                         commits.append(event)
                         index += 1
                         revision = 1
+                        agreement.reset()
                     else:
                         revision += 1
             elif vad_backend is not None:
@@ -331,33 +401,53 @@ def transcribe_events(
                         if not hypothesis.text:
                             continue
                         hypothesis.final = True
-                        event = _event(hypothesis, index)
+                        event = decorate_online(_event(hypothesis, index))
                         last_end = max(last_end, event.end)
                         yield event
                         commits.append(event)
                         index += 1
 
         asr_seconds = perf_counter() - started
+        if online_session is not None:
+            online_turns.extend(online_session.finish())
         turns = (
             diarization_future.result()
             if diarization_future is not None
             else run_diarizer()
         )
+        if not turns:
+            turns = online_turns
         aligned_words: list[list[Word]] | None = None
         if aligner is not None:
             alignment_started = perf_counter()
-            alignment_inputs = [
-                (_slice_audio(recorded, event.start, event.end), event.text)
-                for event in commits
-            ]
+            assert timeline is not None
             align_many = getattr(aligner, "align_many", None)
             if callable(align_many):
-                aligned_words = list(align_many(alignment_inputs))
-                if len(aligned_words) != len(commits):
-                    raise RuntimeError("batch aligner returned the wrong number of results")
+                aligned_words = []
+                alignment_batch_size = int(getattr(aligner, "batch_size", 16))
+                if alignment_batch_size <= 0:
+                    raise ValueError("alignment batch size must be positive")
+                for batch_start in range(0, len(commits), alignment_batch_size):
+                    batch = commits[
+                        batch_start:batch_start + alignment_batch_size
+                    ]
+                    inputs = [
+                        (timeline.slice(event.start, event.end), event.text)
+                        for event in batch
+                    ]
+                    results = list(align_many(inputs))
+                    if len(results) != len(batch):
+                        raise RuntimeError(
+                            "batch aligner returned the wrong number of results"
+                        )
+                    aligned_words.extend(results)
             else:
                 aligned_words = [
-                    aligner.align(audio, text) for audio, text in alignment_inputs
+                    aligner.align(
+                        timeline.slice(event.start, event.end),
+                        event.text,
+                    )
+                    for event in commits
                 ]
             alignment_seconds = perf_counter() - alignment_started
 
@@ -387,7 +477,8 @@ def transcribe_events(
         elapsed = perf_counter() - started
         end_time = max(last_end, input_end)
         metadata = {
-            "segments": index,
+            "segments": index - segment_index_start,
+            "segment_index_next": index,
             "backend": backend.name,
             "audio_seconds": round(audio_seconds, 3),
             "processing_seconds": round(elapsed, 3),
@@ -408,18 +499,26 @@ def transcribe_events(
                 "vad_speech_regions": vad_regions,
                 "vad_forced_splits": vad_forced_splits,
             })
-        yield TranscriptEvent(
-            kind="end",
-            segment_id="session",
-            revision=1,
-            start=end_time,
-            end=end_time,
-            metadata=metadata,
-        )
+        if emit_end and not (cancel_event is not None and cancel_event.is_set()):
+            yield TranscriptEvent(
+                kind="end",
+                segment_id="session",
+                revision=1,
+                start=end_time,
+                end=end_time,
+                metadata=metadata,
+            )
     finally:
         if diarization_executor is not None:
             diarization_executor.shutdown(wait=True, cancel_futures=True)
-        backend.close()
+        if owns_timeline and timeline is not None:
+            timeline.close()
+        if online_session is not None:
+            online_session.close()
+        if online_diarizer is not None:
+            online_diarizer.close()
+        if close_backend:
+            backend.close()
         for component in (vad_backend, aligner, diarizer):
             close = getattr(component, "close", None)
             if callable(close):

@@ -89,9 +89,11 @@ class HintContractTests(unittest.TestCase):
             def __init__(self, config):
                 raise AssertionError("constructor must not run")
 
-        with patch("turnalign.registry.load", return_value=Unsupported):
-            with self.assertRaisesRegex(ValueError, "does not support context"):
-                create_asr("unsupported", AsrConfig(hints=AsrHints(context="topic")))
+        with (
+            patch("turnalign.registry.load", return_value=Unsupported),
+            self.assertRaisesRegex(ValueError, "does not support context"),
+        ):
+            create_asr("unsupported", AsrConfig(hints=AsrHints(context="topic")))
 
 
 class BackendHintMappingTests(unittest.TestCase):
