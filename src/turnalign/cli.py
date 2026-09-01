@@ -947,7 +947,10 @@ def main() -> int:
     model_manifest_parser.add_argument("--output", type=Path, required=True)
     host_profile_parser = commands.add_parser(
         "host-profile",
-        help="Bind target-host identity to retained production artifacts",
+        help=(
+            "Bind the active versioned Wheel runtime and target host to retained "
+            "production artifacts"
+        ),
     )
     host_profile_parser.add_argument(
         "--source-commit", type=_source_commit_argument, required=True

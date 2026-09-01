@@ -260,10 +260,21 @@ class ProductionGateTests(unittest.TestCase):
         profile_artifacts = [
             (kind, path) for kind, path in artifacts if kind != "host-profile"
         ]
-        write_json_report(
-            host_profile,
-            create_host_profile("b" * 40, profile_artifacts),
-        )
+        runtime_prefix = f"/opt/turnalign/releases/{'b' * 40}/venv"
+        with patch.object(
+            production_gate_module,
+            "_installed_runtime_identity",
+            return_value={
+                "python_executable": f"{runtime_prefix}/bin/python",
+                "python_prefix": runtime_prefix,
+                "turnalign_source_commit": "b" * 40,
+                "turnalign_version": "0.1.0",
+            },
+        ):
+            write_json_report(
+                host_profile,
+                create_host_profile("b" * 40, profile_artifacts),
+            )
         return artifacts
 
     def test_passes_and_hash_binds_all_required_evidence(self):
@@ -555,6 +566,18 @@ class ProductionGateTests(unittest.TestCase):
                     "complete typed platform evidence",
                 ),
                 (
+                    lambda payload: payload["runtime"].update(
+                        turnalign_source_commit="c" * 40
+                    ),
+                    "installed versioned Wheel runtime",
+                ),
+                (
+                    lambda payload: payload["runtime"].update(
+                        python_prefix="/opt/turnalign/current/venv"
+                    ),
+                    "installed versioned Wheel runtime",
+                ),
+                (
                     lambda payload: payload["artifacts"][0].update(bytes=1),
                     "does not match the retained deployment artifacts",
                 ),
@@ -577,6 +600,52 @@ class ProductionGateTests(unittest.TestCase):
                 with self.subTest(expected=expected):
                     self.assertFalse(report.passed)
                     self.assertIn(expected, "\n".join(report.failures))
+
+    def test_runtime_identity_requires_the_bound_versioned_wheel(self):
+        source_commit = "b" * 40
+        prefix = f"/opt/turnalign/releases/{source_commit}/venv"
+
+        class SourceIdentity:
+            def __init__(self, value: str):
+                self.value = value
+
+            def joinpath(self, _name: str):
+                return self
+
+            def read_text(self, *, encoding: str) -> str:
+                self.assert_encoding = encoding
+                return self.value
+
+        with patch.object(production_gate_module.sys, "prefix", prefix), patch.object(
+            production_gate_module.sys,
+            "executable",
+            f"{prefix}/bin/python",
+        ), patch.object(
+            production_gate_module.importlib.resources,
+            "files",
+            return_value=SourceIdentity(f"{source_commit}\n"),
+        ):
+            identity = production_gate_module._installed_runtime_identity(
+                source_commit
+            )
+        self.assertEqual(identity["turnalign_source_commit"], source_commit)
+        self.assertEqual(identity["python_prefix"], prefix)
+
+        with patch.object(
+            production_gate_module.sys, "prefix", "/opt/turnalign/current/venv"
+        ), self.assertRaisesRegex(ValueError, "versioned production"):
+            production_gate_module._installed_runtime_identity(source_commit)
+
+        with patch.object(production_gate_module.sys, "prefix", prefix), patch.object(
+            production_gate_module.sys,
+            "executable",
+            f"{prefix}/bin/python",
+        ), patch.object(
+            production_gate_module.importlib.resources,
+            "files",
+            return_value=SourceIdentity("unbound\n"),
+        ), self.assertRaisesRegex(ValueError, "source identity"):
+            production_gate_module._installed_runtime_identity(source_commit)
 
     def test_rejects_weakened_or_comment_only_systemd_controls(self):
         with tempfile.TemporaryDirectory() as directory:

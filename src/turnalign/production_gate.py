@@ -4,6 +4,7 @@ import base64
 import configparser
 import csv
 import hashlib
+import importlib.resources
 import io
 import ipaddress
 import json
@@ -12,6 +13,7 @@ import os
 import platform
 import re
 import stat
+import sys
 import tempfile
 import zipfile
 from dataclasses import asdict, dataclass
@@ -21,6 +23,7 @@ from pathlib import Path
 from typing import cast
 from urllib.parse import unquote, urlsplit
 
+from . import __version__
 from .deployment_validation import validate_nginx_config, validate_systemd_service
 from .jsonutil import strict_json_loads
 
@@ -400,8 +403,9 @@ def create_host_profile(
     if logical_cpu_count is None or logical_cpu_count <= 0:
         raise RuntimeError("cannot determine the host logical CPU count")
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "source_commit": source_commit,
+        "runtime": _installed_runtime_identity(source_commit),
         "platform": {
             "system": platform.system(),
             "release": platform.release(),
@@ -414,6 +418,38 @@ def create_host_profile(
             evidence,
             key=lambda item: (cast(str, item["kind"]), cast(str, item["name"])),
         ),
+    }
+
+
+def _installed_runtime_identity(source_commit: str) -> dict[str, str]:
+    release_prefix = f"/opt/turnalign/releases/{source_commit}/venv"
+    python_executable = os.path.abspath(sys.executable)
+    python_prefix = os.path.abspath(sys.prefix)
+    if (
+        python_prefix != release_prefix
+        or python_executable != f"{release_prefix}/bin/python"
+    ):
+        raise ValueError(
+            "host-profile must run from the candidate's versioned production "
+            "environment"
+        )
+    try:
+        embedded_commit = importlib.resources.files("turnalign").joinpath(
+            "_source_commit.txt"
+        ).read_text(encoding="ascii")
+    except (FileNotFoundError, UnicodeError, OSError) as error:
+        raise ValueError(
+            "host-profile requires a Wheel with a readable source identity"
+        ) from error
+    if embedded_commit != f"{source_commit}\n":
+        raise ValueError(
+            "host-profile runtime source identity does not match the candidate"
+        )
+    return {
+        "python_executable": python_executable,
+        "python_prefix": python_prefix,
+        "turnalign_source_commit": source_commit,
+        "turnalign_version": __version__,
     }
 
 
@@ -1085,20 +1121,20 @@ def _validate_wheel(
     snapshot: _EvidenceSnapshot,
     source_commit: str,
     failures: list[str],
-) -> None:
+) -> str | None:
     if snapshot.content is None:
         failures.append(f"wheel exceeds {_MAX_WHEEL_BYTES} bytes")
-        return
+        return None
     try:
         with zipfile.ZipFile(io.BytesIO(snapshot.content)) as archive:
             infos = archive.infolist()
             if not infos or len(infos) > _MAX_WHEEL_ENTRIES:
                 failures.append("wheel has an invalid number of archive entries")
-                return
+                return None
             names = [item.filename for item in infos]
             if len(set(names)) != len(names):
                 failures.append("wheel contains duplicate archive entries")
-                return
+                return None
             total_size = 0
             contents: dict[str, bytes] = {}
             for info in infos:
@@ -1114,7 +1150,7 @@ def _validate_wheel(
                     or stat.S_ISLNK(mode)
                 ):
                     failures.append("wheel contains an unsafe archive entry")
-                    return
+                    return None
                 if info.is_dir():
                     continue
                 total_size += info.file_size
@@ -1122,13 +1158,13 @@ def _validate_wheel(
                     failures.append(
                         "wheel exceeds the uncompressed release-artifact limit"
                     )
-                    return
+                    return None
                 contents[info.filename] = archive.read(info)
     except Exception as error:  # noqa: BLE001 - untrusted wheel is an evidence boundary
         failures.append(
             f"wheel is not a valid readable ZIP archive: {type(error).__name__}"
         )
-        return
+        return None
 
     metadata_paths = [name for name in contents if name.endswith(".dist-info/METADATA")]
     wheel_paths = [name for name in contents if name.endswith(".dist-info/WHEEL")]
@@ -1140,13 +1176,14 @@ def _validate_wheel(
         == record_paths[0].rsplit("/", 1)[0]
     ):
         failures.append("wheel does not contain one coherent dist-info directory")
-        return
+        return None
     if "turnalign/__init__.py" not in contents:
         failures.append("wheel does not contain the TurnAlign package")
     source_identity = contents.get("turnalign/_source_commit.txt")
     if source_identity != f"{source_commit}\n".encode("ascii"):
         failures.append("wheel source commit does not match the production source commit")
 
+    package_version: str | None = None
     try:
         metadata = BytesParser(policy=email_policy).parsebytes(contents[metadata_paths[0]])
         names = metadata.get_all("Name", [])
@@ -1158,6 +1195,8 @@ def _validate_wheel(
             or not str(versions[0]).strip()
         ):
             failures.append("wheel metadata does not identify one TurnAlign release")
+        else:
+            package_version = str(versions[0]).strip()
 
         wheel_metadata = BytesParser(policy=email_policy).parsebytes(
             contents[wheel_paths[0]]
@@ -1205,16 +1244,16 @@ def _validate_wheel(
         rows = list(csv.reader(io.StringIO(record_text, newline="")))
     except (UnicodeDecodeError, csv.Error):
         failures.append("wheel RECORD is not valid UTF-8 CSV")
-        return
+        return None
     recorded: dict[str, tuple[str, str]] = {}
     for row in rows:
         if len(row) != 3 or row[0] in recorded:
             failures.append("wheel RECORD contains malformed or duplicate entries")
-            return
+            return None
         recorded[row[0]] = (row[1], row[2])
     if set(recorded) != set(contents):
         failures.append("wheel RECORD does not enumerate every archive file exactly once")
-        return
+        return None
     for name, content in contents.items():
         digest, size = recorded[name]
         if name == record_paths[0]:
@@ -1226,12 +1265,14 @@ def _validate_wheel(
         ).decode("ascii")
         if digest != f"sha256={expected_digest}" or size != str(len(content)):
             failures.append(f"wheel RECORD hash or size does not match: {name}")
-            return
+            return None
+    return package_version
 
 
 def _validate_host_profile(
     snapshot: _EvidenceSnapshot,
     source_commit: str,
+    wheel_version: str | None,
     artifacts: list[ArtifactEvidence],
     failures: list[str],
 ) -> None:
@@ -1246,6 +1287,7 @@ def _validate_host_profile(
     if not isinstance(payload, dict) or set(payload) != {
         "schema_version",
         "source_commit",
+        "runtime",
         "platform",
         "artifacts",
     }:
@@ -1253,11 +1295,33 @@ def _validate_host_profile(
         return
     if (
         isinstance(payload.get("schema_version"), bool)
-        or payload.get("schema_version") != 1
+        or payload.get("schema_version") != 2
     ):
         failures.append("host profile has an unsupported schema version")
     if payload.get("source_commit") != source_commit:
         failures.append("host profile is not bound to the production source commit")
+
+    runtime = payload.get("runtime")
+    expected_prefix = f"/opt/turnalign/releases/{source_commit}/venv"
+    expected_executable = f"{expected_prefix}/bin/python"
+    if not (
+        isinstance(runtime, dict)
+        and set(runtime) == {
+            "python_executable",
+            "python_prefix",
+            "turnalign_source_commit",
+            "turnalign_version",
+        }
+        and runtime.get("python_executable") == expected_executable
+        and runtime.get("python_prefix") == expected_prefix
+        and runtime.get("turnalign_source_commit") == source_commit
+        and isinstance(runtime.get("turnalign_version"), str)
+        and bool(runtime["turnalign_version"])
+        and runtime["turnalign_version"] == wheel_version
+    ):
+        failures.append(
+            "host profile is not bound to the installed versioned Wheel runtime"
+        )
 
     platform_data = payload.get("platform")
     text_fields = (
@@ -1407,9 +1471,10 @@ def run_production_gate(
                 f"SBOM does not match locked runtime requirement: {name}=={locked[0]}"
             )
 
+    wheel_version: str | None = None
     wheel_snapshots = artifact_snapshots.get("wheel", [])
     if len(wheel_snapshots) == 1:
-        _validate_wheel(wheel_snapshots[0], source_commit, failures)
+        wheel_version = _validate_wheel(wheel_snapshots[0], source_commit, failures)
 
     model_manifest_snapshots = artifact_snapshots.get("model-manifest", [])
     if len(model_manifest_snapshots) == 1:
@@ -1424,6 +1489,7 @@ def run_production_gate(
         _validate_host_profile(
             host_profile_snapshots[0],
             source_commit,
+            wheel_version,
             artifact_evidence,
             failures,
         )

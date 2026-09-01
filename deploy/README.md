@@ -187,8 +187,11 @@ Before routing users, retain all of the following with the release artifact:
    gate, whose model, host and production-corpus evidence is environment-specific.
 
 Persist each gate with `--report`, generate retained-model provenance with
-`turnalign model-manifest`, and run `turnalign host-profile` on the target host
-after the other ten artifact classes are final. Then run `turnalign
+`turnalign model-manifest`, and run
+`/opt/turnalign/current/venv/bin/turnalign host-profile` on the target host after
+activating the candidate and finalizing the other ten artifact classes. The
+command refuses source checkouts, unbound Wheels, mismatched embedded commits,
+and non-versioned Python environments. Then run `turnalign
 production-gate` with the source commit and all eleven required artifact kinds
 shown in the root README. Keep
 the resulting aggregate report beside the release artifact; it rejects local

@@ -731,12 +731,24 @@ class CliIntegrationTests(unittest.TestCase):
                 path.write_text(f"immutable {kind}\n", encoding="utf-8")
                 arguments.extend(("--artifact", f"{kind}={path}"))
             arguments.extend(("--output", str(output)))
+            runtime_prefix = f"/opt/turnalign/releases/{'a' * 40}/venv"
+            runtime = {
+                "python_executable": f"{runtime_prefix}/bin/python",
+                "python_prefix": runtime_prefix,
+                "turnalign_source_commit": "a" * 40,
+                "turnalign_version": "0.1.0",
+            }
 
-            with patch("sys.argv", arguments), patch("builtins.print"):
+            with patch(
+                "turnalign.production_gate._installed_runtime_identity",
+                return_value=runtime,
+            ), patch("sys.argv", arguments), patch("builtins.print"):
                 self.assertEqual(cli.main(), 0)
 
             payload = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(payload["schema_version"], 2)
             self.assertEqual(payload["source_commit"], "a" * 40)
+            self.assertEqual(payload["runtime"], runtime)
             self.assertGreater(payload["platform"]["logical_cpu_count"], 0)
             self.assertEqual(
                 {item["kind"] for item in payload["artifacts"]},
