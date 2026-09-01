@@ -1,0 +1,72 @@
+[Unit]
+Description=TurnAlign streaming transcription service
+Documentation=https://github.com/GuanZhengPM/TurnAlign
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=turnalign
+Group=turnalign
+WorkingDirectory=/var/lib/turnalign
+StateDirectory=turnalign
+CacheDirectory=turnalign
+Environment=HOME=/var/lib/turnalign
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+EnvironmentFile=/etc/turnalign/turnalign.env
+ExecStartPre=/usr/bin/test -r /var/lib/turnalign/warmup.wav
+ExecStart=/opt/turnalign/venv/bin/turnalign serve \
+  --host 127.0.0.1 \
+  --port 8765 \
+  --backend funasr-streaming \
+  --device cpu \
+  --preload \
+  --warmup-file /var/lib/turnalign/warmup.wav \
+  --require-immutable-model-revision \
+  --auth-token-env TURNALIGN_AUTH_TOKEN \
+  --backend-replicas 1 \
+  --max-concurrent-sessions 1 \
+  --max-session-seconds 7200 \
+  --max-recovery-sessions 8 \
+  --max-recovery-audio-mib 256 \
+  --max-recovery-total-mib 512 \
+  --recovery-ttl-seconds 300 \
+  --initialization-timeout 300 \
+  --client-idle-timeout 60 \
+  --finalization-timeout 120 \
+  --worker-shutdown-timeout 5 \
+  --shutdown-grace-timeout 30
+Restart=on-failure
+RestartSec=5s
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=45s
+TimeoutStartSec=360s
+UMask=0077
+LimitNOFILE=65536
+TasksMax=512
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectClock=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=turnalign
+
+[Install]
+WantedBy=multi-user.target

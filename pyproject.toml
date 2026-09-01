@@ -29,6 +29,7 @@ packages = ["src/turnalign"]
 [tool.hatch.build.targets.sdist]
 include = [
   "/ACKNOWLEDGEMENTS.md",
+  "/deploy",
   "/LICENSE",
   "/README.md",
   "/docs",

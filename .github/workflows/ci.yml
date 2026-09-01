@@ -26,6 +26,15 @@ jobs:
       - run: ruff check src tests
       - run: bandit -q -r src -ll
       - run: mypy --no-error-summary
+      - name: Verify systemd deployment unit
+        run: |
+          if ! getent passwd turnalign >/dev/null; then
+            sudo useradd --system --home /var/lib/turnalign --shell /usr/sbin/nologin turnalign
+          fi
+          sudo install -d /opt/turnalign/venv/bin /etc/turnalign /var/lib/turnalign
+          sudo install -m 0755 /usr/bin/true /opt/turnalign/venv/bin/turnalign
+          sudo touch /etc/turnalign/turnalign.env /var/lib/turnalign/warmup.wav
+          systemd-analyze verify deploy/systemd/turnalign.service
 
   test:
     if: github.event_name != 'schedule'

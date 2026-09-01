@@ -21,7 +21,7 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   materialization limit before constructing the float model input.
 - All source and test modules pass `compileall`.
 - Ruff is enforced in CI and passes over `src` and `tests`.
-- The built wheel passes all 211 tests from site-packages on Python 3.10 with
+- The built wheel passes all 225 tests from site-packages on Python 3.10 with
   `websockets` 14.0 and on Python 3.12 with `websockets` 17.1. The Python 3.12
   run also passes under `python -O`, so production invariants do not depend on
   removable `assert` statements.
@@ -124,6 +124,12 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   commit hashes with checkout credential persistence disabled.
 - The rebuilt wheel installs into a clean target directory and its packaged
   `doctor --device cpu` command returns a valid runtime plan.
+- The source distribution includes a scoped Linux CPU systemd/Nginx deployment
+  reference. Static regression checks require loopback-only application binding,
+  start-message authentication, preload and warm-up, immutable model revisions,
+  bounded recovery capacity, an unprivileged systemd security profile, TLS
+  WebSocket upgrade headers, proxy rate/connection limits, disabled retry, and
+  proxy timeouts longer than the application's idle timeout.
 - `turnalign evaluate reference.jsonl hypothesis.jsonl` reports CER, WER,
   permutation-invariant speaker error, segment counts, and revision updates per
   segment. The speaker metric is a single-active-speaker interval score, not a
