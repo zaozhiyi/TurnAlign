@@ -202,7 +202,7 @@ class CliIntegrationTests(unittest.TestCase):
                 ),
                 patch.object(cli, "create_asr", return_value=backend),
                 patch.object(cli, "file_chunks", return_value=iter(())),
-                self.assertRaises(IsADirectoryError),
+                self.assertRaises(OSError),
             ):
                 cli.transcribe_file(args)
         self.assertTrue(backend.closed)
