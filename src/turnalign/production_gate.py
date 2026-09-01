@@ -285,6 +285,10 @@ def _integer_at_least(value: object, floor: int) -> bool:
     return not isinstance(value, bool) and isinstance(value, int) and value >= floor
 
 
+def _nonnegative_integer(value: object) -> bool:
+    return _integer_at_least(value, 0)
+
+
 def _public_hostname(hostname: str | None) -> bool:
     if hostname is None:
         return False
@@ -333,6 +337,9 @@ def _validate_report_source(
 
 def _validate_release(report: dict[str, object], failures: list[str]) -> None:
     _passed_report("release", report, failures)
+    backend = report.get("backend")
+    if not isinstance(backend, str) or not backend or backend.strip() != backend:
+        failures.append("release report does not identify a valid backend")
     if report.get("require_native_streaming") is not True:
         failures.append("release report did not require native streaming")
     if report.get("native_streaming") is not True:
@@ -377,6 +384,55 @@ def _validate_release(report: dict[str, object], failures: list[str]) -> None:
     if not isinstance(minimum_commits, int) or not _integer_at_least(commits, minimum_commits):
         failures.append("release commit count does not meet its minimum")
 
+    counts = {
+        name: report.get(name)
+        for name in ("events", "partials", "commits", "replacements")
+    }
+    if not all(_nonnegative_integer(value) for value in counts.values()):
+        failures.append("release report lacks complete typed event counts")
+    else:
+        event_count = cast(int, counts["events"])
+        transcript_count = sum(
+            cast(int, counts[name])
+            for name in ("partials", "commits", "replacements")
+        )
+        if cast(int, counts["partials"]) < 1:
+            failures.append("release event counts do not contain a partial result")
+        if event_count < transcript_count + 1:
+            failures.append("release event count is inconsistent with its typed events")
+
+    processing_seconds = report.get("processing_seconds")
+    if not _nonnegative_number(processing_seconds):
+        failures.append("release report lacks a valid processing duration")
+    elif _positive_number(report.get("audio_seconds")) and _nonnegative_number(
+        report.get("realtime_factor")
+    ):
+        expected_realtime_factor = cast(float, processing_seconds) / cast(
+            float, report["audio_seconds"]
+        )
+        if not math.isclose(
+            cast(float, report["realtime_factor"]),
+            expected_realtime_factor,
+            rel_tol=0.001,
+            abs_tol=0.0006,
+        ):
+            failures.append(
+                "release real-time factor is inconsistent with its timing evidence"
+            )
+
+    if _nonnegative_number(processing_seconds):
+        for field, label in (
+            ("first_partial_seconds", "first-partial"),
+            ("first_commit_seconds", "first-commit"),
+        ):
+            latency = report.get(field)
+            if _nonnegative_number(latency) and cast(float, latency) > (
+                cast(float, processing_seconds) + 0.001
+            ):
+                failures.append(
+                    f"release {label} latency exceeds its processing duration"
+                )
+
 
 def _validate_quality(report: dict[str, object], failures: list[str]) -> None:
     _passed_report("quality", report, failures)
@@ -403,21 +459,67 @@ def _validate_quality(report: dict[str, object], failures: list[str]) -> None:
     if not isinstance(evaluation, dict):
         failures.append("quality report has no evaluation evidence")
         return
-    for minimum, actual, label in (
-        (report.get("min_reference_segments"), evaluation.get("reference_segments"), "segments"),
-        (
-            report.get("min_reference_characters"),
-            evaluation.get("reference_characters"),
-            "characters",
-        ),
-        (
-            report.get("min_reference_speech_seconds"),
-            evaluation.get("reference_speech_seconds"),
-            "speech seconds",
-        ),
+
+    normalization = evaluation.get("text_normalization")
+    if not (
+        isinstance(normalization, dict)
+        and set(normalization) == {
+            "unicode_form",
+            "case_sensitive",
+            "punctuation_sensitive",
+        }
+        and normalization.get("unicode_form") in {"none", "NFC", "NFKC"}
+        and isinstance(normalization.get("case_sensitive"), bool)
+        and isinstance(normalization.get("punctuation_sensitive"), bool)
     ):
-        if not _at_least(actual, minimum):
-            failures.append(f"quality reference {label} do not meet their minimum")
+        failures.append("quality report lacks a complete text-normalization policy")
+
+    count_fields = (
+        "reference_segments",
+        "hypothesis_segments",
+        "reference_characters",
+        "reference_words",
+        "reference_speakers",
+    )
+    if not all(_nonnegative_integer(evaluation.get(name)) for name in count_fields):
+        failures.append("quality report lacks complete typed evaluation counts")
+    else:
+        reference_segments = cast(int, evaluation["reference_segments"])
+        reference_characters = cast(int, evaluation["reference_characters"])
+        if cast(int, evaluation["reference_speakers"]) > reference_segments:
+            failures.append("quality speaker count exceeds its reference segment count")
+        if cast(int, evaluation["reference_words"]) > reference_characters:
+            failures.append("quality word count exceeds its reference character count")
+
+    minimum_segments = report.get("min_reference_segments")
+    if not isinstance(minimum_segments, int) or not _integer_at_least(
+        evaluation.get("reference_segments"), minimum_segments
+    ):
+        failures.append("quality reference segments do not meet their minimum")
+    minimum_characters = report.get("min_reference_characters")
+    if not isinstance(minimum_characters, int) or not _integer_at_least(
+        evaluation.get("reference_characters"), minimum_characters
+    ):
+        failures.append("quality reference characters do not meet their minimum")
+    if not _at_least(
+        evaluation.get("reference_speech_seconds"),
+        report.get("min_reference_speech_seconds"),
+    ):
+        failures.append("quality reference speech seconds do not meet their minimum")
+
+    for metric, label in (
+        ("character_error_rate", "CER"),
+        ("word_error_rate", "WER"),
+        ("revision_updates_per_segment", "revision rate"),
+        ("reference_speech_seconds", "reference speech duration"),
+    ):
+        if not _nonnegative_number(evaluation.get(metric)):
+            failures.append(f"quality {label} is missing or invalid")
+    diarization_error_rate = evaluation.get("diarization_error_rate")
+    if diarization_error_rate is not None and not _nonnegative_number(
+        diarization_error_rate
+    ):
+        failures.append("quality speaker error is invalid")
     for ceiling, metric, label in (
         (report.get("max_character_error_rate"), "character_error_rate", "CER"),
         (report.get("max_word_error_rate"), "word_error_rate", "WER"),

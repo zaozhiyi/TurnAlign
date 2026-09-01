@@ -27,6 +27,7 @@ class ProductionGateTests(unittest.TestCase):
                 b"immutable release-audio\n"
             ).hexdigest(),
             "failures": [],
+            "backend": "native-streaming-test",
             "require_native_streaming": True,
             "native_streaming": True,
             "require_partial": True,
@@ -42,8 +43,12 @@ class ProductionGateTests(unittest.TestCase):
             "first_partial_seconds": 0.5,
             "first_commit_seconds": 2.0,
             "initialization_seconds": 10.0,
+            "processing_seconds": 15.0,
             "audio_seconds": 30.0,
+            "events": 4,
+            "partials": 1,
             "commits": 2,
+            "replacements": 0,
         })
         write_json_report(quality, {
             "status": "passed",
@@ -64,13 +69,21 @@ class ProductionGateTests(unittest.TestCase):
             "min_reference_characters": 100,
             "min_reference_speech_seconds": 60.0,
             "evaluation": {
+                "text_normalization": {
+                    "unicode_form": "none",
+                    "case_sensitive": True,
+                    "punctuation_sensitive": True,
+                },
                 "character_error_rate": 0.05,
                 "word_error_rate": 0.1,
                 "diarization_error_rate": None,
                 "revision_updates_per_segment": 0.1,
                 "reference_segments": 10,
+                "hypothesis_segments": 10,
                 "reference_characters": 100,
+                "reference_words": 20,
                 "reference_speech_seconds": 60.0,
+                "reference_speakers": 2,
             },
         })
         write_json_report(websocket, {
@@ -302,6 +315,62 @@ class ProductionGateTests(unittest.TestCase):
                     self.assertFalse(report.passed)
                     self.assertIn(expected, "\n".join(report.failures))
                 _, _, websocket = self._reports(root)
+
+    def test_rejects_incomplete_or_inconsistent_release_and_quality_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifacts = self._artifacts(root)
+            for report_name, mutate, expected in (
+                (
+                    "release",
+                    lambda payload: payload.update(events=True),
+                    "complete typed event counts",
+                ),
+                (
+                    "release",
+                    lambda payload: payload.update(events=2),
+                    "inconsistent with its typed events",
+                ),
+                (
+                    "release",
+                    lambda payload: payload.update(processing_seconds=10.0),
+                    "real-time factor is inconsistent",
+                ),
+                (
+                    "quality",
+                    lambda payload: payload["evaluation"].update(
+                        reference_segments=10.5
+                    ),
+                    "complete typed evaluation counts",
+                ),
+                (
+                    "quality",
+                    lambda payload: payload["evaluation"].pop("text_normalization"),
+                    "text-normalization policy",
+                ),
+                (
+                    "quality",
+                    lambda payload: payload["evaluation"].update(word_error_rate=False),
+                    "WER is missing or invalid",
+                ),
+            ):
+                release, quality, websocket = self._reports(root)
+                target = release if report_name == "release" else quality
+                payload = json.loads(target.read_text(encoding="utf-8"))
+                mutate(payload)
+                write_json_report(target, payload)
+
+                report = run_production_gate(
+                    release,
+                    quality,
+                    websocket,
+                    source_commit="b" * 40,
+                    artifacts=artifacts,
+                )
+
+                with self.subTest(report=report_name, expected=expected):
+                    self.assertFalse(report.passed)
+                    self.assertIn(expected, "\n".join(report.failures))
 
     def test_rejects_ambiguous_or_mutable_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
