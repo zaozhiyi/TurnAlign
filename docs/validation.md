@@ -21,7 +21,7 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   materialization limit before constructing the float model input.
 - All source and test modules pass `compileall`.
 - Ruff is enforced in CI and passes over `src` and `tests`.
-- The built wheel passes all 318 tests from site-packages on Python 3.12 with
+- The built wheel passes all 323 tests from site-packages on Python 3.12 with
   `websockets` 14.0 and on Python 3.12 with `websockets` 17.1. The Python 3.12
   run also passes under `python -O`, so production invariants do not depend on
   removable `assert` statements.
@@ -87,6 +87,10 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   candidate after an interrupted rehearsal; legacy activation markers remain
   readable. Pending state blocks activation, rehearsal, and host-profile
   capture. Host-profile holds the same deployment lock throughout capture.
+  Before any transition, activation, recovery, and rehearsal recursively reject
+  non-root-owned, group/world-writable, special, unresolved-link, or
+  mutable-link-target entries anywhere in both complete release trees. Directory
+  links may not escape their release tree.
   After successful activation, rehearsal switches to the preceding release,
   repeats those checks, then restores and reprobes the candidate even after a
   failed rollback probe.

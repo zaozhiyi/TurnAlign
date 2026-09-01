@@ -42,7 +42,18 @@ sudo /usr/local/bin/uv pip install \
   --python /opt/turnalign/releases/<source-commit>/venv/bin/python \
   --no-compile-bytecode --no-deps dist/turnalign-0.1.0-py3-none-any.whl
 sudo chown -R root:root /opt/turnalign/releases/<source-commit>
+sudo chmod -R go-w /opt/turnalign/releases/<source-commit>
 ```
+
+Activation, recovery, and rollback rehearsal recursively inspect the complete
+candidate and preceding release trees before changing `current`. Every regular
+file and directory must be root-owned and non-writable by group or others;
+symbolic links must themselves be root-owned and resolve through an equally
+immutable root-owned path. Directory links may resolve only inside the same
+release tree; an external link may target only a regular file, such as the
+system interpreter selected by a normal virtual environment. This covers the
+interpreter, TurnAlign, and all installed dependencies rather than trusting only
+the top-level release directory or embedded source identity.
 
 Install a reviewed, pinned `uv` binary at the root-owned path shown above, or
 replace it with its actual absolute path. `uv pip sync` removes packages not

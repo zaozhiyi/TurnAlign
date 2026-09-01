@@ -255,6 +255,8 @@ ready 响应会公开非敏感的后端请求名、后端实现名、模型、�
 
 各门禁和部署命令都可用 `--report` 原子保存 JSON 结论。`deployment-activate` 必须从尚未激活的候选 Wheel 运行：它先在 `/var/lib/turnalign-deployment/pending-activation.json` 落盘 root-only 事务标记，再在全局部署锁内原子切换、重启 systemd，并验证预加载就绪和公网 WebSocket 恢复；普通失败或取消会恢复上一版并重做探测。回滚演练也会在切换前持久化带操作类型的同类事务，安全恢复目标为候选版本。只有报告已安全写盘且最终活动版本正确，CLI 才删除事务标记。若任一操作遭遇 `SIGKILL`、断电或主机重启，使用候选 Wheel 的 `deployment-recover` 读取该标记、恢复并探测记录的安全版本，然后重跑被中断的操作。未恢复的标记会阻止新激活、回滚演练和 `host-profile`。`host-profile` 会全程持有同一把 root-only 部署锁，避免与版本切换并发采证。`production-gate` 只在真实模型、人工标注质量、公网 WebSocket、正式激活和回滚/恢复报告均通过时放行；它要求 wheel、依赖锁、CycloneDX SBOM、发布音频、质量参考/输出、模型文件、模型清单、Nginx、systemd、正式激活、回滚演练和主机规格十三类制品。激活、演练与 `host-profile` 必须绑定同一 Linux boot 和同一对前序/候选版本；激活和演练报告还必须包含合法的持久事务身份，`host-profile` 会绑定 Wheel 版本、版本化 Python 路径和其余十二类工件的名称、大小与 SHA-256。三份模型/质量/传输报告必须绑定同一源码提交，音频、质量输入和模型清单也会逐项校验。Wheel、systemd、Nginx、依赖锁和 SBOM 仍由聚合门禁独立重新解析；缺项、伪造转换、弱化探测或身份不一致都会返回非零退出码。
 
+激活、恢复和回滚演练在任何切换前还会递归检查候选版与前序版的完整发布目录，而不只检查顶层目录和提交标识。解释器、TurnAlign 与全部依赖中的目录和普通文件必须由 root 持有且不可被 group/others 写入；符号链接也必须由 root 持有，并沿完全不可写的 root-owned 路径解析。目录链接不得逃逸到发布树之外，外部链接只能指向普通文件（例如标准虚拟环境使用的系统解释器）。可写依赖、特殊文件、悬空链接或指向可变路径的链接都会阻止切换。
+
 `host-profile` 的第 5 版证据还会验证 root-owned `current` 绝对链接确实指向当前候选提交，并逐文件哈希目标机上实际运行的 `turnalign/` 包；聚合门禁要求其路径、文件集、大小和 SHA-256 与保留 Wheel 完全一致。源码目录遮蔽、非活动候选运行时、缺失/替换文件、符号链接、可写安装文件和额外 `__pycache__`/`.pyc` 均会失败。生产命令直接使用版本化 Python 的 `-I -B -u -m turnalign.cli`，隔离环境/用户路径、禁止生成字节码并保持日志无缓冲，不信任安装器生成的 console launcher。
 
 上游仓库推送与 `pyproject.toml` 版本完全一致的 `vX.Y.Z` 标签时，专用发布工作流会重新执行静态检查、两次可复现构建、Wheel 全量测试和 SBOM 生成，然后为 Wheel、sdist、SBOM 和校验和生成 GitHub/Sigstore provenance，保留 90 天。fork PR 只运行无写权限的工作流验证，不能签发制品。下载后可用 `gh attestation verify FILE --repo GuanZhengPM/TurnAlign` 复验构建身份。该工作流不会自动发布 PyPI 或创建 GitHub Release。
@@ -633,7 +635,15 @@ SIGKILL, power loss, or reboot interrupts either command, run
 release recorded for that operation, then the interrupted operation must be
 rerun. Schema-1 activation markers remain recoverable. A pending marker blocks
 activation, rehearsal, and `host-profile`; host-profile also holds the same
-root-only deployment lock throughout evidence capture. `production-gate`
+root-only deployment lock throughout evidence capture. Before any transition,
+activation, recovery, and rehearsal recursively validate
+both complete release trees: directories and regular files must be root-owned
+and non-writable by group or others, while root-owned symbolic links must resolve
+through an equally immutable root-owned path. Directory links cannot escape the
+release tree; external links may target only regular files such as the system
+interpreter used by a standard virtual environment. Mutable dependencies,
+special files, dangling links, and links into writable paths fail before
+`current` changes. `production-gate`
 releases only when the real-model, labelled-quality, public WebSocket, activation
 and rollback/restore reports passed with production-strength requirements. It
 binds the source commit and SHA-256 digests of those reports,

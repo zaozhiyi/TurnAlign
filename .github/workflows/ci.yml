@@ -76,6 +76,52 @@ jobs:
           finally:
               blocked.close()
           '
+      - name: Exercise immutable Linux release validation
+        run: |
+          set -euo pipefail
+          release_fixture=$(mktemp -d)
+          commit=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+          release_root="$release_fixture/releases"
+          package_root="$release_root/$commit/venv/lib/python3.12/site-packages/turnalign"
+          sudo chown root:root "$release_fixture"
+          sudo chmod 0755 "$release_fixture"
+          sudo install -d -m 0755 \
+            "$package_root" \
+            "$release_root/$commit/venv/bin"
+          printf '%s\n' "$commit" | sudo tee \
+            "$package_root/_source_commit.txt" >/dev/null
+          printf 'VALUE = 1\n' | sudo tee \
+            "$package_root/../dependency.py" >/dev/null
+          sudo chmod 0644 \
+            "$package_root/_source_commit.txt" \
+            "$package_root/../dependency.py"
+          sudo ln -s /usr/bin/python3 "$release_root/$commit/venv/bin/python"
+          sudo env \
+            PYTHONPATH="$GITHUB_WORKSPACE/src" \
+            RELEASE_ROOT="$release_root" \
+            RELEASE_COMMIT="$commit" \
+            python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          from turnalign.deployment_rehearsal import _validate_release_directory
+
+          root = Path(os.environ["RELEASE_ROOT"])
+          commit = os.environ["RELEASE_COMMIT"]
+          dependency = (
+              root
+              / commit
+              / "venv/lib/python3.12/site-packages/dependency.py"
+          )
+          assert _validate_release_directory(root, commit) == root / commit
+          dependency.chmod(0o666)
+          try:
+              _validate_release_directory(root, commit)
+          except ValueError as error:
+              assert "unsafe or mutable entry" in str(error)
+          else:
+              raise SystemExit("mutable dependency unexpectedly passed validation")
+          PY
       - name: Verify Nginx deployment configuration
         run: |
           sudo apt-get update

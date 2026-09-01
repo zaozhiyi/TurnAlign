@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -661,6 +662,133 @@ class DeploymentRehearsalTests(unittest.IsolatedAsyncioTestCase):
                     ),
                 )
             self.assertEqual(os.readlink(current), str(releases / self.candidate))
+
+
+@unittest.skipUnless(os.name == "posix", "deployment release validation is POSIX-only")
+class DeploymentReleaseValidationTests(unittest.TestCase):
+    commit = "b" * 40
+
+    def _release(self, root: Path) -> tuple[Path, Path]:
+        releases = root / "releases"
+        release = releases / self.commit
+        package = (
+            release
+            / "venv"
+            / "lib"
+            / "python3.12"
+            / "site-packages"
+            / "turnalign"
+        )
+        package.mkdir(parents=True)
+        (package / "_source_commit.txt").write_text(
+            f"{self.commit}\n",
+            encoding="ascii",
+        )
+        dependency = package.parent / "dependency.py"
+        dependency.write_text("VALUE = 1\n", encoding="ascii")
+        binary = release / "venv" / "bin" / "python"
+        binary.parent.mkdir()
+        binary.write_bytes(b"#!/bin/sh\nexit 0\n")
+        binary.chmod(0o755)
+        return releases, dependency
+
+    def test_release_validation_covers_the_complete_immutable_tree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            releases, _dependency = self._release(Path(directory))
+            with patch.object(
+                rehearsal,
+                "_required_release_owner",
+                return_value=os.getuid(),
+            ):
+                self.assertEqual(
+                    rehearsal._validate_release_directory(releases, self.commit),
+                    releases / self.commit,
+                )
+
+    def test_release_validation_rejects_a_mutable_dependency_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            releases, dependency = self._release(Path(directory))
+            dependency.chmod(0o666)
+            with patch.object(
+                rehearsal,
+                "_required_release_owner",
+                return_value=os.getuid(),
+            ), self.assertRaisesRegex(ValueError, "unsafe or mutable entry"):
+                rehearsal._validate_release_directory(releases, self.commit)
+
+    def test_release_validation_rejects_a_link_to_a_mutable_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            releases, dependency = self._release(root)
+            target = root / "mutable-target.py"
+            target.write_text("VALUE = 2\n", encoding="ascii")
+            target.chmod(0o666)
+            dependency.unlink()
+            dependency.symlink_to(target)
+
+            def immutable_mode(metadata):
+                return not stat.S_IMODE(metadata.st_mode) & 0o022
+
+            with patch.object(
+                rehearsal,
+                "_required_release_owner",
+                return_value=os.getuid(),
+            ), patch.object(
+                rehearsal,
+                "_release_entry_is_immutable",
+                side_effect=immutable_mode,
+            ), self.assertRaisesRegex(ValueError, "symbolic link target is unsafe"):
+                rehearsal._validate_release_directory(releases, self.commit)
+
+    def test_release_validation_accepts_a_secure_venv_python_link(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            releases, _dependency = self._release(root)
+            binary = releases / self.commit / "venv" / "bin" / "python"
+            target = binary.with_name("python3")
+            binary.replace(target)
+            binary.symlink_to(target.name)
+
+            def immutable_mode(metadata):
+                return not stat.S_IMODE(metadata.st_mode) & 0o022
+
+            with patch.object(
+                rehearsal,
+                "_required_release_owner",
+                return_value=os.getuid(),
+            ), patch.object(
+                rehearsal,
+                "_release_entry_is_immutable",
+                side_effect=immutable_mode,
+            ):
+                self.assertEqual(
+                    rehearsal._validate_release_directory(releases, self.commit),
+                    releases / self.commit,
+                )
+
+    def test_release_validation_rejects_an_external_directory_link(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            releases, dependency = self._release(root)
+            external = root / "external-package"
+            external.mkdir()
+            (external / "mutable.py").write_text("VALUE = 3\n", encoding="ascii")
+            dependency.unlink()
+            dependency.symlink_to(external, target_is_directory=True)
+
+            def immutable_mode(metadata):
+                return not stat.S_IMODE(metadata.st_mode) & 0o022
+
+            with patch.object(
+                rehearsal,
+                "_required_release_owner",
+                return_value=os.getuid(),
+            ), patch.object(
+                rehearsal,
+                "_release_entry_is_immutable",
+                side_effect=immutable_mode,
+            ), self.assertRaisesRegex(ValueError, "external directory"):
+                rehearsal._validate_release_directory(releases, self.commit)
 
 
 @unittest.skipUnless(os.name == "posix", "deployment transaction is POSIX-only")

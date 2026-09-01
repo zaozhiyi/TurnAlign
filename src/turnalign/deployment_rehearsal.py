@@ -325,6 +325,84 @@ def _validate_websocket_uri(uri: str) -> None:
         )
 
 
+def _required_release_owner() -> int:
+    return 0
+
+
+def _release_entry_is_immutable(metadata: os.stat_result) -> bool:
+    return (
+        metadata.st_uid == _required_release_owner()
+        and not stat.S_IMODE(metadata.st_mode) & 0o022
+    )
+
+
+def _validate_symlink_target(path: Path, release: Path) -> None:
+    try:
+        resolved = path.resolve(strict=True)
+        resolved_release = release.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ValueError(f"release contains an unresolved symbolic link: {path}") from error
+    if resolved.is_dir() and not resolved.is_relative_to(resolved_release):
+        raise ValueError(
+            f"release symbolic link points to an external directory: {path}"
+        )
+    candidates = [resolved, *resolved.parents]
+    for candidate in reversed(candidates):
+        try:
+            metadata = os.lstat(candidate)
+        except OSError as error:
+            raise ValueError(
+                f"cannot securely inspect release link target: {path}"
+            ) from error
+        if candidate == resolved:
+            valid_type = stat.S_ISREG(metadata.st_mode) or stat.S_ISDIR(
+                metadata.st_mode
+            )
+        else:
+            valid_type = stat.S_ISDIR(metadata.st_mode)
+        if (
+            not valid_type
+            or stat.S_ISLNK(metadata.st_mode)
+            or not _release_entry_is_immutable(metadata)
+        ):
+            raise ValueError(
+                f"release symbolic link target is unsafe or mutable: {path}"
+            )
+
+
+def _validate_release_tree(release: Path) -> None:
+    def fail_walk(error: OSError) -> None:
+        raise error
+
+    try:
+        for directory, directory_names, file_names in os.walk(
+            release,
+            topdown=True,
+            onerror=fail_walk,
+            followlinks=False,
+        ):
+            directory_path = Path(directory)
+            for name in (*directory_names, *file_names):
+                path = directory_path / name
+                metadata = os.lstat(path)
+                if stat.S_ISLNK(metadata.st_mode):
+                    if metadata.st_uid != _required_release_owner():
+                        raise ValueError(
+                            f"release contains a non-root-owned symbolic link: {path}"
+                        )
+                    _validate_symlink_target(path, release)
+                    continue
+                if not (
+                    stat.S_ISDIR(metadata.st_mode)
+                    or stat.S_ISREG(metadata.st_mode)
+                ) or not _release_entry_is_immutable(metadata):
+                    raise ValueError(
+                        f"release contains an unsafe or mutable entry: {path}"
+                    )
+    except OSError as error:
+        raise ValueError("cannot securely inspect the complete release tree") from error
+
+
 def _read_release_identity(path: Path) -> str:
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -338,7 +416,7 @@ def _read_release_identity(path: Path) -> str:
         metadata = os.fstat(descriptor)
         if (
             not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_uid != 0
+            or metadata.st_uid != _required_release_owner()
             or stat.S_IMODE(metadata.st_mode) & 0o022
         ):
             raise ValueError("release identity must be root-owned and immutable")
@@ -370,10 +448,10 @@ def _validate_release_directory(release_root: Path, commit: str) -> Path:
         if (
             not stat.S_ISDIR(metadata.st_mode)
             or stat.S_ISLNK(metadata.st_mode)
-            or metadata.st_uid != 0
-            or stat.S_IMODE(metadata.st_mode) & 0o022
+            or not _release_entry_is_immutable(metadata)
         ):
             raise ValueError(f"{label} must be a root-owned immutable directory")
+    _validate_release_tree(release)
     identities = list(
         (release / "venv" / "lib").glob(
             "python*/site-packages/turnalign/_source_commit.txt"
@@ -382,7 +460,15 @@ def _validate_release_directory(release_root: Path, commit: str) -> Path:
     if len(identities) != 1 or _read_release_identity(identities[0]) != commit:
         raise ValueError(f"release directory is not bound to source commit {commit}")
     python = release / "venv" / "bin" / "python"
-    if not python.exists() or not python.is_file() or not os.access(python, os.X_OK):
+    try:
+        python_metadata = os.stat(python)
+    except OSError as error:
+        raise ValueError(f"release has no executable Python runtime: {python}") from error
+    if (
+        not stat.S_ISREG(python_metadata.st_mode)
+        or not _release_entry_is_immutable(python_metadata)
+        or not stat.S_IMODE(python_metadata.st_mode) & 0o111
+    ):
         raise ValueError(f"release has no executable Python runtime: {python}")
     return release
 
