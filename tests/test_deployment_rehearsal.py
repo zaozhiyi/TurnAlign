@@ -58,10 +58,13 @@ class DeploymentRehearsalTests(unittest.IsolatedAsyncioTestCase):
         self,
         releases: Path,
         current: Path,
+        *,
+        operation: str = "activation",
     ) -> PendingDeploymentTransaction:
         return PendingDeploymentTransaction(
-            schema_version=1,
+            schema_version=2,
             transaction_id="d" * 64,
+            operation=operation,
             previous_commit=self.previous,
             candidate_commit=self.candidate,
             boot_id=self.boot_id,
@@ -324,6 +327,50 @@ class DeploymentRehearsalTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(os.readlink(current), str(releases / self.previous))
             self.assertEqual(observed_commits, [self.previous])
 
+    async def test_interrupted_rehearsal_recovery_restores_and_probes_candidate(self):
+        observed_commits = []
+
+        async def websocket_gate(_uri, **options):
+            observed_commits.append(options["source_commit"])
+            return FakeWebSocketReport(options["source_commit"])
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            releases = root / "releases"
+            current = root / "current"
+            (releases / self.previous).mkdir(parents=True)
+            (releases / self.candidate).mkdir()
+            current.symlink_to(releases / self.previous)
+            transaction = self._transaction(
+                releases,
+                current,
+                operation="rehearsal",
+            )
+            patches = self._patches()
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7], patch.object(
+                rehearsal,
+                "_read_pending_transaction",
+                return_value=transaction,
+            ), patch.object(
+                rehearsal,
+                "run_websocket_gate",
+                side_effect=websocket_gate,
+            ):
+                report = await run_deployment_recovery(
+                    probe=RehearsalProbeConfig(
+                        backend="fake",
+                        model="model-a",
+                    ),
+                )
+
+            self.assertTrue(report.passed)
+            self.assertEqual(report.operation, "rehearsal")
+            self.assertEqual(report.recovery_commit, self.candidate)
+            self.assertEqual(report.initial_active_commit, self.previous)
+            self.assertEqual(report.final_active_commit, self.candidate)
+            self.assertEqual(os.readlink(current), str(releases / self.candidate))
+            self.assertEqual(observed_commits, [self.candidate])
+
     async def test_interrupted_recovery_is_idempotent_when_previous_is_active(self):
         observed_commits = []
 
@@ -387,6 +434,52 @@ class DeploymentRehearsalTests(unittest.IsolatedAsyncioTestCase):
                 )
 
             self.assertEqual(os.readlink(current), str(releases / unrelated))
+
+    async def test_rehearsal_persists_transaction_before_switching(self):
+        observed_transactions = []
+
+        async def websocket_gate(_uri, **options):
+            return FakeWebSocketReport(options["source_commit"])
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            releases = root / "releases"
+            current = root / "current"
+            (releases / self.previous).mkdir(parents=True)
+            (releases / self.candidate).mkdir()
+            current.symlink_to(releases / self.candidate)
+            patches = self._patches()
+
+            def capture(transaction):
+                observed_transactions.append((
+                    transaction.operation,
+                    rehearsal._active_commit(releases, current),
+                ))
+
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7], patch.object(
+                rehearsal,
+                "run_websocket_gate",
+                side_effect=websocket_gate,
+            ), patch.object(
+                rehearsal,
+                "_write_pending_transaction",
+                side_effect=capture,
+            ):
+                report = await run_deployment_rehearsal(
+                    self.previous,
+                    self.candidate,
+                    "wss://asr.example.com/ws",
+                    release_root=releases,
+                    current_link=current,
+                    probe=RehearsalProbeConfig(
+                        backend="fake",
+                        model="model-a",
+                    ),
+                )
+
+            self.assertTrue(report.passed)
+            self.assertEqual(observed_transactions, [("rehearsal", self.candidate)])
+            self.assertEqual(report.transaction_path, str(rehearsal._DEPLOYMENT_TRANSACTION_PATH))
 
     async def test_atomically_rolls_back_and_restores_candidate(self):
         observed_commits = []
@@ -574,8 +667,9 @@ class DeploymentRehearsalTests(unittest.IsolatedAsyncioTestCase):
 class DeploymentTransactionFileTests(unittest.TestCase):
     def _transaction(self, root: Path) -> PendingDeploymentTransaction:
         return PendingDeploymentTransaction(
-            schema_version=1,
+            schema_version=2,
             transaction_id="d" * 64,
+            operation="activation",
             previous_commit="a" * 40,
             candidate_commit="b" * 40,
             boot_id="12345678-1234-4234-8234-123456789abc",
@@ -613,6 +707,30 @@ class DeploymentTransactionFileTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "no recoverable"):
                     rehearsal._read_pending_transaction()
 
+    def test_legacy_activation_transaction_remains_recoverable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "deployment-state" / "pending-activation.json"
+            payload = self._transaction(root).to_dict()
+            payload["schema_version"] = 1
+            payload.pop("operation")
+            path.parent.mkdir()
+            path.parent.chmod(0o700)
+            path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+            path.chmod(0o600)
+            with patch.object(
+                rehearsal,
+                "_DEPLOYMENT_TRANSACTION_PATH",
+                path,
+            ), patch.object(
+                rehearsal,
+                "_required_transaction_owner",
+                return_value=os.getuid(),
+            ):
+                transaction = rehearsal._read_pending_transaction()
+            self.assertEqual(transaction.schema_version, 2)
+            self.assertEqual(transaction.operation, "activation")
+
     def test_transaction_rejects_mutable_or_non_strict_state(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -639,6 +757,11 @@ class DeploymentTransactionFileTests(unittest.TestCase):
                     encoding="utf-8",
                 )
                 with self.assertRaisesRegex(RuntimeError, "not strict JSON"):
+                    rehearsal._read_pending_transaction()
+                payload = transaction.to_dict()
+                payload["operation"] = "unknown"
+                path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+                with self.assertRaisesRegex(RuntimeError, "invalid identities"):
                     rehearsal._read_pending_transaction()
 
     def test_transaction_write_handles_short_writes_and_cleans_up_failure(self):
@@ -759,6 +882,21 @@ class DeploymentTransactionFileTests(unittest.TestCase):
                 rehearsal.finalize_deployment_transaction(
                     transaction.transaction_id,
                     transaction.candidate_commit,
+                )
+                self.assertFalse(path.exists())
+
+                payload = transaction.to_dict()
+                payload["operation"] = "rehearsal"
+                rehearsal_transaction = rehearsal._transaction_from_payload(payload)
+                rehearsal._write_pending_transaction(rehearsal_transaction)
+                with self.assertRaisesRegex(RuntimeError, "unrelated release"):
+                    rehearsal.finalize_deployment_transaction(
+                        rehearsal_transaction.transaction_id,
+                        rehearsal_transaction.previous_commit,
+                    )
+                rehearsal.finalize_deployment_transaction(
+                    rehearsal_transaction.transaction_id,
+                    rehearsal_transaction.candidate_commit,
                 )
                 self.assertFalse(path.exists())
 

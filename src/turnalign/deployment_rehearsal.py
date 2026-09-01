@@ -132,6 +132,8 @@ class DeploymentRehearsalReport:
     completed_at: str
     initial_active_commit: str
     final_active_commit: str | None
+    transaction_id: str
+    transaction_path: str
     rollback: RehearsalPhaseReport
     restore: RehearsalPhaseReport
     failures: tuple[str, ...]
@@ -180,6 +182,7 @@ class DeploymentActivationReport:
 class PendingDeploymentTransaction:
     schema_version: int
     transaction_id: str
+    operation: str
     previous_commit: str
     candidate_commit: str
     boot_id: str
@@ -201,6 +204,8 @@ class DeploymentRecoveryReport:
     status: str
     transaction_id: str
     transaction_path: str
+    operation: str
+    recovery_commit: str
     candidate_commit: str
     previous_commit: str
     original_boot_id: str
@@ -452,7 +457,7 @@ def _validate_transaction_directory(path: Path) -> None:
 
 
 def _transaction_from_payload(payload: object) -> PendingDeploymentTransaction:
-    expected_fields = {
+    common_fields = {
         "schema_version",
         "transaction_id",
         "previous_commit",
@@ -466,13 +471,18 @@ def _transaction_from_payload(payload: object) -> PendingDeploymentTransaction:
         "websocket_uri",
         "created_at",
     }
-    if not isinstance(payload, dict) or set(payload) != expected_fields:
-        raise ValueError("deployment transaction has an invalid schema")
-    if payload.get("schema_version") != 1 or isinstance(
-        payload.get("schema_version"), bool
-    ):
+    if not isinstance(payload, dict):
+        raise TypeError("deployment transaction has an invalid schema")
+    schema_version = payload.get("schema_version")
+    if isinstance(schema_version, bool) or schema_version not in {1, 2}:
         raise ValueError("deployment transaction has an unsupported schema version")
+    expected_fields = (
+        common_fields if schema_version == 1 else common_fields | {"operation"}
+    )
+    if set(payload) != expected_fields:
+        raise ValueError("deployment transaction has an invalid schema")
     transaction_id = payload.get("transaction_id")
+    operation = "activation" if schema_version == 1 else payload.get("operation")
     previous_commit = payload.get("previous_commit")
     candidate_commit = payload.get("candidate_commit")
     boot_id = payload.get("boot_id")
@@ -491,6 +501,7 @@ def _transaction_from_payload(payload: object) -> PendingDeploymentTransaction:
     if (
         not isinstance(transaction_id, str)
         or _TRANSACTION_ID_PATTERN.fullmatch(transaction_id) is None
+        or operation not in {"activation", "rehearsal"}
         or not isinstance(previous_commit, str)
         or _COMMIT_PATTERN.fullmatch(previous_commit) is None
         or not isinstance(candidate_commit, str)
@@ -520,8 +531,9 @@ def _transaction_from_payload(payload: object) -> PendingDeploymentTransaction:
     if created_at.tzinfo is None:
         raise ValueError("deployment transaction timestamp must include a timezone")
     return PendingDeploymentTransaction(
-        schema_version=1,
+        schema_version=2,
         transaction_id=transaction_id,
+        operation=str(operation),
         previous_commit=previous_commit,
         candidate_commit=candidate_commit,
         boot_id=boot_id,
@@ -598,7 +610,7 @@ def _read_pending_transaction() -> PendingDeploymentTransaction:
         raise RuntimeError("deployment transaction is not strict JSON") from error
     try:
         return _transaction_from_payload(payload)
-    except ValueError as error:
+    except (TypeError, ValueError) as error:
         raise RuntimeError(str(error)) from error
 
 
@@ -982,6 +994,22 @@ async def _run_deployment_rehearsal_locked(
         raise ValueError("candidate must be active before the rollback rehearsal")
     boot_id = _read_linux_boot_id()
     started_at = _utc_timestamp()
+    transaction = PendingDeploymentTransaction(
+        schema_version=2,
+        transaction_id=secrets.token_hex(32),
+        operation="rehearsal",
+        previous_commit=previous_commit,
+        candidate_commit=candidate_commit,
+        boot_id=boot_id,
+        release_root=str(release_root),
+        current_link=str(current_link),
+        service=service,
+        systemctl=str(systemctl),
+        ready_uri=ready_uri,
+        websocket_uri=websocket_uri,
+        created_at=started_at,
+    )
+    _write_pending_transaction(transaction)
 
     restore: RehearsalPhaseReport | None = None
     try:
@@ -1066,7 +1094,7 @@ async def _run_deployment_rehearsal_locked(
     except RuntimeError as error:
         failures.append(_failure_text(error))
     return DeploymentRehearsalReport(
-        schema_version=1,
+        schema_version=2,
         status="failed" if failures else "passed",
         candidate_commit=candidate_commit,
         previous_commit=previous_commit,
@@ -1082,6 +1110,8 @@ async def _run_deployment_rehearsal_locked(
         completed_at=_utc_timestamp(),
         initial_active_commit=initial_active_commit,
         final_active_commit=final_active_commit,
+        transaction_id=transaction.transaction_id,
+        transaction_path=str(_DEPLOYMENT_TRANSACTION_PATH),
         rollback=rollback,
         restore=restore,
         failures=tuple(failures),
@@ -1147,8 +1177,9 @@ async def _run_deployment_activation_locked(
     boot_id = _read_linux_boot_id()
     started_at = _utc_timestamp()
     transaction = PendingDeploymentTransaction(
-        schema_version=1,
+        schema_version=2,
         transaction_id=secrets.token_hex(32),
+        operation="activation",
         previous_commit=previous_commit,
         candidate_commit=candidate_commit,
         boot_id=boot_id,
@@ -1294,7 +1325,7 @@ async def _run_deployment_recovery_locked(
     probe: RehearsalProbeConfig | None = None,
     auth_token: str | None = None,
 ) -> DeploymentRecoveryReport:
-    """Restore and probe the prior release from a durable interrupted transaction."""
+    """Restore and probe the safe release recorded by an interrupted operation."""
 
     if platform.system() != "Linux":
         raise RuntimeError("deployment recovery must run on the Linux production host")
@@ -1333,9 +1364,14 @@ async def _run_deployment_recovery_locked(
         )
     recovery_boot_id = _read_linux_boot_id()
     started_at = _utc_timestamp()
+    recovery_commit = (
+        transaction.previous_commit
+        if transaction.operation == "activation"
+        else transaction.candidate_commit
+    )
     recovery = await _exercise_phase(
-        "crash-recovery",
-        transaction.previous_commit,
+        f"{transaction.operation}-crash-recovery",
+        recovery_commit,
         release_root=release_root,
         current_link=current_link,
         systemctl=systemctl,
@@ -1358,18 +1394,20 @@ async def _run_deployment_recovery_locked(
     except ValueError as error:
         final_active_commit = None
         failures.append(_failure_text(error))
-    if final_active_commit != transaction.previous_commit:
-        failures.append("deployment recovery did not restore the preceding release")
+    if final_active_commit != recovery_commit:
+        failures.append("deployment recovery did not restore its recorded safe release")
     try:
         if _read_linux_boot_id() != recovery_boot_id:
             failures.append("host rebooted during deployment recovery")
     except RuntimeError as error:
         failures.append(_failure_text(error))
     return DeploymentRecoveryReport(
-        schema_version=1,
+        schema_version=2,
         status="failed" if failures else "passed",
         transaction_id=transaction.transaction_id,
         transaction_path=str(_DEPLOYMENT_TRANSACTION_PATH),
+        operation=transaction.operation,
+        recovery_commit=recovery_commit,
         candidate_commit=transaction.candidate_commit,
         previous_commit=transaction.previous_commit,
         original_boot_id=transaction.boot_id,
@@ -1411,6 +1449,7 @@ def _acquire_deployment_lock() -> int:
         if (
             not stat.S_ISREG(metadata.st_mode)
             or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
             or stat.S_IMODE(metadata.st_mode) & 0o077
         ):
             raise RuntimeError("deployment lock must be a root-only regular file")
@@ -1519,7 +1558,7 @@ async def run_deployment_recovery(
     probe: RehearsalProbeConfig | None = None,
     auth_token: str | None = None,
 ) -> DeploymentRecoveryReport:
-    """Recover an interrupted activation, leaving its marker for finalization."""
+    """Recover an interrupted deployment operation and retain its marker."""
 
     if platform.system() != "Linux":
         raise RuntimeError("deployment recovery must run on the Linux production host")
@@ -1557,10 +1596,12 @@ def finalize_deployment_transaction(
         transaction = _read_pending_transaction()
         if transaction.transaction_id != transaction_id:
             raise RuntimeError("deployment transaction identity changed")
-        if expected_active_commit not in {
-            transaction.previous_commit,
-            transaction.candidate_commit,
-        }:
+        permitted_commits = (
+            {transaction.previous_commit, transaction.candidate_commit}
+            if transaction.operation == "activation"
+            else {transaction.candidate_commit}
+        )
+        if expected_active_commit not in permitted_commits:
             raise RuntimeError("deployment finalization selected an unrelated release")
         active_commit = _active_commit(
             Path(transaction.release_root),

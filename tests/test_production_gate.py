@@ -3,6 +3,7 @@ import csv
 import hashlib
 import io
 import json
+import os
 import tempfile
 import unittest
 import zipfile
@@ -288,7 +289,7 @@ class ProductionGateTests(unittest.TestCase):
             }
 
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "status": "passed",
             "candidate_commit": "b" * 40,
             "previous_commit": "c" * 40,
@@ -304,6 +305,10 @@ class ProductionGateTests(unittest.TestCase):
             "completed_at": "2026-09-01T08:00:08.000Z",
             "initial_active_commit": "b" * 40,
             "final_active_commit": "b" * 40,
+            "transaction_id": "d" * 64,
+            "transaction_path": (
+                "/var/lib/turnalign-deployment/pending-activation.json"
+            ),
             "rollback": phase(
                 "rollback",
                 "b" * 40,
@@ -467,6 +472,10 @@ class ProductionGateTests(unittest.TestCase):
             "_installed_distribution_identity",
             return_value=ProductionGateTests._installed_distribution(wheel),
         ), patch.object(
+            production_gate_module,
+            "_active_release_commit",
+            return_value="b" * 40,
+        ), patch.object(
             production_gate_module.platform,
             "system",
             return_value="Linux",
@@ -474,6 +483,10 @@ class ProductionGateTests(unittest.TestCase):
             production_gate_module,
             "_read_linux_boot_id",
             return_value=ProductionGateTests.BOOT_ID,
+        ), patch.object(
+            production_gate_module,
+            "_acquire_deployment_lock",
+            side_effect=lambda: os.open(os.devnull, os.O_RDONLY),
         ):
             write_json_report(
                 host_profile,
@@ -785,6 +798,10 @@ class ProductionGateTests(unittest.TestCase):
                     "not bound to the production source commit",
                 ),
                 (
+                    lambda payload: payload.update(active_commit="c" * 40),
+                    "did not capture the active candidate release",
+                ),
+                (
                     lambda payload: payload["platform"].update(
                         logical_cpu_count=True
                     ),
@@ -871,6 +888,14 @@ class ProductionGateTests(unittest.TestCase):
                 (
                     lambda payload: payload.update(previous_commit="b" * 40),
                     "not bound to one prior and candidate release",
+                ),
+                (
+                    lambda payload: payload.update(transaction_id="d" * 63),
+                    "invalid transaction identity",
+                ),
+                (
+                    lambda payload: payload.update(transaction_path="/tmp/pending"),
+                    "invalid transaction identity",
                 ),
                 (
                     lambda payload: payload.update(final_active_commit="c" * 40),
@@ -1222,8 +1247,117 @@ class ProductionGateTests(unittest.TestCase):
                 production_gate_module,
                 "_DEPLOYMENT_TRANSACTION_PATH",
                 pending,
+            ), patch.object(
+                production_gate_module,
+                "_acquire_deployment_lock",
+                side_effect=lambda: os.open(os.devnull, os.O_RDONLY),
             ), self.assertRaisesRegex(RuntimeError, "pending deployment"):
                 create_host_profile(None, [])
+
+    def test_host_profile_holds_deployment_lock_through_capture(self):
+        descriptor = os.open(os.devnull, os.O_RDONLY)
+        events = []
+
+        def reject_pending():
+            events.append("checked")
+
+        def capture(source_commit, artifacts, system):
+            self.assertEqual(events, ["checked"])
+            self.assertEqual(source_commit, "b" * 40)
+            self.assertEqual(artifacts, [])
+            self.assertEqual(system, "Linux")
+            os.fstat(descriptor)
+            events.append("captured")
+            return {"schema_version": 5}
+
+        with patch.object(
+            production_gate_module.platform,
+            "system",
+            return_value="Linux",
+        ), patch.object(
+            production_gate_module,
+            "_acquire_deployment_lock",
+            return_value=descriptor,
+        ), patch.object(
+            production_gate_module,
+            "_reject_pending_deployment_transaction",
+            side_effect=reject_pending,
+        ), patch.object(
+            production_gate_module,
+            "_create_host_profile_locked",
+            side_effect=capture,
+        ):
+            self.assertEqual(
+                create_host_profile("b" * 40, []),
+                {"schema_version": 5},
+            )
+        self.assertEqual(events, ["checked", "captured"])
+        with self.assertRaises(OSError):
+            os.fstat(descriptor)
+
+    def test_host_profile_deployment_lock_is_root_only_and_exclusive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "deployment.lock"
+
+            def root_metadata(descriptor):
+                metadata = real_fstat(descriptor)
+                return SimpleNamespace(
+                    st_mode=metadata.st_mode,
+                    st_uid=0,
+                    st_nlink=metadata.st_nlink,
+                )
+
+            with patch.object(
+                production_gate_module,
+                "_DEPLOYMENT_LOCK_PATH",
+                path,
+            ), patch.object(
+                production_gate_module.os,
+                "fstat",
+                side_effect=root_metadata,
+            ):
+                first = production_gate_module._acquire_deployment_lock()
+                try:
+                    with self.assertRaisesRegex(RuntimeError, "operation is active"):
+                        production_gate_module._acquire_deployment_lock()
+                finally:
+                    os.close(first)
+                second = production_gate_module._acquire_deployment_lock()
+                os.close(second)
+
+    def test_host_profile_requires_a_canonical_active_candidate_link(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            releases = root / "releases"
+            current = root / "current"
+            commit = "b" * 40
+            (releases / commit).mkdir(parents=True)
+            current.symlink_to(releases / commit)
+            with patch.object(
+                production_gate_module,
+                "_RELEASE_ROOT",
+                releases,
+            ), patch.object(
+                production_gate_module,
+                "_CURRENT_RELEASE_LINK",
+                current,
+            ), patch.object(
+                production_gate_module,
+                "_required_deployment_owner",
+                return_value=os.getuid(),
+            ), patch.object(
+                production_gate_module,
+                "_root_owned_immutable",
+                return_value=True,
+            ):
+                self.assertEqual(
+                    production_gate_module._active_release_commit(),
+                    commit,
+                )
+                current.unlink()
+                current.symlink_to(Path("releases") / commit)
+                with self.assertRaisesRegex(ValueError, "absolute target"):
+                    production_gate_module._active_release_commit()
 
     def test_rejects_weakened_or_comment_only_systemd_controls(self):
         with tempfile.TemporaryDirectory() as directory:

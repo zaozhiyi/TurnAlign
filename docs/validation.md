@@ -21,7 +21,7 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   materialization limit before constructing the float model input.
 - All source and test modules pass `compileall`.
 - Ruff is enforced in CI and passes over `src` and `tests`.
-- The built wheel passes all 312 tests from site-packages on Python 3.12 with
+- The built wheel passes all 318 tests from site-packages on Python 3.12 with
   `websockets` 14.0 and on Python 3.12 with `websockets` 17.1. The Python 3.12
   run also passes under `python -O`, so production invariants do not depend on
   removable `assert` statements.
@@ -81,12 +81,15 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   root-only transaction marker. Failure or cancellation restores and reprobes
   the preceding immutable release, and the marker is removed only after the
   report is durable. SIGKILL, power loss, or reboot leaves the marker for
-  `turnalign deployment-recover`, which restores and reprobes the exact recorded
-  preceding release. Pending state blocks activation, rehearsal, and host-profile
-  capture. After successful activation, the
-  rehearsal uses the same lock to switch to the preceding release, repeat those
-  checks, then restore and reprobe the candidate even after a failed rollback
-  probe.
+  `turnalign deployment-recover`, which restores and reprobes the safe release
+  recorded for that operation. Rehearsal now persists its own operation-tagged
+  transaction before switching, so the same recovery command restores the
+  candidate after an interrupted rehearsal; legacy activation markers remain
+  readable. Pending state blocks activation, rehearsal, and host-profile
+  capture. Host-profile holds the same deployment lock throughout capture.
+  After successful activation, rehearsal switches to the preceding release,
+  repeats those checks, then restores and reprobes the candidate even after a
+  failed rollback probe.
   `turnalign production-gate` independently rechecks the critical
   thresholds, requires a public `wss://` concurrent recovery/soak result, and
   binds the source commit plus thirteen required artifact classes and all reports
@@ -99,7 +102,7 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   names, sizes and SHA-256 digests. It also revalidates the activation transition,
   both rehearsal transitions, systemd/readiness exit evidence, complete per-phase
   WebSocket reports, candidate restoration, and restored backend/model identity.
-- `/opt/turnalign/current/venv/bin/python -I -B -u -m turnalign.cli host-profile` must
+- `sudo /opt/turnalign/current/venv/bin/python -I -B -u -m turnalign.cli host-profile` must
   run from the
   active candidate on the Linux target host. It derives the source commit from
   the installed Wheel instead of requiring a production Git checkout, records
@@ -107,7 +110,8 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   the Wheel version, versioned Python
   executable/prefix, final source commit, the complete active `turnalign/`
   package file set, and the exact name, size and SHA-256 identity of the other
-  twelve retained artifacts. Schema 4 rejects a source checkout shadowing the
+  twelve retained artifacts. Schema 5 also binds the root-owned canonical
+  `current` link to the candidate and rejects a source checkout shadowing the
   installed package, non-root-owned or writable package files, symlinks, and any missing,
   modified or extra file (including bytecode) relative to the retained Wheel.
   Production service and administrative commands use the exact versioned

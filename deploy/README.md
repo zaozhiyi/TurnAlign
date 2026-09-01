@@ -256,6 +256,11 @@ Before routing users, retain all of the following with the release artifact:
    restores and reprobes the candidate. Probe failure or cancellation still
    triggers candidate restoration, and the command fails unless both exact
    transitions pass. Retain its report rather than writing a success summary.
+   Before switching, rehearsal persists an operation-tagged transaction at the
+   same root-only marker path. If SIGKILL, power loss, or reboot interrupts it,
+   run candidate-installed `deployment-recover`; it restores and reprobes the
+   candidate, after which the rehearsal must be rerun. Legacy schema-1 markers
+   are treated as interrupted activations.
 8. For tagged upstream distributions,
    `gh attestation verify FILE --repo GuanZhengPM/TurnAlign` verifies the signed
    GitHub/Sigstore build provenance.
@@ -264,13 +269,15 @@ Before routing users, retain all of the following with the release artifact:
 
 Persist each gate with `--report`, generate retained-model provenance with
 `turnalign model-manifest`, and run
-`/opt/turnalign/current/venv/bin/python -I -B -u -m turnalign.cli host-profile` on the
+`sudo /opt/turnalign/current/venv/bin/python -I -B -u -m turnalign.cli host-profile` on the
 target host after
 activating the candidate and finalizing the other twelve artifact classes. The
-command reads the commit embedded in the installed Wheel, so the production
+command holds the root-only deployment lock for the complete capture and reads
+the commit embedded in the installed Wheel, so the production
 host does not need a Git checkout. It refuses non-Linux hosts, source checkouts,
 unbound Wheels, mismatched explicitly supplied commits, and non-versioned Python
-environments. Its schema 4 evidence hashes the complete active `turnalign/`
+environments. Its schema 5 evidence also proves that the root-owned canonical
+`current` link selects the candidate and hashes the complete active `turnalign/`
 tree; the aggregate gate requires that tree to match the retained Wheel exactly.
 Then run `turnalign
 production-gate` with the source commit and all thirteen required artifact kinds

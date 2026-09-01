@@ -426,6 +426,14 @@ def deployment_rehearsal(args) -> int:
         auth_token=auth_token,
     ))
     _emit_gate_report(report, args.report)
+    if (
+        report.restore.passed
+        and report.final_active_commit == report.candidate_commit
+    ):
+        finalize_deployment_transaction(
+            report.transaction_id,
+            report.candidate_commit,
+        )
     return 0 if report.passed else 1
 
 
@@ -469,7 +477,7 @@ def deployment_recovery(args) -> int:
     if report.passed:
         finalize_deployment_transaction(
             report.transaction_id,
-            report.previous_commit,
+            report.recovery_commit,
         )
     return 0 if report.passed else 1
 
@@ -1066,8 +1074,8 @@ def main() -> int:
     recovery_parser = commands.add_parser(
         "deployment-recover",
         help=(
-            "Restore and probe the preceding release after an interrupted "
-            "production activation"
+            "Restore and probe the safe release after an interrupted "
+            "production deployment operation"
         ),
     )
     _add_deployment_probe_arguments(recovery_parser)

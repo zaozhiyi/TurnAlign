@@ -687,10 +687,14 @@ class CliIntegrationTests(unittest.TestCase):
 
         class Report:
             passed = True
+            candidate_commit = "b" * 40
+            final_active_commit = candidate_commit
+            transaction_id = "c" * 64
+            restore = SimpleNamespace(passed=True)
 
             @staticmethod
             def to_dict():
-                return {"schema_version": 1, "status": "passed", "failures": []}
+                return {"schema_version": 2, "status": "passed", "failures": []}
 
         async def fake_rehearsal(previous, candidate, uri, **options):
             captured.update({
@@ -703,10 +707,19 @@ class CliIntegrationTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "rehearsal.json"
+
+            def fake_finalize(transaction_id, active_commit):
+                captured["finalized"] = (transaction_id, active_commit)
+                self.assertTrue(output.exists())
+
             with patch.object(
                 cli,
                 "run_deployment_rehearsal",
                 side_effect=fake_rehearsal,
+            ), patch.object(
+                cli,
+                "finalize_deployment_transaction",
+                side_effect=fake_finalize,
             ), patch(
                 "sys.argv",
                 [
@@ -734,6 +747,7 @@ class CliIntegrationTests(unittest.TestCase):
             self.assertEqual(probe.backend, "funasr-streaming")
             self.assertEqual(probe.model, "paraformer-zh-streaming")
             self.assertEqual(probe.sessions, 2)
+            self.assertEqual(captured["finalized"], ("c" * 64, "b" * 40))
             self.assertEqual(json.loads(output.read_text())["status"], "passed")
 
     def test_deployment_activation_maps_transactional_production_options(self):
@@ -808,11 +822,11 @@ class CliIntegrationTests(unittest.TestCase):
         class Report:
             passed = True
             transaction_id = "d" * 64
-            previous_commit = "a" * 40
+            recovery_commit = "a" * 40
 
             @staticmethod
             def to_dict():
-                return {"schema_version": 1, "status": "passed", "failures": []}
+                return {"schema_version": 2, "status": "passed", "failures": []}
 
         async def fake_recovery(**options):
             captured.update(options)
@@ -927,17 +941,24 @@ class CliIntegrationTests(unittest.TestCase):
                 "turnalign.production_gate._installed_distribution_identity",
                 return_value=installed_distribution,
             ), patch(
+                "turnalign.production_gate._active_release_commit",
+                return_value="a" * 40,
+            ), patch(
                 "turnalign.production_gate.platform.system",
                 return_value="Linux",
             ), patch(
                 "turnalign.production_gate._read_linux_boot_id",
                 return_value="12345678-1234-4234-8234-123456789abc",
+            ), patch(
+                "turnalign.production_gate._acquire_deployment_lock",
+                side_effect=lambda: os.open(os.devnull, os.O_RDONLY),
             ), patch("sys.argv", arguments), patch("builtins.print"):
                 self.assertEqual(cli.main(), 0)
 
             payload = json.loads(output.read_text(encoding="utf-8"))
-            self.assertEqual(payload["schema_version"], 4)
+            self.assertEqual(payload["schema_version"], 5)
             self.assertEqual(payload["source_commit"], "a" * 40)
+            self.assertEqual(payload["active_commit"], "a" * 40)
             self.assertEqual(payload["runtime"], runtime)
             self.assertEqual(
                 payload["installed_distribution"], installed_distribution

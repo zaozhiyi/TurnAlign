@@ -54,6 +54,9 @@ _MAX_WHEEL_ENTRIES = 4_096
 _DEPLOYMENT_TRANSACTION_PATH = Path(
     "/var/lib/turnalign-deployment/pending-activation.json"
 )
+_DEPLOYMENT_LOCK_PATH = Path("/run/lock/turnalign-deployment.lock")
+_RELEASE_ROOT = Path("/opt/turnalign/releases")
+_CURRENT_RELEASE_LINK = Path("/opt/turnalign/current")
 _LOCK_REQUIREMENT_PATTERN = re.compile(
     r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([A-Za-z0-9][A-Za-z0-9.!+_-]*)(?:\s|;|$)"
 )
@@ -403,6 +406,51 @@ def create_host_profile(
     system = platform.system()
     if system != "Linux":
         raise RuntimeError("host-profile must run on the Linux production host")
+    lock_descriptor = _acquire_deployment_lock()
+    try:
+        _reject_pending_deployment_transaction()
+        return _create_host_profile_locked(source_commit, artifacts, system)
+    finally:
+        os.close(lock_descriptor)
+
+
+def _acquire_deployment_lock() -> int:
+    import fcntl
+
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(
+            _DEPLOYMENT_LOCK_PATH,
+            os.O_RDWR
+            | os.O_CREAT
+            | getattr(os, "O_CLOEXEC", 0)
+            | nofollow,
+            0o600,
+        )
+    except OSError as error:
+        raise RuntimeError("cannot securely open the deployment lock") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != 0
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) & 0o077
+        ):
+            raise RuntimeError("deployment lock must be a root-only regular file")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RuntimeError(
+                "another TurnAlign deployment operation is active"
+            ) from error
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _reject_pending_deployment_transaction() -> None:
     try:
         os.lstat(_DEPLOYMENT_TRANSACTION_PATH)
     except FileNotFoundError:
@@ -413,8 +461,20 @@ def create_host_profile(
         raise RuntimeError(
             "host-profile refuses a pending deployment transaction; recover it first"
         )
+
+
+def _create_host_profile_locked(
+    source_commit: str | None,
+    artifacts: list[tuple[str, Path]],
+    system: str,
+) -> dict[str, object]:
     runtime = _installed_runtime_identity(source_commit)
     bound_commit = runtime["turnalign_source_commit"]
+    active_commit = _active_release_commit()
+    if active_commit != bound_commit:
+        raise ValueError(
+            "host-profile runtime is not the active production release"
+        )
     installed_distribution = _installed_distribution_identity(runtime)
     expected_kinds = REQUIRED_ARTIFACT_KINDS - {"host-profile"}
     evidence = []
@@ -450,8 +510,9 @@ def create_host_profile(
     if logical_cpu_count is None or logical_cpu_count <= 0:
         raise RuntimeError("cannot determine the host logical CPU count")
     return {
-        "schema_version": 4,
+        "schema_version": 5,
         "source_commit": bound_commit,
+        "active_commit": active_commit,
         "runtime": runtime,
         "installed_distribution": installed_distribution,
         "platform": {
@@ -468,6 +529,47 @@ def create_host_profile(
             key=lambda item: (cast(str, item["kind"]), cast(str, item["name"])),
         ),
     }
+
+
+def _active_release_commit() -> str:
+    release_root = _RELEASE_ROOT
+    current_link = _CURRENT_RELEASE_LINK
+    try:
+        metadata = current_link.lstat()
+        raw_target = os.readlink(current_link)
+    except OSError as error:
+        raise ValueError("host-profile cannot read the active release link") from error
+    if (
+        not stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != _required_deployment_owner()
+    ):
+        raise ValueError("host-profile active release link must be root-owned")
+    target = Path(raw_target)
+    if not target.is_absolute():
+        raise ValueError("host-profile active release link must use an absolute target")
+    normalized = Path(os.path.normpath(raw_target))
+    commit = normalized.name
+    if (
+        normalized.parent != release_root
+        or normalized != release_root / commit
+        or _COMMIT_PATTERN.fullmatch(commit) is None
+    ):
+        raise ValueError("host-profile active release link is not canonical")
+    try:
+        target_metadata = normalized.lstat()
+    except OSError as error:
+        raise ValueError("host-profile active release directory is missing") from error
+    if (
+        not stat.S_ISDIR(target_metadata.st_mode)
+        or stat.S_ISLNK(target_metadata.st_mode)
+        or not _root_owned_immutable(target_metadata)
+    ):
+        raise ValueError("host-profile active release directory is unsafe or mutable")
+    return commit
+
+
+def _required_deployment_owner() -> int:
+    return 0
 
 
 def _read_linux_boot_id() -> str:
@@ -1586,6 +1688,7 @@ def _validate_host_profile(
     if not isinstance(payload, dict) or set(payload) != {
         "schema_version",
         "source_commit",
+        "active_commit",
         "runtime",
         "installed_distribution",
         "platform",
@@ -1595,11 +1698,13 @@ def _validate_host_profile(
         return None
     if (
         isinstance(payload.get("schema_version"), bool)
-        or payload.get("schema_version") != 4
+        or payload.get("schema_version") != 5
     ):
         failures.append("host profile has an unsupported schema version")
     if payload.get("source_commit") != source_commit:
         failures.append("host profile is not bound to the production source commit")
+    if payload.get("active_commit") != source_commit:
+        failures.append("host profile did not capture the active candidate release")
 
     runtime = payload.get("runtime")
     expected_prefix = f"/opt/turnalign/releases/{source_commit}/venv"
@@ -2081,6 +2186,8 @@ def _validate_rollback_rehearsal(
         "completed_at",
         "initial_active_commit",
         "final_active_commit",
+        "transaction_id",
+        "transaction_path",
         "rollback",
         "restore",
         "failures",
@@ -2091,9 +2198,17 @@ def _validate_rollback_rehearsal(
     _passed_report("rollback rehearsal", payload, failures)
     if (
         isinstance(payload.get("schema_version"), bool)
-        or payload.get("schema_version") != 1
+        or payload.get("schema_version") != 2
     ):
         failures.append("rollback rehearsal has an unsupported schema version")
+    transaction_id = payload.get("transaction_id")
+    if (
+        not isinstance(transaction_id, str)
+        or _TRANSACTION_ID_PATTERN.fullmatch(transaction_id) is None
+        or payload.get("transaction_path")
+        != "/var/lib/turnalign-deployment/pending-activation.json"
+    ):
+        failures.append("rollback rehearsal has invalid transaction identity")
     previous_commit = payload.get("previous_commit")
     if (
         payload.get("candidate_commit") != source_commit
