@@ -22,6 +22,7 @@ class DeploymentArtifactTests(unittest.TestCase):
         content = SERVICE.read_text(encoding="utf-8")
         for setting in (
             "--host 127.0.0.1",
+            "ExecStart=/opt/turnalign/current/venv/bin/turnalign serve",
             "--preload",
             "--warmup-file /var/lib/turnalign/warmup.wav",
             "--require-immutable-model-revision",
@@ -120,7 +121,7 @@ class DeploymentArtifactTests(unittest.TestCase):
         ):
             self.assertIn(requirement, content)
 
-    def test_distribution_sbom_environment_is_version_bound(self):
+    def test_distribution_sbom_environment_is_reproducible_and_runtime_only(self):
         requirement = (
             "sbom-env/bin/python -m pip install --upgrade \\\n"
             "            pip==26.0.1 setuptools==80.9.0"
@@ -128,6 +129,10 @@ class DeploymentArtifactTests(unittest.TestCase):
         for workflow in (CI_WORKFLOW, RELEASE_WORKFLOW):
             content = workflow.read_text(encoding="utf-8")
             self.assertIn(requirement, content)
+            self.assertIn(
+                "sbom-env/bin/python -m pip uninstall --yes pip setuptools",
+                content,
+            )
 
 
 if __name__ == "__main__":

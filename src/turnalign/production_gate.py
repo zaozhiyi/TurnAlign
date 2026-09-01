@@ -43,6 +43,16 @@ _EMBEDDED_REQUIREMENT_PATTERN = re.compile(
     r"\s[A-Za-z0-9][A-Za-z0-9._-]*==[A-Za-z0-9]"
 )
 _SHA256_OPTION_PATTERN = re.compile(r"--hash=sha256:([0-9a-fA-F]{64})(?:\s|$)")
+_BUILD_ONLY_SBOM_COMPONENTS = frozenset({
+    "bandit",
+    "build",
+    "cyclonedx-bom",
+    "mypy",
+    "pip",
+    "pip-audit",
+    "ruff",
+    "twine",
+})
 REQUIRED_ARTIFACT_KINDS = frozenset({
     "dependency-lock",
     "host-profile",
@@ -900,6 +910,12 @@ def _validate_sbom(
             websocket_refs.add(component_ref)
     if "websockets" not in component_versions:
         failures.append("SBOM does not include the WebSocket server runtime dependency")
+    build_only = sorted(_BUILD_ONLY_SBOM_COMPONENTS.intersection(component_versions))
+    if build_only:
+        failures.append(
+            "SBOM includes build-only tooling in the production environment: "
+            + ", ".join(build_only)
+        )
     dependencies = payload.get("dependencies")
     if not isinstance(dependencies, list):
         failures.append("SBOM has no dependency graph")
@@ -1381,6 +1397,14 @@ def run_production_gate(
         if sbom_components.get(name) != version:
             failures.append(
                 f"SBOM does not match locked runtime requirement: {name}=={version}"
+            )
+    for name, version in sbom_components.items():
+        locked = locked_requirements.get(name)
+        if locked is None:
+            failures.append(f"SBOM contains an unlocked runtime component: {name}=={version}")
+        elif locked[0] != version and locked[1]:
+            failures.append(
+                f"SBOM does not match locked runtime requirement: {name}=={locked[0]}"
             )
 
     wheel_snapshots = artifact_snapshots.get("wheel", [])

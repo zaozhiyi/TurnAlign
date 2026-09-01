@@ -227,7 +227,7 @@ python examples/websocket_file_client.py sample.wav --backend glm-asr --language
 
 `websocket-gate` 使用生成的静音并发检查已部署服务的协议、流控、确认、完成率和延迟，不保存识别文本或恢复凭证。默认要求每会话至少一个 ACK 且不允许丢弃 partial，可用 `--min-audio-acks`、`--max-dropped-partials` 和 `--max-backpressure-pauses` 收紧目标环境门槛。它只证明传输与生命周期，不证明识别质量；突发测试不加 `--realtime`，长稳测试则加上该参数。生产 TLS 应由反向代理或服务网格终止，门槛直接访问外部 `wss://` 地址。非浏览器客户默认允许；浏览器 Origin 默认拒绝，必须用 `--allow-origin` 精确放行。`GET /healthz` 和 `GET /readyz` 可用作存活/就绪探针；仅回环访问的 `GET /metrics` 提供不含标签、文本和凭证的 Prometheus 运行指标，示例 Nginx 明确拒绝公网 `/metrics`。进程收到 `SIGTERM` 后会停止接入、关闭现有连接并在 `--shutdown-grace-timeout` 后强制取消未退出的处理器。恢复音频默认限制为每会话 512 MiB、每进程 2 GiB，完成后立即释放临时文件；断线会话的默认恢复窗口为 300 秒，超时由后台任务自动清理。相关上限均可通过 `serve --help` 调整。服务进程默认最多接受 32 个会话，但同一模型默认只有一个实例；需要进程内并行时显式设置 `--backend-replicas N`（最多 8，模型内存也近似乘以 N），或部署多个单副本进程。生产服务应加 `--preload`，在监听端口前加载全部副本；配合 `--warmup-file` 可在启动阶段执行真实推理。首次消息、客户端空闲、模型初始化、结束收尾和工作线程退出时间均有界，可通过 `turnalign serve --help` 调整。命令行后端的可执行文件、模型路径和参数可由运维侧通过 `--executable`、`--model-path` 和 `--backend-option KEY=VALUE` 固定，无需开放客户端路径权限。内置后端的私密热词按租约注入并在归还时清空，不同热词会话可复用同一大模型实例。
 
-三个门禁都可用 `--report` 原子保存 JSON 结论。`production-gate` 只在真实模型、人工标注质量和公网 WebSocket 报告均通过，并且报告证明不可变模型、原生流式、`wss://`、实时压测、延迟上限及断线恢复已启用时放行；它要求 wheel、依赖锁、CycloneDX SBOM、发布音频、质量参考/输出、模型文件、模型清单、Nginx、systemd 和主机规格十一类制品。三份门禁报告必须绑定同一源码提交，音频和质量输入的 SHA-256 必须与聚合制品匹配，模型清单的 revision、文件名、大小和 SHA-256 必须与报告及保留的模型文件完全一致，防止任意文件冒充已验证模型。`host-profile` 必须在目标主机生成，并将该主机的平台信息、源码提交和其余十类工件的名称、大小、SHA-256 绑定为同一批部署证据。Wheel 必须是有界且路径安全的纯 Python TurnAlign 包，其内嵌源码 commit 必须与聚合门禁一致，控制台入口和 `RECORD` 中每个文件的 SHA-256/大小也必须完整匹配。systemd unit 会按实际指令而非注释重新解析，并验证回环监听、凭据文件、预加载、不可变模型、容量/生命周期边界、网络隔离、非 root 身份和最小权限设置。Nginx 配置也会按语法树重新解析，并与公网 `wss://` 报告及 systemd 端点交叉验证 TLS、WebSocket Upgrade、回环 upstream、限流、禁止重试、私有 metrics 和超时关系。依赖锁必须使用带 SHA-256 的精确版本，SBOM 必须标识 TurnAlign 根组件、WebSocket 运行依赖和依赖图，并与所有无条件锁定版本一致；缺项或弱化的门禁会返回非零退出码。
+三个门禁都可用 `--report` 原子保存 JSON 结论。`production-gate` 只在真实模型、人工标注质量和公网 WebSocket 报告均通过，并且报告证明不可变模型、原生流式、`wss://`、实时压测、延迟上限及断线恢复已启用时放行；它要求 wheel、依赖锁、CycloneDX SBOM、发布音频、质量参考/输出、模型文件、模型清单、Nginx、systemd 和主机规格十一类制品。三份门禁报告必须绑定同一源码提交，音频和质量输入的 SHA-256 必须与聚合制品匹配，模型清单的 revision、文件名、大小和 SHA-256 必须与报告及保留的模型文件完全一致，防止任意文件冒充已验证模型。`host-profile` 必须在目标主机生成，并将该主机的平台信息、源码提交和其余十类工件的名称、大小、SHA-256 绑定为同一批部署证据。Wheel 必须是有界且路径安全的纯 Python TurnAlign 包，其内嵌源码 commit 必须与聚合门禁一致，控制台入口和 `RECORD` 中每个文件的 SHA-256/大小也必须完整匹配。systemd unit 会按实际指令而非注释重新解析，并验证回环监听、凭据文件、预加载、不可变模型、容量/生命周期边界、网络隔离、非 root 身份、可切换版本路径和最小权限设置。Nginx 配置也会按语法树重新解析，并与公网 `wss://` 报告及 systemd 端点交叉验证 TLS、WebSocket Upgrade、回环 upstream、限流、禁止重试、私有 metrics 和超时关系。依赖锁必须使用带 SHA-256 的精确版本，SBOM 必须标识 TurnAlign 根组件、WebSocket 运行依赖和依赖图；每个运行组件都必须能在锁文件中找到相同版本，pip、Twine、CycloneDX 等构建工具不得留在生产环境中。缺项或弱化的门禁会返回非零退出码。
 
 上游仓库推送与 `pyproject.toml` 版本完全一致的 `vX.Y.Z` 标签时，专用发布工作流会重新执行静态检查、两次可复现构建、Wheel 全量测试和 SBOM 生成，然后为 Wheel、sdist、SBOM 和校验和生成 GitHub/Sigstore provenance，保留 90 天。fork PR 只运行无写权限的工作流验证，不能签发制品。下载后可用 `gh attestation verify FILE --repo GuanZhengPM/TurnAlign` 复验构建身份。该工作流不会自动发布 PyPI 或创建 GitHub Release。
 
@@ -585,7 +585,8 @@ must match the public `wss://` host/path plus the systemd loopback endpoint,
 while proving TLS, WebSocket upgrade, rate and connection limits, private
 metrics, disabled retries, and safe proxy/application timeout ordering;
 the SBOM must identify TurnAlign and the WebSocket runtime, include a dependency
-graph, and match every unconditional locked version.
+graph, match every installed runtime component to its locked version, and omit
+build-only tooling.
 Missing or weakened evidence returns a non-zero exit code.
 
 When the upstream repository receives a `vX.Y.Z` tag that exactly matches the
@@ -595,8 +596,8 @@ creating GitHub/Sigstore provenance for the Wheel, sdist, SBOM and checksums.
 Fork pull requests run only the read-only workflow validation and cannot attest
 artifacts. Verify a downloaded file with
 `gh attestation verify FILE --repo GuanZhengPM/TurnAlign`. The workflow retains
-artifacts for 90 days and fixes the pip/setuptools versions recorded in the
-distribution SBOM; it does not
+artifacts for 90 days, pins its bootstrap installer, and removes pip/setuptools
+before recording the runtime SBOM; it does not
 publish to PyPI or create a GitHub Release.
 
 A scoped [Linux CPU systemd and Nginx reference deployment](deploy/README.md)

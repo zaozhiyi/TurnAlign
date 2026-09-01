@@ -21,7 +21,7 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   materialization limit before constructing the float model input.
 - All source and test modules pass `compileall`.
 - Ruff is enforced in CI and passes over `src` and `tests`.
-- The built wheel passes all 280 tests from site-packages on Python 3.10 with
+- The built wheel passes all 281 tests from site-packages on Python 3.10 with
   `websockets` 14.0 and on Python 3.12 with `websockets` 17.1. The Python 3.12
   run also passes under `python -O`, so production invariants do not depend on
   removable `assert` statements.
@@ -211,8 +211,8 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   SHA-256 manifest, and retains the checked artifacts for 14 days. A valid
   upstream version tag repeats these checks, signs the distribution provenance,
   and retains the attested artifacts for 90 days. Build tools
-  and the pip/setuptools versions represented in the distribution SBOM are
-  fixed, while first-party GitHub Actions are pinned to immutable
+  and the temporary pip/setuptools bootstrap versions are fixed, then removed
+  before the runtime SBOM is generated. First-party GitHub Actions are pinned to immutable
   commit hashes with checkout credential persistence disabled. CI downloads
   the pinned actionlint release only after verifying its published SHA-256,
   then validates every workflow file.

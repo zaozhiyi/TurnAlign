@@ -45,8 +45,9 @@ jobs:
           if ! getent passwd turnalign >/dev/null; then
             sudo useradd --system --home /var/lib/turnalign --shell /usr/sbin/nologin turnalign
           fi
-          sudo install -d /opt/turnalign/venv/bin /etc/turnalign /var/lib/turnalign
-          sudo install -m 0755 /usr/bin/true /opt/turnalign/venv/bin/turnalign
+          sudo install -d /opt/turnalign/current/venv/bin /etc/turnalign /var/lib/turnalign
+          sudo install -m 0755 /usr/bin/true \
+            /opt/turnalign/current/venv/bin/turnalign
           sudo install -m 0600 /dev/null /etc/turnalign/auth-token
           sudo touch /var/lib/turnalign/warmup.wav
           systemd-analyze verify deploy/systemd/turnalign.service
@@ -140,6 +141,7 @@ jobs:
           sbom-env/bin/python -m pip install --upgrade \
             pip==26.0.1 setuptools==80.9.0
           sbom-env/bin/python -m pip install dist-a/*.whl "websockets==17.1"
+          sbom-env/bin/python -m pip uninstall --yes pip setuptools
           cyclonedx-py environment sbom-env/bin/python \
             --pyproject pyproject.toml --mc-type application --sv 1.6 \
             --output-reproducible --of JSON -o dist-a/sbom.cdx.json

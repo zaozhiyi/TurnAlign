@@ -602,6 +602,13 @@ class ProductionGateTests(unittest.TestCase):
                     ("ProtectSystem=strict", "ProtectSystem=full"),
                     "ProtectSystem=strict",
                 ),
+                (
+                    (
+                        "/opt/turnalign/current/venv/bin/turnalign",
+                        "/opt/turnalign/venv/bin/turnalign",
+                    ),
+                    "version-switchable current release path",
+                ),
             ):
                 artifacts = self._artifacts(root)
                 service = next(
@@ -835,6 +842,34 @@ class ProductionGateTests(unittest.TestCase):
             failures = "\n".join(report.failures)
             self.assertIn("lacks a SHA-256 hash", failures)
             self.assertIn("SBOM does not match locked runtime requirement", failures)
+
+    def test_rejects_unlocked_or_build_only_sbom_components(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, quality, websocket = self._reports(root)
+            artifacts = self._artifacts(root)
+            sbom = next(path for kind, path in artifacts if kind == "sbom")
+            payload = json.loads(sbom.read_text(encoding="utf-8"))
+            payload["components"].append({
+                "bom-ref": "pip==26.0.1",
+                "name": "pip",
+                "version": "26.0.1",
+                "purl": "pkg:pypi/pip@26.0.1",
+            })
+            write_json_report(sbom, payload)
+
+            report = run_production_gate(
+                release,
+                quality,
+                websocket,
+                source_commit="b" * 40,
+                artifacts=artifacts,
+            )
+
+            self.assertFalse(report.passed)
+            failures = "\n".join(report.failures)
+            self.assertIn("build-only tooling", failures)
+            self.assertIn("unlocked runtime component: pip==26.0.1", failures)
 
     def test_rejects_sbom_with_inconsistent_package_url(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -25,31 +25,50 @@ Development builds without that environment variable remain installable but
 carry an `unbound` marker and cannot pass `production-gate`.
 
 For the reference CPU profile, create a target-specific, hash-locked dependency
-set and install it before the wheel:
+set and install each source commit into a new release directory before the
+wheel. Never update the active virtual environment in place:
 
 ```bash
 uv pip compile pyproject.toml --extra server --extra funasr \
   --generate-hashes --output-file requirements.lock
-uv pip sync requirements.lock
-uv pip install --no-deps dist/turnalign-0.1.0-py3-none-any.whl
+sudo install -d -m 0755 /opt/turnalign/releases/<source-commit>
+sudo python3 -m venv --without-pip \
+  /opt/turnalign/releases/<source-commit>/venv
+sudo /usr/local/bin/uv pip sync \
+  --python /opt/turnalign/releases/<source-commit>/venv/bin/python \
+  requirements.lock
+sudo /usr/local/bin/uv pip install \
+  --python /opt/turnalign/releases/<source-commit>/venv/bin/python \
+  --no-deps dist/turnalign-0.1.0-py3-none-any.whl
+sudo chown -R root:root /opt/turnalign/releases/<source-commit>
 ```
+
+Install a reviewed, pinned `uv` binary at the root-owned path shown above, or
+replace it with its actual absolute path. `uv pip sync` removes packages not
+present in the complete lock, while `--without-pip` avoids seeding packaging
+tools into the runtime environment. The final
+runtime SBOM must not contain pip, Twine, CycloneDX, linters, auditors, or other
+build-only tools. If a backend genuinely imports `setuptools`/`pkg_resources`,
+retain an exact hash-pinned setuptools entry in the runtime lock; otherwise
+remove the bootstrap copy before generating the SBOM.
 
 Run the SBOM generator from a separately installed, pinned `cyclonedx-bom`
 tool, not from inside the production environment:
 
 ```bash
-cyclonedx-py environment /opt/turnalign/venv/bin/python \
+cyclonedx-py environment /opt/turnalign/releases/<source-commit>/venv/bin/python \
   --pyproject pyproject.toml --mc-type application --sv 1.6 \
   --output-reproducible --of JSON -o sbom.cdx.json
 ```
 
 The production gate requires exact `==` pins with SHA-256 hashes and verifies
-that every unconditional lock entry has the same version in the SBOM; editable,
-VCS, local-path and unhashed requirements fail.
+both directions: every unconditional lock entry is present at that version,
+and every installed SBOM runtime component has a matching lock entry. Editable,
+VCS, local-path, unhashed, unlocked and build-only components fail.
 
 The example paths assume:
 
-- executable: `/opt/turnalign/venv/bin/turnalign`
+- executable: `/opt/turnalign/current/venv/bin/turnalign`
 - service account: `turnalign`
 - state/model cache: `/var/lib/turnalign`
 - root-only authentication credential: `/etc/turnalign/auth-token`
@@ -67,6 +86,20 @@ monitoring traffic but cannot fetch weights, call third-party APIs, or otherwise
 open Internet connections. Complete every download and cache validation before
 starting the service. A backend that genuinely requires remote inference is not
 compatible with this reference profile and needs a separately reviewed unit.
+
+Activate a fully prepared release by atomically replacing the `current`
+symlink. The systemd unit and production validator require this exact layout:
+
+```bash
+sudo ln -s /opt/turnalign/releases/<source-commit> \
+  /opt/turnalign/.current-<source-commit>
+sudo mv -Tf /opt/turnalign/.current-<source-commit> /opt/turnalign/current
+```
+
+Do not remove the preceding release directory until the new release has passed
+all gates and the rollback rehearsal. A failed activation is reversed by the
+same atomic link replacement; no package is installed into or removed from the
+running release.
 
 ## 2. Install the service
 
@@ -141,8 +174,12 @@ Before routing users, retain all of the following with the release artifact:
    commit, model-file checksums, Nginx configuration, service unit, host
    profile, and gate reports are saved. Treat labelled references and
    hypotheses as potentially sensitive data and restrict their storage.
-6. Rollback is tested by restoring the preceding immutable artifact and model
-   bundle, not by mutating the running environment.
+6. Rollback is tested by atomically pointing `/opt/turnalign/current` at the
+   preceding immutable release directory, restarting the service, and rerunning
+   readiness plus the public WebSocket gate. Atomically restore the candidate,
+   restart, and rerun both probes before approval. Retain the two source commits,
+   model revisions, activation times, command exit status and probe reports as
+   deployment-system evidence; a hand-written success JSON is not sufficient.
 7. For tagged upstream distributions,
    `gh attestation verify FILE --repo GuanZhengPM/TurnAlign` verifies the signed
    GitHub/Sigstore build provenance.
@@ -160,7 +197,8 @@ quality evidence, incomplete artifact sets, a retained Nginx file containing
 unresolved includes or weakened TLS/WebSocket/upstream controls, and a retained
 systemd unit that
 weakens loopback binding, credential handling, resource limits, network
-isolation, graceful lifecycle behavior, or least-privilege controls.
+isolation, version-switchable activation, graceful lifecycle behavior, or
+least-privilege controls.
 
 WebSocket recovery is process-local. Keep one process behind this reference
 upstream. A multi-process or multi-host topology must either provide sticky

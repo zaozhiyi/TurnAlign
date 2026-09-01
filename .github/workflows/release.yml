@@ -90,6 +90,7 @@ jobs:
           sbom-env/bin/python -m pip install --upgrade \
             pip==26.0.1 setuptools==80.9.0
           sbom-env/bin/python -m pip install dist-a/*.whl "websockets==17.1"
+          sbom-env/bin/python -m pip uninstall --yes pip setuptools
           cyclonedx-py environment sbom-env/bin/python \
             --pyproject pyproject.toml --mc-type application --sv 1.6 \
             --output-reproducible --of JSON -o dist-a/sbom.cdx.json

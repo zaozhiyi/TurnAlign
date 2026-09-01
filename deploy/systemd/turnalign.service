@@ -19,7 +19,7 @@ Environment=PYTHONDONTWRITEBYTECODE=1
 LoadCredential=auth-token:/etc/turnalign/auth-token
 ExecStartPre=/usr/bin/test -r /var/lib/turnalign/warmup.wav
 ExecStartPre=/usr/bin/test -s ${CREDENTIALS_DIRECTORY}/auth-token
-ExecStart=/opt/turnalign/venv/bin/turnalign serve \
+ExecStart=/opt/turnalign/current/venv/bin/turnalign serve \
   --host 127.0.0.1 \
   --port 8765 \
   --backend funasr-streaming \
