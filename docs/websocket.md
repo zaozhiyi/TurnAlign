@@ -181,6 +181,11 @@ VAD boundaries. The final remainder on an explicit `end` may be shorter than
 20 ms; the server accepts it as a final internal chunk and acknowledges it
 before emitting terminal events.
 
+The WebSocket transport caps each assembled message at 16 MiB, which still
+contains the largest legal ten-second PCM frame at 96 kHz and eight channels,
+and lowers the incoming frame queue high-water mark to four. This bounds
+library-level buffering before TurnAlign's own input queue and flow control run.
+
 When the input queue is under pressure the server may send:
 
 ```json

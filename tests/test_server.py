@@ -248,6 +248,37 @@ class OutputQueueTests(unittest.TestCase):
 
 
 class ServerConfigurationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_websocket_transport_buffers_are_explicitly_bounded(self):
+        captured = {}
+        started = asyncio.Event()
+        shutdown_event = asyncio.Event()
+
+        class FakeWebSocketServer:
+            def close(self, *, close_connections=True):
+                return None
+
+            async def wait_closed(self):
+                return None
+
+        async def fake_websocket_serve(_handler, _host, _port, **options):
+            captured.update(options)
+            started.set()
+            return FakeWebSocketServer()
+
+        with patch("websockets.asyncio.server.serve", new=fake_websocket_serve):
+            server_task = asyncio.create_task(serve(shutdown_event=shutdown_event))
+            await asyncio.wait_for(started.wait(), timeout=1)
+            try:
+                self.assertEqual(captured["max_size"], 16 * 1024 * 1024)
+                self.assertGreaterEqual(
+                    captured["max_size"],
+                    96_000 * 8 * 2 * 10,
+                )
+                self.assertEqual(captured["max_queue"], 4)
+            finally:
+                shutdown_event.set()
+                await asyncio.wait_for(server_task, timeout=1)
+
     async def test_rejects_invalid_lifecycle_limits_before_binding(self):
         for options, message in (
             ({"port": -1}, "port"),

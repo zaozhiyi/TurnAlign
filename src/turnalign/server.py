@@ -38,6 +38,8 @@ from .session import transcribe_events
 
 LOGGER = logging.getLogger(__name__)
 _QueueItem = TypeVar("_QueueItem")
+_MAX_WEBSOCKET_MESSAGE_BYTES = 16 * 1024 * 1024
+_MAX_PENDING_WEBSOCKET_FRAMES = 4
 
 
 class _ServerMetrics:
@@ -1191,7 +1193,12 @@ async def serve(
             handler,
             host,
             port,
-            max_size=20 * 1024 * 1024,
+            # A legal maximum PCM frame is 15.36 MB (96 kHz, eight channels,
+            # signed 16-bit, ten seconds). Bound the transport queue as well as
+            # each assembled message so a stalled handler can't inherit the
+            # library's substantially larger default buffering envelope.
+            max_size=_MAX_WEBSOCKET_MESSAGE_BYTES,
+            max_queue=_MAX_PENDING_WEBSOCKET_FRAMES,
             ping_interval=20,
             ping_timeout=20,
             close_timeout=5,
