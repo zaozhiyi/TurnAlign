@@ -56,15 +56,19 @@ class ResourceCleanupTests(unittest.TestCase):
         self.assertTrue(second.closed)
         self.assertIn("resource_type=Resource", captured.output[0])
 
+    @unittest.skipUnless(os.name == "posix", "model ownership is a POSIX invariant")
     def test_local_model_path_rejects_symlinks_and_writable_ancestors(self):
         original_lstat = os.lstat
-
-        def root_owned(path):
-            metadata = original_lstat(path)
-            return SimpleNamespace(st_mode=metadata.st_mode, st_uid=0)
-
         with tempfile.TemporaryDirectory() as directory:
             retained_root = (Path(directory) / "models").resolve()
+
+            def trusted_root_owned(path):
+                metadata = original_lstat(path)
+                mode = metadata.st_mode
+                if Path(path) != retained_root:
+                    mode &= ~0o022
+                return SimpleNamespace(st_mode=mode, st_uid=0)
+
             model = retained_root / "model"
             model.mkdir(parents=True)
             weights = model / "weights.bin"
@@ -75,7 +79,11 @@ class ResourceCleanupTests(unittest.TestCase):
                 backend_common,
                 "_LOCAL_MODEL_ROOT",
                 retained_root,
-            ), patch.object(backend_common.os, "lstat", side_effect=root_owned):
+            ), patch.object(
+                backend_common.os,
+                "lstat",
+                side_effect=trusted_root_owned,
+            ):
                 self.assertEqual(
                     backend_common.require_local_model_path(
                         str(model), directory=True

@@ -21,7 +21,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from email.parser import BytesParser
 from email.policy import default as email_policy
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import cast
 from urllib.parse import unquote, urlsplit
 
@@ -1815,7 +1815,11 @@ def _validate_model_manifest(
     model_id = payload.get("model_id")
     if not _valid_model_id(model_id):
         failures.append("model manifest does not identify a valid model")
-    model_relative = Path(cast(str, model_id)) if isinstance(model_id, str) else None
+    # Gate reports describe paths on the Linux production host.  Parse those
+    # paths with POSIX semantics even when the verifier itself runs elsewhere.
+    model_relative = (
+        PurePosixPath(cast(str, model_id)) if isinstance(model_id, str) else None
+    )
     if (
         model_relative is None
         or model_relative.is_absolute()
@@ -1864,7 +1868,7 @@ def _validate_model_manifest(
         failures.append("model manifest is not bound to loaded runtime model evidence")
         return
     expected_model_root = (
-        _MODEL_EVIDENCE_ROOT / model_relative
+        PurePosixPath("/var/lib/turnalign/models") / model_relative
         if model_relative is not None
         else None
     )
@@ -1874,7 +1878,7 @@ def _validate_model_manifest(
         if not isinstance(item, dict) or not isinstance(item.get("path"), str):
             loaded_paths_valid = False
             continue
-        loaded_path = Path(cast(str, item["path"]))
+        loaded_path = PurePosixPath(cast(str, item["path"]))
         if (
             not loaded_path.is_absolute()
             or expected_model_root is None

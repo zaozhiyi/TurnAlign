@@ -527,6 +527,9 @@ class ProductionGateTests(unittest.TestCase):
             (kind, path) for kind, path in artifacts if kind != "host-profile"
         ]
         runtime_prefix = f"/opt/turnalign/releases/{'b' * 40}/venv"
+        python_version = ".".join(
+            production_gate_module.platform.python_version().split(".")[:2]
+        )
         wheel = next(path for kind, path in artifacts if kind == "wheel")
         service_path = next(
             path for kind, path in artifacts if kind == "service-unit"
@@ -556,7 +559,7 @@ class ProductionGateTests(unittest.TestCase):
                     "version": "17.1",
                     "root": (
                         f"/opt/turnalign/releases/{'b' * 40}/venv/lib/"
-                        "python3.10/site-packages"
+                        f"python{python_version}/site-packages"
                     ),
                     "file_count": 1,
                     "sha256": hashlib.sha256(b"dependency\n").hexdigest(),
