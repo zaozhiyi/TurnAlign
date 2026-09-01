@@ -71,13 +71,15 @@ class DeploymentArtifactTests(unittest.TestCase):
         ):
             self.assertIn(setting, content)
 
-    def test_nginx_timeouts_exceed_application_idle_timeout(self):
+    def test_nginx_timeouts_cover_application_lifecycle_deadlines(self):
         service = SERVICE.read_text(encoding="utf-8")
         nginx = NGINX.read_text(encoding="utf-8")
         idle = option_number(service, "client-idle-timeout")
+        initialization = option_number(service, "initialization-timeout")
+        finalization = option_number(service, "finalization-timeout")
         read_timeout = float(re.search(r"proxy_read_timeout\s+(\d+(?:\.\d+)?)s", nginx).group(1))
         send_timeout = float(re.search(r"proxy_send_timeout\s+(\d+(?:\.\d+)?)s", nginx).group(1))
-        self.assertGreater(read_timeout, idle)
+        self.assertGreater(read_timeout, max(idle, initialization, finalization))
         self.assertGreater(send_timeout, idle)
         self.assertIn("proxy_pass http://turnalign_backend/healthz;", nginx)
         self.assertIn("proxy_pass http://turnalign_backend/readyz;", nginx)

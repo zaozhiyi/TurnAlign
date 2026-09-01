@@ -59,7 +59,9 @@ server {
         proxy_set_header X-Forwarded-Proto https;
         proxy_buffering off;
         proxy_request_buffering off;
-        proxy_read_timeout 75s;
+        # Keep the proxy's outer read deadline beyond every application phase
+        # that may legitimately produce no server-to-client traffic.
+        proxy_read_timeout 330s;
         proxy_send_timeout 75s;
         proxy_next_upstream off;
     }

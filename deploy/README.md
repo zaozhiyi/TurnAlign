@@ -114,6 +114,12 @@ application token in the first protocol message, never in the URI or proxy
 logs. Browser clients remain denied until an exact `--allow-origin` value is
 added to the service after reviewing the frontend origin.
 
+Keep Nginx's `proxy_read_timeout` greater than the application's initialization,
+client-idle, and finalization deadlines. The example uses 330 seconds because
+the service allows initialization for 300 seconds and finalization for 120
+seconds. Application deadlines remain the inner resource limits; the proxy
+deadline must not terminate a valid slow phase first.
+
 ## 4. Release gates
 
 Before routing users, retain all of the following with the release artifact:
