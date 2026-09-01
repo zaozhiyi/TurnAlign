@@ -164,12 +164,15 @@ Before routing users, retain all of the following with the release artifact:
 
 1. `/readyz` succeeds only after preload and warm-up.
 2. `turnalign websocket-gate` passes against the **public** `wss://` endpoint,
-   including the fault-resume option and intended concurrency/soak duration.
+   including the fault-resume option and intended concurrency/soak duration;
+   every ready response identifies the same requested backend, backend
+   implementation, model, device and immutable model revision.
 3. `turnalign quality-gate` passes on the versioned, human-labelled production
    corpus using project-owned thresholds.
 4. All three reports name the exact release source commit; the release audio,
    quality reference and quality hypothesis digests match the retained input
-   artifacts, and the quality/release reports identify the same immutable model.
+   artifacts, and the quality/release/public-WebSocket reports identify the same
+   backend implementation and immutable model revision.
 5. The exact wheel hash, dependency lock, validated CycloneDX SBOM, model
    commit, model-file checksums, Nginx configuration, service unit, host
    profile, and gate reports are saved. Treat labelled references and

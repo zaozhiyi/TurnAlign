@@ -711,6 +711,29 @@ def _validate_quality(report: dict[str, object], failures: list[str]) -> None:
 
 def _validate_websocket(report: dict[str, object], failures: list[str]) -> None:
     _passed_report("websocket", report, failures)
+    if report.get("identity_consistent") is not True:
+        failures.append("websocket report did not observe one consistent deployment identity")
+    backend = report.get("backend")
+    backend_implementation = report.get("backend_implementation")
+    model = report.get("model")
+    revision = report.get("model_revision")
+    device = report.get("device")
+    if not _valid_model_id(backend):
+        failures.append("websocket report has no valid observed backend identity")
+    if not _valid_model_id(backend_implementation):
+        failures.append(
+            "websocket report has no valid observed backend implementation identity"
+        )
+    if not _valid_model_id(model):
+        failures.append("websocket report has no valid observed model identity")
+    if not isinstance(revision, str) or _MODEL_REVISION_PATTERN.fullmatch(revision) is None:
+        failures.append("websocket report has no immutable observed model revision")
+    if not _valid_model_id(device):
+        failures.append("websocket report has no valid observed device identity")
+    for field in ("language", "compute_type"):
+        value = report.get(field)
+        if value is not None and not _valid_model_id(value):
+            failures.append(f"websocket report has an invalid observed {field} identity")
     uri = report.get("uri")
     parsed = urlsplit(uri) if isinstance(uri, str) else None
     if parsed is None or parsed.scheme != "wss" or not _public_hostname(parsed.hostname):
@@ -736,7 +759,14 @@ def _validate_websocket(report: dict[str, object], failures: list[str]) -> None:
     if not isinstance(recovery, dict) or recovery.get("passed") is not True:
         failures.append("websocket recovery probe did not pass")
     elif (
-        not _positive_number(recovery.get("disconnected_audio_seconds"))
+        recovery.get("backend") != backend
+        or recovery.get("backend_implementation") != backend_implementation
+        or recovery.get("model") != model
+        or recovery.get("model_revision") != revision
+        or recovery.get("device") != device
+        or recovery.get("language") != report.get("language")
+        or recovery.get("compute_type") != report.get("compute_type")
+        or not _positive_number(recovery.get("disconnected_audio_seconds"))
         or not _integer_at_least(
             recovery.get("first_last_acknowledged_sequence"), 0
         )
@@ -813,6 +843,13 @@ def _validate_websocket(report: dict[str, object], failures: list[str]) -> None:
     valid_results = all(
         isinstance(result, dict)
         and result.get("passed") is True
+        and result.get("backend") == backend
+        and result.get("backend_implementation") == backend_implementation
+        and result.get("model") == model
+        and result.get("model_revision") == revision
+        and result.get("device") == device
+        and result.get("language") == report.get("language")
+        and result.get("compute_type") == report.get("compute_type")
         and _integer_at_least(result.get("session"), 1)
         and _positive_number(result.get("ready_seconds"))
         and _positive_number(result.get("total_seconds"))
@@ -1544,6 +1581,10 @@ def run_production_gate(
         _validate_report_source(name, report, source_commit, failures)
     if release.get("model_revision") != quality.get("model_revision"):
         failures.append("quality and release reports identify different model revisions")
+    if websocket.get("backend_implementation") != release.get("backend"):
+        failures.append("websocket and release reports identify different backends")
+    if websocket.get("model_revision") != release.get("model_revision"):
+        failures.append("websocket and release reports identify different model revisions")
     for report, field, kind, label in (
         (release, "input_audio_sha256", "release-audio", "release audio"),
         (quality, "reference_sha256", "quality-reference", "quality reference"),

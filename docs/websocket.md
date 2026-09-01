@@ -152,9 +152,11 @@ successfully:
   "resume_token": "high-entropy-session-secret",
   "model_loaded": true,
   "backend": "glm-asr",
+  "backend_implementation": "glm-asr",
+  "model_revision": "0123456789abcdef0123456789abcdef01234567",
   "sample_rate": 16000,
   "channels": 1,
-  "config": {},
+  "config": {"model": "glm-asr-nano", "device": "cpu", "language": "zh"},
   "capabilities": {}
 }
 ```
@@ -343,8 +345,10 @@ with an empty server frame buffer, deliberately closes the connection without
 `end`, and retries resume for up to `--recovery-resume-timeout` seconds while the
 old worker exits. The gate then requires the same session ID,
 `resumed: true`, an exact `next_audio_sequence` continuation, advancing ACKs,
-and a terminal `end` after the remaining audio. Recovery counters and failures
-are stored under `recovery_probe`; transcript text is never retained.
+and a terminal `end` after the remaining audio. Recovery counters, the requested
+backend, actual backend implementation, model, device and immutable model
+revision are stored under `recovery_probe`; transcript text is never retained.
+Every normal and resumed session must observe the same deployment identity.
 Because v1 recovery is process-local, a multi-process or multi-pod deployment
 must keep reconnects on the original instance for the recovery TTL. Run this
 probe through the public load balancer: failure there exposes missing session

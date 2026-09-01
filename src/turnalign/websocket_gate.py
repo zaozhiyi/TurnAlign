@@ -5,6 +5,7 @@ import json
 from dataclasses import asdict, dataclass
 from math import ceil, isfinite
 from time import perf_counter
+from typing import cast
 from urllib.parse import urlsplit
 
 from .jsonutil import strict_json_object
@@ -16,6 +17,13 @@ from .validation import EventStreamValidator
 class WebSocketSessionResult:
     session: int
     passed: bool
+    backend: str | None = None
+    backend_implementation: str | None = None
+    model: str | None = None
+    model_revision: str | None = None
+    device: str | None = None
+    language: str | None = None
+    compute_type: str | None = None
     ready_seconds: float | None = None
     total_seconds: float | None = None
     events: int = 0
@@ -32,6 +40,13 @@ class WebSocketSessionResult:
 @dataclass(frozen=True, slots=True)
 class WebSocketRecoveryResult:
     passed: bool
+    backend: str | None = None
+    backend_implementation: str | None = None
+    model: str | None = None
+    model_revision: str | None = None
+    device: str | None = None
+    language: str | None = None
+    compute_type: str | None = None
     disconnected_audio_seconds: float | None = None
     first_last_acknowledged_sequence: int | None = None
     resumed_next_audio_sequence: int | None = None
@@ -48,6 +63,14 @@ class WebSocketGateReport:
     status: str
     source_commit: str | None
     uri: str
+    identity_consistent: bool
+    backend: str | None
+    backend_implementation: str | None
+    model: str | None
+    model_revision: str | None
+    device: str | None
+    language: str | None
+    compute_type: str | None
     sessions: int
     passed_sessions: int
     failed_sessions: int
@@ -79,10 +102,82 @@ class WebSocketGateReport:
             not self.recovery_probe_required
             or self.recovery_probe is not None and self.recovery_probe.passed
         )
-        return sessions_passed and recovery_passed
+        return sessions_passed and recovery_passed and self.identity_consistent
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class _ReadyIdentity:
+    backend: str
+    backend_implementation: str
+    model: str | None
+    model_revision: str | None
+    device: str | None
+    language: str | None
+    compute_type: str | None
+
+
+def _valid_identity(value: object, *, required: bool = False) -> bool:
+    if value is None:
+        return not required
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and value.strip() == value
+        and len(value) <= 512
+        and not any(
+            ord(character) < 32 or ord(character) == 127 for character in value
+        )
+    )
+
+
+def _ready_identity(
+    payload: dict[str, object],
+    *,
+    requested_backend: str | None,
+    requested_model: str | None,
+    requested_language: str | None,
+    requested_compute_type: str | None,
+) -> _ReadyIdentity:
+    backend = payload.get("backend")
+    backend_implementation = payload.get("backend_implementation")
+    config = payload.get("config")
+    revision = payload.get("model_revision")
+    if not _valid_identity(backend, required=True):
+        raise ValueError("server ready response has no valid backend identity")
+    if not _valid_identity(backend_implementation, required=True):
+        raise ValueError(
+            "server ready response has no valid backend implementation identity"
+        )
+    if not isinstance(config, dict):
+        raise TypeError("server ready response has no configuration identity")
+    values: dict[str, str | None] = {}
+    for key in ("model", "device", "language", "compute_type"):
+        value = config.get(key)
+        if not _valid_identity(value):
+            raise ValueError(f"server ready response has an invalid {key} identity")
+        values[key] = cast(str | None, value)
+    if not _valid_identity(revision):
+        raise ValueError("server ready response has an invalid model revision")
+    for label, requested, observed in (
+        ("backend", requested_backend, backend),
+        ("model", requested_model, values["model"]),
+        ("language", requested_language, values["language"]),
+        ("compute_type", requested_compute_type, values["compute_type"]),
+    ):
+        if requested is not None and observed != requested:
+            raise ValueError(f"server ready response changed the requested {label}")
+    return _ReadyIdentity(
+        backend=cast(str, backend),
+        backend_implementation=cast(str, backend_implementation),
+        model=values["model"],
+        model_revision=cast(str | None, revision),
+        device=values["device"],
+        language=values["language"],
+        compute_type=values["compute_type"],
+    )
 
 
 def _parse_server_response(raw: object) -> dict[str, object]:
@@ -250,6 +345,13 @@ async def _run_session(
             session_id = ready.get("session_id")
             if not isinstance(session_id, str) or not session_id:
                 raise ValueError("server ready response is missing a session_id")
+            identity = _ready_identity(
+                ready,
+                requested_backend=backend,
+                requested_model=model,
+                requested_language=language,
+                requested_compute_type=compute_type,
+            )
             ready_seconds = perf_counter() - started
 
             flow_allowed = asyncio.Event()
@@ -404,6 +506,13 @@ async def _run_session(
             return WebSocketSessionResult(
                 session=session,
                 passed=failure is None,
+                backend=identity.backend,
+                backend_implementation=identity.backend_implementation,
+                model=identity.model,
+                model_revision=identity.model_revision,
+                device=identity.device,
+                language=identity.language,
+                compute_type=identity.compute_type,
                 ready_seconds=ready_seconds,
                 total_seconds=total_seconds,
                 events=counters["events"],
@@ -466,6 +575,7 @@ async def _run_recovery_probe(
         last_acknowledged_sequence: int | None = None
         final_buffered_bytes: int | None = None
         highest_event_sequence = -1
+        first_identity: _ReadyIdentity | None = None
 
         def start_request(
             *,
@@ -501,7 +611,7 @@ async def _run_recovery_probe(
             *,
             expected_session_id: str | None = None,
             expected_resume_token: str | None = None,
-        ) -> tuple[str, int, str]:
+        ) -> tuple[str, int, str, _ReadyIdentity]:
             if payload.get("type") == "error":
                 raise RuntimeError(
                     f"server rejected recovery probe: "
@@ -530,7 +640,14 @@ async def _run_recovery_probe(
                 or next_audio_sequence < 0
             ):
                 raise ValueError("ready response has invalid next_audio_sequence")
-            return ready_session_id, next_audio_sequence, ready_resume_token
+            identity = _ready_identity(
+                payload,
+                requested_backend=backend,
+                requested_model=model,
+                requested_language=language,
+                requested_compute_type=compute_type,
+            )
+            return ready_session_id, next_audio_sequence, ready_resume_token, identity
 
         async def consume_message(websocket) -> None:
             nonlocal final_buffered_bytes, highest_event_sequence
@@ -603,7 +720,7 @@ async def _run_recovery_probe(
         try:
             await first.send(json.dumps(start_request(), ensure_ascii=False))
             ready = await receive_json(first)
-            session_id, _, resume_token = validate_ready(ready)
+            session_id, _, resume_token, first_identity = validate_ready(ready)
             while (
                 sent_samples < disconnect_target
                 or last_acknowledged_sequence is None
@@ -661,6 +778,7 @@ async def _run_recovery_probe(
                     recovered_session_id,
                     resumed_next_audio_sequence,
                     _recovered_resume_token,
+                    recovered_identity,
                 ) = validate_ready(
                     response,
                     expected_session_id=session_id,
@@ -668,6 +786,8 @@ async def _run_recovery_probe(
                 )
                 if recovered_session_id != session_id or response.get("resumed") is not True:
                     raise ValueError("server did not confirm recovery resume")
+                if recovered_identity != first_identity:
+                    raise ValueError("recovered server identity changed")
                 if resumed_next_audio_sequence != first_last_ack + 1:
                     raise ValueError(
                         "recovered next_audio_sequence does not continue the first connection"
@@ -710,8 +830,17 @@ async def _run_recovery_probe(
         if not validator.ended:
             failures.append("recovered session did not emit a terminal end event")
         failure = "; ".join(failures) or None
+        if first_identity is None:
+            raise RuntimeError("recovery probe completed without a server identity")
         return WebSocketRecoveryResult(
             passed=failure is None,
+            backend=first_identity.backend,
+            backend_implementation=first_identity.backend_implementation,
+            model=first_identity.model,
+            model_revision=first_identity.model_revision,
+            device=first_identity.device,
+            language=first_identity.language,
+            compute_type=first_identity.compute_type,
             disconnected_audio_seconds=disconnected_audio_seconds,
             first_last_acknowledged_sequence=first_last_ack,
             resumed_next_audio_sequence=resumed_next_audio_sequence,
@@ -823,16 +952,63 @@ async def run_websocket_gate(
             compute_type=compute_type,
             auth_token=auth_token,
         )
+    observed_identities = [
+        (
+            result.backend,
+            result.backend_implementation,
+            result.model,
+            result.model_revision,
+            result.device,
+            result.language,
+            result.compute_type,
+        )
+        for result in results
+        if result.passed and result.backend is not None
+    ]
+    if (
+        recovery_probe is not None
+        and recovery_probe.passed
+        and recovery_probe.backend is not None
+    ):
+        observed_identities.append((
+            recovery_probe.backend,
+            recovery_probe.backend_implementation,
+            recovery_probe.model,
+            recovery_probe.model_revision,
+            recovery_probe.device,
+            recovery_probe.language,
+            recovery_probe.compute_type,
+        ))
+    expected_identity_count = sessions + int(verify_recovery)
+    identity_consistent = (
+        len(observed_identities) == expected_identity_count
+        and len(set(observed_identities)) == 1
+    )
+    observed_identity = (
+        observed_identities[0]
+        if identity_consistent
+        else (None, None, None, None, None, None, None)
+    )
     ready = [result.ready_seconds for result in results if result.ready_seconds is not None]
     total = [result.total_seconds for result in results if result.total_seconds is not None]
     return WebSocketGateReport(
         status=(
             "passed"
-            if passed == sessions and (recovery_probe is None or recovery_probe.passed)
+            if passed == sessions
+            and (recovery_probe is None or recovery_probe.passed)
+            and identity_consistent
             else "failed"
         ),
         source_commit=source_commit,
         uri=uri,
+        identity_consistent=identity_consistent,
+        backend=observed_identity[0],
+        backend_implementation=observed_identity[1],
+        model=observed_identity[2],
+        model_revision=observed_identity[3],
+        device=observed_identity[4],
+        language=observed_identity[5],
+        compute_type=observed_identity[6],
         sessions=sessions,
         passed_sessions=passed,
         failed_sessions=sessions - passed,

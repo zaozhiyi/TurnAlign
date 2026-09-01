@@ -35,7 +35,7 @@ from .registry import (
     supports_session_hints,
     validate_asr_hints,
 )
-from .resources import close_resources, require_immutable_model_revision
+from .resources import close_resources, model_revision, require_immutable_model_revision
 from .session import transcribe_events
 
 LOGGER = logging.getLogger(__name__)
@@ -843,6 +843,7 @@ async def serve(
                     initialized.put({
                         "capabilities": asdict(backend.capabilities),
                         "backend_name": backend.name,
+                        "model_revision": model_revision(backend),
                     })
                     announced = True
                     for event in transcribe_events(
@@ -992,6 +993,8 @@ async def serve(
                 "resumed": resumed,
                 "model_loaded": True,
                 "backend": backend_name,
+                "backend_implementation": initialization["backend_name"],
+                "model_revision": initialization["model_revision"],
                 "sample_rate": sample_rate,
                 "channels": channels,
                 "config": public_config,

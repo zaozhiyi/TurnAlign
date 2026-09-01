@@ -141,6 +141,14 @@ class ProductionGateTests(unittest.TestCase):
             "status": "passed",
             "source_commit": "b" * 40,
             "uri": "wss://asr.example.com/ws",
+            "identity_consistent": True,
+            "backend": "native-streaming-test",
+            "backend_implementation": "native-streaming-test",
+            "model": "paraformer-zh-streaming",
+            "model_revision": "a" * 40,
+            "device": "cpu",
+            "language": "zh",
+            "compute_type": None,
             "sessions": 8,
             "passed_sessions": 8,
             "failed_sessions": 0,
@@ -148,6 +156,13 @@ class ProductionGateTests(unittest.TestCase):
             "recovery_probe_required": True,
             "recovery_probe": {
                 "passed": True,
+                "backend": "native-streaming-test",
+                "backend_implementation": "native-streaming-test",
+                "model": "paraformer-zh-streaming",
+                "model_revision": "a" * 40,
+                "device": "cpu",
+                "language": "zh",
+                "compute_type": None,
                 "disconnected_audio_seconds": 30.0,
                 "first_last_acknowledged_sequence": 299,
                 "resumed_next_audio_sequence": 300,
@@ -176,6 +191,13 @@ class ProductionGateTests(unittest.TestCase):
                 {
                     "session": session,
                     "passed": True,
+                    "backend": "native-streaming-test",
+                    "backend_implementation": "native-streaming-test",
+                    "model": "paraformer-zh-streaming",
+                    "model_revision": "a" * 40,
+                    "device": "cpu",
+                    "language": "zh",
+                    "compute_type": None,
                     "ready_seconds": 2.0,
                     "total_seconds": 62.0,
                     "events": 2,
@@ -371,6 +393,10 @@ class ProductionGateTests(unittest.TestCase):
             artifacts = self._artifacts(root)
             for mutate, expected in (
                 (
+                    lambda payload: payload.update(identity_consistent=False),
+                    "consistent deployment identity",
+                ),
+                (
                     lambda payload: payload.update(recovery_probe={"passed": True}),
                     "recovery probe lacks complete typed evidence",
                 ),
@@ -393,6 +419,22 @@ class ProductionGateTests(unittest.TestCase):
                 (
                     lambda payload: payload["results"][0].update(audio_acks=True),
                     "lacks complete typed per-session evidence",
+                ),
+                (
+                    lambda payload: payload["results"][0].update(
+                        model_revision="c" * 40
+                    ),
+                    "lacks complete typed per-session evidence",
+                ),
+                (
+                    lambda payload: payload.update(model_revision="c" * 40),
+                    "websocket and release reports identify different model revisions",
+                ),
+                (
+                    lambda payload: payload.update(
+                        backend_implementation="different-backend"
+                    ),
+                    "websocket and release reports identify different backends",
                 ),
                 (
                     lambda payload: payload.update(ready_seconds_p95=1.0),

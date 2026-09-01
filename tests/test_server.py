@@ -23,7 +23,7 @@ from turnalign.server import (
     _queue_output,
     serve,
 )
-from turnalign.websocket_gate import run_websocket_gate
+from turnalign.websocket_gate import WebSocketSessionResult, run_websocket_gate
 
 try:
     from websockets.asyncio.client import connect
@@ -893,8 +893,16 @@ class WebSocketTests(unittest.IsolatedAsyncioTestCase):
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
         probe.close()
-        with patch("turnalign.server.create_asr", return_value=FakeServerBackend()):
-            server_task = asyncio.create_task(serve("127.0.0.1", port, default_backend="fake"))
+        backend = FakeServerBackend()
+        backend.model_revision = "a" * 40
+        with patch("turnalign.server.create_asr", return_value=backend):
+            server_task = asyncio.create_task(serve(
+                "127.0.0.1",
+                port,
+                default_backend="fake",
+                default_model="model-a",
+                default_device="cpu",
+            ))
             await asyncio.sleep(0.05)
             try:
                 report = await run_websocket_gate(
@@ -906,6 +914,16 @@ class WebSocketTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertTrue(report.passed)
                 self.assertEqual(report.passed_sessions, 3)
+                self.assertTrue(report.identity_consistent)
+                self.assertEqual(report.backend, "fake")
+                self.assertEqual(report.backend_implementation, "fake-server")
+                self.assertEqual(report.model, "model-a")
+                self.assertEqual(report.model_revision, "a" * 40)
+                self.assertEqual(report.device, "cpu")
+                self.assertTrue(all(
+                    result.model_revision == "a" * 40
+                    for result in report.results
+                ))
                 self.assertEqual(report.commits, 0)
                 self.assertEqual(report.events, 3)
                 self.assertGreaterEqual(
@@ -916,6 +934,33 @@ class WebSocketTests(unittest.IsolatedAsyncioTestCase):
                 server_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await server_task
+
+    async def test_websocket_gate_rejects_inconsistent_deployment_identities(self):
+        async def session_result(_uri, session, **_options):
+            return WebSocketSessionResult(
+                session=session,
+                passed=True,
+                backend="fake",
+                backend_implementation="fake-server",
+                model="model-a",
+                model_revision=("a" if session == 1 else "b") * 40,
+                device="cpu",
+                ready_seconds=0.1,
+                total_seconds=0.2,
+            )
+
+        with patch(
+            "turnalign.websocket_gate._run_session",
+            side_effect=session_result,
+        ):
+            report = await run_websocket_gate(
+                "ws://example.test/ws",
+                sessions=2,
+            )
+        self.assertFalse(report.passed)
+        self.assertEqual(report.status, "failed")
+        self.assertFalse(report.identity_consistent)
+        self.assertIsNone(report.model_revision)
 
     async def test_websocket_gate_injects_disconnect_and_verifies_resume(self):
         probe = socket.socket()
@@ -1130,6 +1175,10 @@ class WebSocketTests(unittest.IsolatedAsyncioTestCase):
                 "type": "ready",
                 "protocol_version": 1,
                 "session_id": "malformed-session",
+                "backend": "fake",
+                "backend_implementation": "fake-server",
+                "model_revision": None,
+                "config": {},
             }))
             await websocket.recv()
             await websocket.send(json.dumps({
