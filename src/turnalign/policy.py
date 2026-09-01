@@ -49,6 +49,33 @@ def _auth_tokens_equal(supplied: str, expected: str) -> bool:
     return hmac.compare_digest(supplied_bytes, expected.encode("utf-8"))
 
 
+def _validate_policy_name(value: object, *, label: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{label} must be a string")
+    if (
+        not value
+        or value != value.strip()
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        raise ValueError(f"{label} must be a non-empty trimmed string")
+    return value
+
+
+def _request_name(
+    request: dict[str, Any],
+    key: str,
+    default: str | None,
+) -> str | None:
+    raw = request.get(key)
+    if raw is None:
+        return (
+            _validate_policy_name(default, label=f"default {key}")
+            if default is not None
+            else None
+        )
+    return _validate_policy_name(raw, label=key)
+
+
 @dataclass(frozen=True, slots=True)
 class ServerPolicy:
     """Explicit trust boundary for WebSocket-controlled configuration."""
@@ -66,6 +93,31 @@ class ServerPolicy:
     redact_errors: bool = True
 
     def __post_init__(self) -> None:
+        for name in (
+            "allowed_backends",
+            "allowed_models",
+            "allowed_languages",
+            "allowed_compute_types",
+            "allowed_components",
+        ):
+            values = getattr(self, name)
+            if not isinstance(values, frozenset):
+                raise TypeError(f"{name} must be a frozenset")
+            for value in values:
+                _validate_policy_name(value, label=f"{name} entry")
+        for name in (
+            "allow_client_paths",
+            "allow_component_options",
+            "allow_remote",
+            "redact_errors",
+        ):
+            if not isinstance(getattr(self, name), bool):
+                raise TypeError(f"{name} must be a boolean")
+        if (
+            isinstance(self.max_session_seconds, bool)
+            or not isinstance(self.max_session_seconds, (int, float))
+        ):
+            raise TypeError("max_session_seconds must be a number")
         if not math.isfinite(self.max_session_seconds) or self.max_session_seconds <= 0:
             raise ValueError("max_session_seconds must be finite and positive")
         if self.auth_token is not None:
@@ -99,24 +151,23 @@ class ServerPolicy:
             ):
                 raise PermissionError("authentication failed")
 
-        backend = str(request.get("backend") or default_backend)
+        backend = _request_name(request, "backend", default_backend)
+        if backend is None:
+            raise ValueError("backend must not be empty")
         if backend not in self.allowed_backends:
             raise ValueError(f"backend {backend!r} is not allowed by server policy")
 
-        model_value = request.get("model")
-        model = str(model_value) if model_value else default_model
+        model = _request_name(request, "model", default_model)
         if model != default_model and (model is None or model not in self.allowed_models):
             raise ValueError("requested model is not allowed by server policy")
 
-        language_value = request.get("language")
-        language = str(language_value) if language_value else default_language
+        language = _request_name(request, "language", default_language)
         if language != default_language and (
             language is None or language not in self.allowed_languages
         ):
             raise ValueError("requested language is not allowed by server policy")
 
-        compute_value = request.get("compute_type")
-        compute_type = str(compute_value) if compute_value else default_compute_type
+        compute_type = _request_name(request, "compute_type", default_compute_type)
         if compute_type != default_compute_type and (
             compute_type is None or compute_type not in self.allowed_compute_types
         ):
@@ -129,15 +180,11 @@ class ServerPolicy:
                     f"client-controlled paths are disabled: {', '.join(forbidden)}"
                 )
 
-        components = {
-            str(value)
-            for value in (
-                request.get("aligner"),
-                request.get("diarizer"),
-                request.get("online_diarizer"),
-            )
-            if value
-        }
+        components = set()
+        for key in ("aligner", "diarizer", "online_diarizer"):
+            component = _request_name(request, key, None)
+            if component is not None:
+                components.add(component)
         if not components.issubset(self.allowed_components):
             raise ValueError("requested component is not allowed by server policy")
         for key in (

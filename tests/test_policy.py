@@ -107,6 +107,46 @@ class ServerPolicyTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 ServerPolicy(max_session_seconds=value)
 
+    def test_policy_and_request_identity_fields_require_strict_types(self):
+        for options, expected in (
+            ({"allowed_backends": "fake"}, "frozenset"),
+            ({"allowed_models": frozenset({1})}, "must be a string"),
+            ({"allowed_components": frozenset({" bad "})}, "trimmed string"),
+            ({"allow_remote": 1}, "must be a boolean"),
+            ({"allow_client_paths": None}, "must be a boolean"),
+            ({"redact_errors": 0}, "must be a boolean"),
+            ({"max_session_seconds": True}, "must be a number"),
+            ({"max_session_seconds": "60"}, "must be a number"),
+        ):
+            with self.subTest(options=options), self.assertRaisesRegex(
+                (TypeError, ValueError), expected
+            ):
+                ServerPolicy(**options)
+
+        policy = ServerPolicy(
+            allowed_backends=frozenset({"fake", "True"}),
+            allowed_models=frozenset({"7"}),
+            allowed_languages=frozenset({"7"}),
+            allowed_compute_types=frozenset({"7"}),
+            allowed_components=frozenset({"7"}),
+        )
+        for request, expected in (
+            ({"backend": True}, "backend must be a string"),
+            ({"backend": ""}, "non-empty trimmed string"),
+            ({"model": 7}, "model must be a string"),
+            ({"language": 7}, "language must be a string"),
+            ({"compute_type": 7}, "compute_type must be a string"),
+            ({"aligner": 7}, "aligner must be a string"),
+        ):
+            with self.subTest(request=request), self.assertRaisesRegex(
+                (TypeError, ValueError), expected
+            ):
+                policy.validate_start(
+                    request,
+                    default_backend="fake",
+                    default_model=None,
+                )
+
     def test_authentication_uses_public_generic_error(self):
         policy = ServerPolicy(
             allowed_backends=frozenset({"fake"}),
