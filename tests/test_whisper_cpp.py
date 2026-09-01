@@ -138,6 +138,55 @@ class WhisperCppConfigurationTests(unittest.TestCase):
                 list(backend.transcribe([AudioChunk(bytes(3_200), 0.0)]))
             self.assertLess(len(str(error.exception)), 66_000)
 
+    def test_result_json_is_bounded_strict_and_typed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend = WhisperCppBackend(self._config(Path(directory)))
+            pcm = array("h", [1000] * 1600).tobytes()
+
+            def transcribe_output(content: bytes, *, limit: int = 1024):
+                def fake_popen(command, **_options):
+                    output_base = Path(command[command.index("-of") + 1])
+                    output_base.with_suffix(".json").write_bytes(content)
+                    return SimpleNamespace(returncode=0, wait=lambda: 0)
+
+                with (
+                    patch(
+                        "turnalign.backends.whisper_cpp.subprocess.Popen",
+                        side_effect=fake_popen,
+                    ),
+                    patch(
+                        "turnalign.backends.whisper_cpp._MAX_OUTPUT_JSON_BYTES",
+                        limit,
+                    ),
+                ):
+                    return list(backend.transcribe([AudioChunk(pcm, 0.0)]))
+
+            for content, expected in (
+                (b'{"text":"first","text":"second"}', "duplicate JSON key"),
+                (b'{"text":"ok","value":NaN}', "non-standard JSON number"),
+                (b'{"text":{"nested":true}}', "text must be a string"),
+                (
+                    b'{"segments":[{"text":"bad","start":true,"end":1}]}',
+                    "start timestamp must be non-negative",
+                ),
+                (b"x" * 33, "JSON output exceeds 32 bytes"),
+            ):
+                limit = 32 if content == b"x" * 33 else 1024
+                with (
+                    self.subTest(expected=expected),
+                    self.assertRaisesRegex((TypeError, ValueError), expected),
+                ):
+                    transcribe_output(content, limit=limit)
+
+            result = transcribe_output(json.dumps({
+                "transcription": [{
+                    "text": "typed",
+                    "offsets": {"from": 250, "to": 750},
+                }],
+            }).encode())
+            self.assertEqual(result[0].text, "typed")
+            self.assertEqual((result[0].start, result[0].end), (0.25, 0.75))
+
     def test_cancel_terminates_the_active_process(self):
         with tempfile.TemporaryDirectory() as directory:
             backend = WhisperCppBackend(self._config(Path(directory)))

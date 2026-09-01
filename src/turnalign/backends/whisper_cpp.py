@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import re
 import shutil
@@ -9,9 +8,11 @@ import tempfile
 import threading
 import wave
 from collections.abc import Iterable
+from math import isfinite
 from pathlib import Path
 
 from ..hints import whisper_initial_prompt
+from ..jsonutil import strict_json_object
 from ..models import AudioChunk, Hypothesis
 from ..plugins import Accelerator, AsrConfig, BackendCapabilities
 from ..processes import process_error_tail
@@ -20,6 +21,7 @@ from .common import collect_pcm
 _INDEXED_DEVICE = re.compile(r"^(?:cuda|rocm|vulkan):(\d+)$")
 _UNINDEXED_DEVICES = {"auto", "cpu", "cuda", "rocm", "vulkan", "mps"}
 _ALLOWED_OPTIONS = {"threads", "flash_attention", "allow_prompt_argv"}
+_MAX_OUTPUT_JSON_BYTES = 64 * 1024 * 1024
 
 
 def _bounded_integer(value: object, *, name: str, minimum: int, maximum: int) -> int:
@@ -51,6 +53,39 @@ def _windows_creationflags() -> int:
     if os.name != "nt":
         return 0
     return int(getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0x00004000))
+
+
+def _read_output_payload(path: Path) -> dict[str, object]:
+    with path.open("rb") as source:
+        content = source.read(_MAX_OUTPUT_JSON_BYTES + 1)
+    if len(content) > _MAX_OUTPUT_JSON_BYTES:
+        raise ValueError(
+            f"whisper.cpp JSON output exceeds {_MAX_OUTPUT_JSON_BYTES} bytes"
+        )
+    return strict_json_object(content, label="whisper.cpp JSON output")
+
+
+def _timestamp_seconds(
+    item: dict[str, object],
+    offsets: dict[str, object],
+    *,
+    offset_key: str,
+    segment_key: str,
+) -> float:
+    if offset_key in offsets:
+        value = offsets[offset_key]
+        divisor = 1000.0
+    else:
+        value = item.get(segment_key, 0)
+        divisor = 1.0
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not isfinite(value)
+        or value < 0
+    ):
+        raise ValueError(f"whisper.cpp {segment_key} timestamp must be non-negative")
+    return value / divisor
 
 
 class WhisperCppBackend:
@@ -173,12 +208,20 @@ class WhisperCppBackend:
                     detail = process_error_tail(error_output)
                     suffix = f": {detail}" if detail else ""
                     raise RuntimeError(f"whisper.cpp failed{suffix}")
-            payload = json.loads(output_base.with_suffix(".json").read_text(encoding="utf-8"))
-            items = payload.get("transcription") or payload.get("segments") or []
-            if not items and payload.get("text"):
+            payload = _read_output_payload(output_base.with_suffix(".json"))
+            if "transcription" in payload:
+                items = payload["transcription"]
+            else:
+                items = payload.get("segments", [])
+            if not isinstance(items, list):
+                raise TypeError("whisper.cpp transcription must be a list")
+            text = payload.get("text")
+            if text is not None and not isinstance(text, str):
+                raise TypeError("whisper.cpp text must be a string")
+            if not items and text:
                 end = offset + len(data) / (2 * channels * sample_rate)
                 yield Hypothesis(
-                    str(payload["text"]).strip(), offset, end, final=True,
+                    text.strip(), offset, end, final=True,
                     metadata=(
                         self.hints.private_metadata("whisper-cpp-prompt")
                         if self.hints.active else {}
@@ -186,13 +229,30 @@ class WhisperCppBackend:
                 )
                 return
             for item in items:
+                if not isinstance(item, dict):
+                    raise TypeError("whisper.cpp transcription item must be an object")
                 offsets = item.get("offsets", {})
-                start_ms = offsets.get("from", item.get("start", 0) * 1000)
-                end_ms = offsets.get("to", item.get("end", 0) * 1000)
+                if not isinstance(offsets, dict):
+                    raise TypeError("whisper.cpp transcription offsets must be an object")
+                item_text = item.get("text", "")
+                if not isinstance(item_text, str):
+                    raise TypeError("whisper.cpp transcription text must be a string")
+                start = _timestamp_seconds(
+                    item,
+                    offsets,
+                    offset_key="from",
+                    segment_key="start",
+                )
+                end = _timestamp_seconds(
+                    item,
+                    offsets,
+                    offset_key="to",
+                    segment_key="end",
+                )
                 yield Hypothesis(
-                    str(item.get("text", "")).strip(),
-                    offset + float(start_ms) / 1000,
-                    offset + float(end_ms) / 1000,
+                    item_text.strip(),
+                    offset + start,
+                    offset + end,
                     final=True,
                     metadata=(
                         self.hints.private_metadata("whisper-cpp-prompt")
