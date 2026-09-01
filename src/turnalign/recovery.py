@@ -139,7 +139,7 @@ class RecoveryStore:
                 session
                 for session in self._sessions.values()
                 if not session.active
-                and current - session.updated_at >= max_idle_seconds
+                and current >= session.updated_at + max_idle_seconds
             ]
             for session in expired:
                 self._sessions.pop(session.session_id, None)

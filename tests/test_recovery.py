@@ -217,6 +217,21 @@ class RecoveryStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "finite and positive"):
             RecoveryStore().prune_expired(float("nan"))
 
+    def test_prune_expired_honors_exact_deadline_despite_float_rounding(self):
+        store = RecoveryStore()
+        try:
+            session, _ = store.open("config")
+            store.release(session)
+            session.updated_at = 9.8765431209876
+
+            self.assertLess((session.updated_at + 10) - session.updated_at, 10)
+            self.assertEqual(
+                store.prune_expired(10, now=session.updated_at + 10),
+                1,
+            )
+        finally:
+            store.close()
+
 
 if __name__ == "__main__":
     unittest.main()
