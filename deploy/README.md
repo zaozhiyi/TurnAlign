@@ -174,34 +174,54 @@ Before routing users, retain all of the following with the release artifact:
    artifacts, and the quality/release/public-WebSocket reports identify the same
    backend implementation and immutable model revision.
 5. The exact wheel hash, dependency lock, validated CycloneDX SBOM, model
-   commit, model-file checksums, Nginx configuration, service unit, host
-   profile, and gate reports are saved. Treat labelled references and
-   hypotheses as potentially sensitive data and restrict their storage.
-6. Rollback is tested by atomically pointing `/opt/turnalign/current` at the
-   preceding immutable release directory, restarting the service, and rerunning
-   readiness plus the public WebSocket gate. Atomically restore the candidate,
-   restart, and rerun both probes before approval. Retain the two source commits,
-   model revisions, activation times, command exit status and probe reports as
-   deployment-system evidence; a hand-written success JSON is not sufficient.
+   commit, model-file checksums, Nginx configuration, service unit, rollback
+   rehearsal, host profile, and gate reports are saved. Treat labelled
+   references and hypotheses as potentially sensitive data and restrict their
+   storage.
+6. Run the candidate-installed command as root to exercise the actual atomic
+   symlink and systemd path:
+
+   ```bash
+   sudo /opt/turnalign/current/venv/bin/turnalign deployment-rehearsal \
+     wss://asr.example.com/ws \
+     --previous-commit <preceding-source-commit> \
+     --candidate-commit <candidate-source-commit> \
+     --backend funasr-streaming --model paraformer-zh-streaming \
+     --auth-token-file /etc/turnalign/auth-token \
+     --report rollback-rehearsal.json
+   ```
+
+   The command refuses non-Linux/non-root execution, an unbound candidate
+   runtime, mutable or non-root-owned release directories, a non-public probe,
+   and any initial active release other than the candidate. A root-only
+   non-blocking lock at `/run/lock/turnalign-deployment.lock` prevents a second
+   deploy or rehearsal from racing the symlink transition. It switches to the
+   preceding release, restarts and checks `systemctl is-active`, requires
+   preloaded readiness plus a real-time concurrent public recovery probe, then
+   restores and reprobes the candidate. Probe failure or cancellation still
+   triggers candidate restoration, and the command fails unless both exact
+   transitions pass. Retain its report rather than writing a success summary.
 7. For tagged upstream distributions,
    `gh attestation verify FILE --repo GuanZhengPM/TurnAlign` verifies the signed
    GitHub/Sigstore build provenance.
-   This supplements rather than replaces the final eleven-artifact deployment
+   This supplements rather than replaces the final twelve-artifact deployment
    gate, whose model, host and production-corpus evidence is environment-specific.
 
 Persist each gate with `--report`, generate retained-model provenance with
 `turnalign model-manifest`, and run
 `/opt/turnalign/current/venv/bin/turnalign host-profile` on the target host after
-activating the candidate and finalizing the other ten artifact classes. The
+activating the candidate and finalizing the other eleven artifact classes. The
 command reads the commit embedded in the installed Wheel, so the production
 host does not need a Git checkout. It refuses non-Linux hosts, source checkouts,
 unbound Wheels, mismatched explicitly supplied commits, and non-versioned Python
 environments. Then run `turnalign
-production-gate` with the source commit and all eleven required artifact kinds
+production-gate` with the source commit and all twelve required artifact kinds
 shown in the root README. Keep
 the resulting aggregate report beside the release artifact; it rejects local
 `ws://`, missing recovery/latency controls, mutable model revisions, undersized
-quality evidence, incomplete artifact sets, a retained Nginx file containing
+quality evidence, incomplete artifact sets, a rollback report with forged or
+out-of-order transitions, a different Linux boot or restored model identity,
+a retained Nginx file containing
 unresolved includes or weakened TLS/WebSocket/upstream controls, and a retained
 systemd unit that
 weakens loopback binding, credential handling, resource limits, network

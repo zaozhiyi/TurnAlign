@@ -17,6 +17,7 @@ import sys
 import tempfile
 import zipfile
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from email.parser import BytesParser
 from email.policy import default as email_policy
 from pathlib import Path
@@ -30,11 +31,19 @@ from .jsonutil import strict_json_loads
 _COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
 _MODEL_REVISION_PATTERN = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})")
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+_BOOT_ID_PATTERN = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+)
+_UTC_TIMESTAMP_PATTERN = re.compile(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z"
+)
+_DNS_LABEL_PATTERN = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 _MAX_REPORT_BYTES = 2 * 1024 * 1024
 _MAX_SBOM_BYTES = 16 * 1024 * 1024
 _MAX_LOCK_BYTES = 4 * 1024 * 1024
 _MAX_MODEL_MANIFEST_BYTES = 2 * 1024 * 1024
 _MAX_HOST_PROFILE_BYTES = 2 * 1024 * 1024
+_MAX_ROLLBACK_REHEARSAL_BYTES = 8 * 1024 * 1024
 _MAX_DEPLOYMENT_CONFIG_BYTES = 2 * 1024 * 1024
 _MAX_WHEEL_BYTES = 64 * 1024 * 1024
 _MAX_WHEEL_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
@@ -65,6 +74,7 @@ REQUIRED_ARTIFACT_KINDS = frozenset({
     "quality-hypothesis",
     "quality-reference",
     "release-audio",
+    "rollback-rehearsal",
     "service-unit",
     "sbom",
     "wheel",
@@ -406,11 +416,12 @@ def create_host_profile(
     if logical_cpu_count is None or logical_cpu_count <= 0:
         raise RuntimeError("cannot determine the host logical CPU count")
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "source_commit": bound_commit,
         "runtime": runtime,
         "platform": {
             "system": system,
+            "boot_id": _read_linux_boot_id(),
             "release": platform.release(),
             "machine": platform.machine(),
             "python_implementation": platform.python_implementation(),
@@ -422,6 +433,39 @@ def create_host_profile(
             key=lambda item: (cast(str, item["kind"]), cast(str, item["name"])),
         ),
     }
+
+
+def _read_linux_boot_id() -> str:
+    """Read the current Linux boot identity without following a replacement link."""
+
+    path = Path("/proc/sys/kernel/random/boot_id")
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow,
+        )
+    except OSError as error:
+        raise RuntimeError("cannot securely read the Linux boot identity") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise RuntimeError("Linux boot identity is not a regular file")
+        raw = os.read(descriptor, 65)
+        if os.read(descriptor, 1):
+            raise RuntimeError("Linux boot identity exceeds its expected size")
+    finally:
+        os.close(descriptor)
+    try:
+        text = raw.decode("ascii")
+    except UnicodeDecodeError as error:
+        raise RuntimeError("Linux boot identity is not ASCII") from error
+    if not text.endswith("\n"):
+        raise RuntimeError("Linux boot identity is not newline-terminated")
+    value = text[:-1]
+    if _BOOT_ID_PATTERN.fullmatch(value) is None:
+        raise RuntimeError("Linux boot identity has an invalid format")
+    return value
 
 
 def _installed_runtime_identity(source_commit: str | None = None) -> dict[str, str]:
@@ -472,9 +516,14 @@ def _public_hostname(hostname: str | None) -> bool:
     except ValueError:
         normalized = hostname.rstrip(".").lower()
         return (
-            "." in normalized
+            len(normalized) <= 253
+            and "." in normalized
             and normalized not in {"localhost"}
             and not normalized.endswith((".local", ".localhost", ".internal"))
+            and all(
+                _DNS_LABEL_PATTERN.fullmatch(label) is not None
+                for label in normalized.split(".")
+            )
         )
     return address.is_global
 
@@ -1323,15 +1372,15 @@ def _validate_host_profile(
     wheel_version: str | None,
     artifacts: list[ArtifactEvidence],
     failures: list[str],
-) -> None:
+) -> str | None:
     if snapshot.content is None:
         failures.append(f"host profile exceeds {_MAX_HOST_PROFILE_BYTES} bytes")
-        return
+        return None
     try:
         payload = strict_json_loads(snapshot.content.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
         failures.append(f"host profile is not strict JSON: {error}")
-        return
+        return None
     if not isinstance(payload, dict) or set(payload) != {
         "schema_version",
         "source_commit",
@@ -1340,10 +1389,10 @@ def _validate_host_profile(
         "artifacts",
     }:
         failures.append("host profile has an invalid top-level schema")
-        return
+        return None
     if (
         isinstance(payload.get("schema_version"), bool)
-        or payload.get("schema_version") != 2
+        or payload.get("schema_version") != 3
     ):
         failures.append("host profile has an unsupported schema version")
     if payload.get("source_commit") != source_commit:
@@ -1381,8 +1430,10 @@ def _validate_host_profile(
     )
     if not (
         isinstance(platform_data, dict)
-        and set(platform_data) == {*text_fields, "logical_cpu_count"}
+        and set(platform_data) == {*text_fields, "boot_id", "logical_cpu_count"}
         and platform_data.get("system") == "Linux"
+        and isinstance(platform_data.get("boot_id"), str)
+        and _BOOT_ID_PATTERN.fullmatch(platform_data["boot_id"]) is not None
         and all(
             isinstance(platform_data.get(name), str)
             and bool(platform_data[name])
@@ -1401,7 +1452,7 @@ def _validate_host_profile(
     entries = payload.get("artifacts")
     if not isinstance(entries, list) or not entries:
         failures.append("host profile has no retained artifact evidence")
-        return
+        return None
     reported: list[tuple[str, str, str, int]] = []
     for item in entries:
         if not isinstance(item, dict) or set(item) != {
@@ -1411,7 +1462,7 @@ def _validate_host_profile(
             "bytes",
         }:
             failures.append("host profile contains an invalid artifact entry")
-            return
+            return None
         kind = item.get("kind")
         name = item.get("name")
         digest = item.get("sha256")
@@ -1427,13 +1478,13 @@ def _validate_host_profile(
             or not _positive_integer(size)
         ):
             failures.append("host profile contains an invalid artifact identity")
-            return
+            return None
         reported.append((kind, name, digest, cast(int, size)))
     if len({(kind, name) for kind, name, _digest, _size in reported}) != len(
         reported
     ):
         failures.append("host profile contains duplicate artifact identities")
-        return
+        return None
     actual = [
         (item.kind, item.name, item.sha256, item.bytes)
         for item in artifacts
@@ -1441,6 +1492,291 @@ def _validate_host_profile(
     ]
     if sorted(reported) != sorted(actual):
         failures.append("host profile does not match the retained deployment artifacts")
+    if (
+        isinstance(platform_data, dict)
+        and isinstance(platform_data.get("boot_id"), str)
+        and _BOOT_ID_PATTERN.fullmatch(platform_data["boot_id"]) is not None
+    ):
+        return cast(str, platform_data["boot_id"])
+    return None
+
+
+def _utc_timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str) or _UTC_TIMESTAMP_PATTERN.fullmatch(value) is None:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%fZ").replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError:
+        return None
+
+
+def _validate_rehearsal_restart(
+    payload: object,
+    phase: str,
+    failures: list[str],
+) -> None:
+    if not isinstance(payload, dict) or set(payload) != {
+        "restart_exit_code",
+        "active_exit_code",
+        "seconds",
+        "failure",
+    }:
+        failures.append(f"rollback rehearsal {phase} has invalid restart evidence")
+        return
+    if (
+        payload.get("restart_exit_code") != 0
+        or isinstance(payload.get("restart_exit_code"), bool)
+        or payload.get("active_exit_code") != 0
+        or isinstance(payload.get("active_exit_code"), bool)
+        or not _nonnegative_number(payload.get("seconds"))
+        or payload.get("failure") is not None
+    ):
+        failures.append(f"rollback rehearsal {phase} did not restart an active service")
+
+
+def _validate_rehearsal_readiness(
+    payload: object,
+    phase: str,
+    ready_uri: str,
+    failures: list[str],
+) -> None:
+    if not isinstance(payload, dict) or set(payload) != {
+        "uri",
+        "status_code",
+        "ready",
+        "preloaded",
+        "attempts",
+        "seconds",
+        "failure",
+    }:
+        failures.append(f"rollback rehearsal {phase} has invalid readiness evidence")
+        return
+    if (
+        payload.get("uri") != ready_uri
+        or payload.get("status_code") != 200
+        or isinstance(payload.get("status_code"), bool)
+        or payload.get("ready") is not True
+        or payload.get("preloaded") is not True
+        or not _positive_integer(payload.get("attempts"))
+        or not _nonnegative_number(payload.get("seconds"))
+        or payload.get("failure") is not None
+    ):
+        failures.append(
+            f"rollback rehearsal {phase} did not prove preloaded readiness"
+        )
+
+
+def _validate_rehearsal_phase(
+    payload: object,
+    *,
+    phase: str,
+    from_commit: str,
+    target_commit: str,
+    ready_uri: str,
+    websocket_uri: str,
+    release_root: str,
+    failures: list[str],
+) -> tuple[datetime | None, datetime | None, dict[str, object] | None]:
+    if not isinstance(payload, dict) or set(payload) != {
+        "name",
+        "status",
+        "from_commit",
+        "target_commit",
+        "target_path",
+        "started_at",
+        "activated_at",
+        "completed_at",
+        "activation_seconds",
+        "restart",
+        "readiness",
+        "websocket_report",
+        "failures",
+    }:
+        failures.append(f"rollback rehearsal {phase} has an invalid phase schema")
+        return None, None, None
+    _passed_report(f"rollback rehearsal {phase}", payload, failures)
+    if (
+        payload.get("name") != phase
+        or payload.get("from_commit") != from_commit
+        or payload.get("target_commit") != target_commit
+        or payload.get("target_path") != f"{release_root}/{target_commit}"
+    ):
+        failures.append(f"rollback rehearsal {phase} has an invalid transition")
+    started = _utc_timestamp(payload.get("started_at"))
+    activated = _utc_timestamp(payload.get("activated_at"))
+    completed = _utc_timestamp(payload.get("completed_at"))
+    if (
+        started is None
+        or activated is None
+        or completed is None
+        or not started <= activated <= completed
+        or not _nonnegative_number(payload.get("activation_seconds"))
+    ):
+        failures.append(f"rollback rehearsal {phase} has invalid activation timing")
+    _validate_rehearsal_restart(payload.get("restart"), phase, failures)
+    _validate_rehearsal_readiness(
+        payload.get("readiness"),
+        phase,
+        ready_uri,
+        failures,
+    )
+    websocket = payload.get("websocket_report")
+    if not isinstance(websocket, dict):
+        failures.append(f"rollback rehearsal {phase} has no WebSocket gate report")
+        websocket = None
+    else:
+        phase_failures: list[str] = []
+        _validate_websocket(websocket, phase_failures)
+        _validate_report_source(phase, websocket, target_commit, phase_failures)
+        if websocket.get("uri") != websocket_uri:
+            phase_failures.append("WebSocket report URI changed")
+        failures.extend(
+            f"rollback rehearsal {phase}: {failure}"
+            for failure in phase_failures
+        )
+    return started, completed, websocket
+
+
+def _validate_rollback_rehearsal(
+    snapshot: _EvidenceSnapshot,
+    source_commit: str,
+    candidate_websocket: dict[str, object],
+    failures: list[str],
+) -> str | None:
+    if snapshot.content is None:
+        failures.append(
+            "rollback rehearsal exceeds "
+            f"{_MAX_ROLLBACK_REHEARSAL_BYTES} bytes"
+        )
+        return None
+    try:
+        payload = strict_json_loads(snapshot.content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        failures.append(f"rollback rehearsal is not strict JSON: {error}")
+        return None
+    expected_fields = {
+        "schema_version",
+        "status",
+        "candidate_commit",
+        "previous_commit",
+        "boot_id",
+        "release_root",
+        "current_link",
+        "lock_path",
+        "service",
+        "systemctl",
+        "ready_uri",
+        "websocket_uri",
+        "started_at",
+        "completed_at",
+        "initial_active_commit",
+        "final_active_commit",
+        "rollback",
+        "restore",
+        "failures",
+    }
+    if not isinstance(payload, dict) or set(payload) != expected_fields:
+        failures.append("rollback rehearsal has an invalid top-level schema")
+        return None
+    _passed_report("rollback rehearsal", payload, failures)
+    if (
+        isinstance(payload.get("schema_version"), bool)
+        or payload.get("schema_version") != 1
+    ):
+        failures.append("rollback rehearsal has an unsupported schema version")
+    previous_commit = payload.get("previous_commit")
+    if (
+        payload.get("candidate_commit") != source_commit
+        or payload.get("initial_active_commit") != source_commit
+        or payload.get("final_active_commit") != source_commit
+        or not isinstance(previous_commit, str)
+        or _COMMIT_PATTERN.fullmatch(previous_commit) is None
+        or previous_commit == source_commit
+    ):
+        failures.append("rollback rehearsal is not bound to one prior and candidate release")
+        previous_commit = ""
+    boot_id = payload.get("boot_id")
+    if not isinstance(boot_id, str) or _BOOT_ID_PATTERN.fullmatch(boot_id) is None:
+        failures.append("rollback rehearsal has no valid Linux boot identity")
+        boot_id = None
+    if (
+        payload.get("release_root") != "/opt/turnalign/releases"
+        or payload.get("current_link") != "/opt/turnalign/current"
+        or payload.get("lock_path") != "/run/lock/turnalign-deployment.lock"
+        or payload.get("service") != "turnalign.service"
+        or payload.get("systemctl") != "/usr/bin/systemctl"
+        or payload.get("ready_uri") != "http://127.0.0.1:8765/readyz"
+    ):
+        failures.append("rollback rehearsal did not use the production activation layout")
+    websocket_uri = candidate_websocket.get("uri")
+    if not isinstance(websocket_uri, str) or payload.get("websocket_uri") != websocket_uri:
+        failures.append("rollback rehearsal did not probe the production WebSocket URI")
+        websocket_uri = ""
+    started = _utc_timestamp(payload.get("started_at"))
+    completed = _utc_timestamp(payload.get("completed_at"))
+    if started is None or completed is None or started > completed:
+        failures.append("rollback rehearsal has invalid overall timing")
+    rollback_started, rollback_completed, _rollback_websocket = (
+        _validate_rehearsal_phase(
+            payload.get("rollback"),
+            phase="rollback",
+            from_commit=source_commit,
+            target_commit=previous_commit,
+            ready_uri="http://127.0.0.1:8765/readyz",
+            websocket_uri=websocket_uri,
+            release_root="/opt/turnalign/releases",
+            failures=failures,
+        )
+    )
+    restore_started, restore_completed, restored_websocket = (
+        _validate_rehearsal_phase(
+            payload.get("restore"),
+            phase="restore",
+            from_commit=previous_commit,
+            target_commit=source_commit,
+            ready_uri="http://127.0.0.1:8765/readyz",
+            websocket_uri=websocket_uri,
+            release_root="/opt/turnalign/releases",
+            failures=failures,
+        )
+    )
+    if (
+        started is not None
+        and completed is not None
+        and rollback_started is not None
+        and rollback_completed is not None
+        and restore_started is not None
+        and restore_completed is not None
+        and not (
+            started
+            <= rollback_started
+            <= rollback_completed
+            <= restore_started
+            <= restore_completed
+            <= completed
+        )
+    ):
+        failures.append("rollback rehearsal phase timestamps are out of order")
+    if restored_websocket is not None:
+        identity_fields = (
+            "backend",
+            "backend_implementation",
+            "model",
+            "model_revision",
+            "device",
+            "language",
+            "compute_type",
+        )
+        if any(
+            restored_websocket.get(field) != candidate_websocket.get(field)
+            for field in identity_fields
+        ):
+            failures.append(
+                "rollback rehearsal restored a different deployed model identity"
+            )
+    return cast(str, boot_id) if isinstance(boot_id, str) else None
 
 
 def run_production_gate(
@@ -1476,6 +1812,7 @@ def run_production_gate(
             "host-profile": _MAX_HOST_PROFILE_BYTES,
             "model-manifest": _MAX_MODEL_MANIFEST_BYTES,
             "nginx-config": _MAX_DEPLOYMENT_CONFIG_BYTES,
+            "rollback-rehearsal": _MAX_ROLLBACK_REHEARSAL_BYTES,
             "sbom": _MAX_SBOM_BYTES,
             "wheel": _MAX_WHEEL_BYTES,
             "service-unit": _MAX_DEPLOYMENT_CONFIG_BYTES,
@@ -1533,14 +1870,32 @@ def run_production_gate(
             evidence_by_kind.get("model", []),
             failures,
         )
+    host_boot_id: str | None = None
     host_profile_snapshots = artifact_snapshots.get("host-profile", [])
     if len(host_profile_snapshots) == 1:
-        _validate_host_profile(
+        host_boot_id = _validate_host_profile(
             host_profile_snapshots[0],
             source_commit,
             wheel_version,
             artifact_evidence,
             failures,
+        )
+    rehearsal_boot_id: str | None = None
+    rehearsal_snapshots = artifact_snapshots.get("rollback-rehearsal", [])
+    if len(rehearsal_snapshots) == 1:
+        rehearsal_boot_id = _validate_rollback_rehearsal(
+            rehearsal_snapshots[0],
+            source_commit,
+            websocket,
+            failures,
+        )
+    if (
+        host_boot_id is not None
+        and rehearsal_boot_id is not None
+        and host_boot_id != rehearsal_boot_id
+    ):
+        failures.append(
+            "host profile and rollback rehearsal identify different Linux boots"
         )
     service_content: bytes | None = None
     service_snapshots = artifact_snapshots.get("service-unit", [])

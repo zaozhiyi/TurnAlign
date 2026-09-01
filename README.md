@@ -198,6 +198,12 @@ turnalign websocket-gate wss://asr.example/ws --sessions 8 \
 turnalign model-manifest --model-id modelscope://damo/paraformer-zh-streaming \
   --model-revision "$MODEL_REVISION" --file /models/model.safetensors \
   --output model-manifest.json
+sudo /opt/turnalign/current/venv/bin/turnalign deployment-rehearsal \
+  wss://asr.example.com/ws --previous-commit "$PREVIOUS_COMMIT" \
+  --candidate-commit "$CANDIDATE_COMMIT" --backend funasr-streaming \
+  --model paraformer-zh-streaming \
+  --auth-token-file /path/to/restricted/auth-token \
+  --report rollback-rehearsal.json
 /opt/turnalign/current/venv/bin/turnalign host-profile \
   --artifact wheel=dist/turnalign.whl --artifact dependency-lock=requirements.lock \
   --artifact sbom=sbom.cdx.json --artifact release-audio=sample-30s.wav \
@@ -207,6 +213,7 @@ turnalign model-manifest --model-id modelscope://damo/paraformer-zh-streaming \
   --artifact model-manifest=model-manifest.json \
   --artifact nginx-config=/etc/nginx/conf.d/turnalign.conf \
   --artifact service-unit=/etc/systemd/system/turnalign.service \
+  --artifact rollback-rehearsal=rollback-rehearsal.json \
   --output host-profile.json
 turnalign production-gate release-report.json quality-report.json websocket-report.json \
   --source-commit "$(git rev-parse HEAD)" \
@@ -219,6 +226,7 @@ turnalign production-gate release-report.json quality-report.json websocket-repo
   --artifact model-manifest=model-manifest.json \
   --artifact nginx-config=/etc/nginx/conf.d/turnalign.conf \
   --artifact service-unit=/etc/systemd/system/turnalign.service \
+  --artifact rollback-rehearsal=rollback-rehearsal.json \
   --artifact host-profile=host-profile.json --report production-report.json
 python examples/websocket_file_client.py sample.wav --backend glm-asr --language zh
 ```
@@ -229,7 +237,7 @@ python examples/websocket_file_client.py sample.wav --backend glm-asr --language
 
 ready 响应会公开非敏感的后端请求名、后端实现名、模型、设备和不可变模型 revision。`websocket-gate` 要求所有普通及恢复会话观察到完全一致的部署身份，`production-gate` 再把实际后端实现和模型 revision 与 release/quality 证据交叉校验，避免公网探测误测到另一套模型。
 
-三个门禁都可用 `--report` 原子保存 JSON 结论。`production-gate` 只在真实模型、人工标注质量和公网 WebSocket 报告均通过，并且报告证明不可变模型、原生流式、`wss://`、实时压测、延迟上限及断线恢复已启用时放行；它要求 wheel、依赖锁、CycloneDX SBOM、发布音频、质量参考/输出、模型文件、模型清单、Nginx、systemd 和主机规格十一类制品。三份门禁报告必须绑定同一源码提交，音频和质量输入的 SHA-256 必须与聚合制品匹配，模型清单的 revision、文件名、大小和 SHA-256 必须与报告及保留的模型文件完全一致，防止任意文件冒充已验证模型。`host-profile` 必须由 Linux 目标主机上当前激活的候选版本命令生成；它直接读取已安装 Wheel 的内嵌 commit，无需生产机保留 Git checkout，并将 Wheel 版本、版本化 Python 路径、主机平台和其余十类工件的名称、大小、SHA-256 绑定为同一批部署证据。Wheel 必须是有界且路径安全的纯 Python TurnAlign 包，其内嵌源码 commit 必须与聚合门禁一致，控制台入口和 `RECORD` 中每个文件的 SHA-256/大小也必须完整匹配。systemd unit 会按实际指令而非注释重新解析，并验证回环监听、凭据文件、预加载、不可变模型、容量/生命周期边界、网络隔离、非 root 身份、可切换版本路径和最小权限设置。Nginx 配置也会按语法树重新解析，并与公网 `wss://` 报告及 systemd 端点交叉验证 TLS、WebSocket Upgrade、回环 upstream、限流、禁止重试、私有 metrics 和超时关系。依赖锁必须使用带 SHA-256 的精确版本，SBOM 必须标识 TurnAlign 根组件、WebSocket 运行依赖和依赖图；每个运行组件都必须能在锁文件中找到相同版本，pip、Twine、CycloneDX 等构建工具不得留在生产环境中。缺项或弱化的门禁会返回非零退出码。
+各门禁和部署演练命令都可用 `--report` 原子保存 JSON 结论。`deployment-rehearsal` 必须从 Linux 目标机的候选 Wheel 运行：它原子切回上一个不可变发布、重启 systemd、验证预加载就绪和公网 WebSocket 恢复，再无条件尝试恢复候选版本并重做两项探测。`production-gate` 只在真实模型、人工标注质量、公网 WebSocket 和回滚/恢复报告均通过时放行；它要求 wheel、依赖锁、CycloneDX SBOM、发布音频、质量参考/输出、模型文件、模型清单、Nginx、systemd、回滚演练和主机规格十二类制品。演练与 `host-profile` 必须绑定同一 Linux boot，恢复后的后端和模型身份必须与正式公网报告一致；`host-profile` 还会绑定 Wheel 版本、版本化 Python 路径和其余十一类工件的名称、大小与 SHA-256。三份模型/质量/传输报告必须绑定同一源码提交，音频、质量输入和模型清单也会逐项校验。Wheel、systemd、Nginx、依赖锁和 SBOM 仍由聚合门禁独立重新解析；缺项、伪造转换、弱化探测或身份不一致都会返回非零退出码。
 
 上游仓库推送与 `pyproject.toml` 版本完全一致的 `vX.Y.Z` 标签时，专用发布工作流会重新执行静态检查、两次可复现构建、Wheel 全量测试和 SBOM 生成，然后为 Wheel、sdist、SBOM 和校验和生成 GitHub/Sigstore provenance，保留 90 天。fork PR 只运行无写权限的工作流验证，不能签发制品。下载后可用 `gh attestation verify FILE --repo GuanZhengPM/TurnAlign` 复验构建身份。该工作流不会自动发布 PyPI 或创建 GitHub Release。
 
@@ -452,6 +460,12 @@ turnalign websocket-gate wss://asr.example/ws --sessions 8 \
 turnalign model-manifest --model-id modelscope://damo/paraformer-zh-streaming \
   --model-revision "$MODEL_REVISION" --file /models/model.safetensors \
   --output model-manifest.json
+sudo /opt/turnalign/current/venv/bin/turnalign deployment-rehearsal \
+  wss://asr.example.com/ws --previous-commit "$PREVIOUS_COMMIT" \
+  --candidate-commit "$CANDIDATE_COMMIT" --backend funasr-streaming \
+  --model paraformer-zh-streaming \
+  --auth-token-file /path/to/restricted/auth-token \
+  --report rollback-rehearsal.json
 /opt/turnalign/current/venv/bin/turnalign host-profile \
   --artifact wheel=dist/turnalign.whl --artifact dependency-lock=requirements.lock \
   --artifact sbom=sbom.cdx.json --artifact release-audio=sample-30s.wav \
@@ -461,6 +475,7 @@ turnalign model-manifest --model-id modelscope://damo/paraformer-zh-streaming \
   --artifact model-manifest=model-manifest.json \
   --artifact nginx-config=/etc/nginx/conf.d/turnalign.conf \
   --artifact service-unit=/etc/systemd/system/turnalign.service \
+  --artifact rollback-rehearsal=rollback-rehearsal.json \
   --output host-profile.json
 turnalign production-gate release-report.json quality-report.json websocket-report.json \
   --source-commit "$(git rev-parse HEAD)" \
@@ -473,6 +488,7 @@ turnalign production-gate release-report.json quality-report.json websocket-repo
   --artifact model-manifest=model-manifest.json \
   --artifact nginx-config=/etc/nginx/conf.d/turnalign.conf \
   --artifact service-unit=/etc/systemd/system/turnalign.service \
+  --artifact rollback-rehearsal=rollback-rehearsal.json \
   --artifact host-profile=host-profile.json --report production-report.json
 ```
 
@@ -567,13 +583,20 @@ Run the probe through the public load balancer. Since recovery is process-local,
 multi-instance deployments require session affinity for the configured recovery
 TTL; the probe will fail if reconnects reach another instance.
 
-All three gates accept `--report` to atomically persist their JSON verdict.
-`production-gate` releases only when the real-model, labelled-quality and public
-WebSocket reports passed with production-strength requirements, then binds the
-source commit and SHA-256 digests of the reports, wheel, dependency lock,
-CycloneDX SBOM, release audio, quality reference and hypothesis, model files,
-model manifest, Nginx configuration, systemd unit and host profile into one
-auditable verdict. The model manifest must bind the report revision to the exact
+The executable gates and deployment rehearsal accept `--report` to atomically
+persist their JSON verdict. `deployment-rehearsal` must run from the candidate
+Wheel on the Linux target: it atomically activates the preceding immutable
+release, restarts systemd, proves preloaded readiness and public WebSocket
+recovery, then unconditionally attempts to restore and reprobe the candidate.
+`production-gate` releases only when the real-model, labelled-quality, public
+WebSocket and rollback/restore reports passed with production-strength
+requirements. It binds the source commit and SHA-256 digests of those reports,
+the wheel, dependency lock, CycloneDX SBOM, release audio, quality reference and
+hypothesis, model files, model manifest, Nginx configuration, systemd unit and
+host profile into one auditable twelve-artifact verdict. The rehearsal and host
+profile must identify the same Linux boot, and the restored backend/model
+identity must match the standalone candidate probe. The model manifest must
+bind the report revision to the exact
 names, sizes, and SHA-256 digests of every retained model artifact. The host
 profile must be generated by the active candidate command on the Linux target
 host. It reads the embedded commit without requiring a production Git checkout

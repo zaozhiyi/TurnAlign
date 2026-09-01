@@ -166,6 +166,7 @@ jobs:
       - run: turnalign quality-gate --help
       - run: turnalign release-gate --help
       - run: turnalign websocket-gate --help
+      - run: turnalign deployment-rehearsal --help
       - run: turnalign production-gate --help
       - run: turnalign model-manifest --help
       - run: turnalign host-profile --help

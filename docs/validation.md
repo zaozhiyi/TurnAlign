@@ -21,7 +21,7 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   materialization limit before constructing the float model input.
 - All source and test modules pass `compileall`.
 - Ruff is enforced in CI and passes over `src` and `tests`.
-- The built wheel passes all 284 tests from site-packages on Python 3.10 with
+- The built wheel passes all 291 tests from site-packages on Python 3.10 with
   `websockets` 14.0 and on Python 3.12 with `websockets` 17.1. The Python 3.12
   run also passes under `python -O`, so production invariants do not depend on
   removable `assert` statements.
@@ -72,25 +72,34 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   dropped partials fail by default; pause and latency limits are configurable.
   Generated silence intentionally
   keeps transport/load evidence separate from speech-quality evidence.
-- All three executable gates can atomically persist their JSON verdict with
-  `--report`. `turnalign production-gate` independently rechecks the critical
+- All executable gates and `turnalign deployment-rehearsal` can atomically
+  persist their JSON verdict with `--report`. The rehearsal runs from the
+  candidate Wheel as root on the Linux target, atomically activates the prior
+  immutable release under a root-only non-blocking deployment lock, restarts
+  systemd, proves preloaded readiness and a public concurrent recovery probe,
+  then restores and reprobes the candidate even after a failed rollback probe.
+  `turnalign production-gate` independently rechecks the critical
   thresholds, requires a public `wss://` concurrent recovery/soak result, and
-  binds the source commit plus eleven required artifact classes and all reports by
+  binds the source commit plus twelve required artifact classes and all reports by
   SHA-256 into one final pass/fail record. Each component gate must name the same
   source commit; release-audio and labelled-quality input digests are checked
   against retained artifacts; every normal and recovery WebSocket session must
   observe one backend/model/device/revision identity; the observed backend
   implementation and immutable revision must match release/quality evidence; and a
   strict model manifest must bind that revision to the exact retained model file
-  names, sizes and SHA-256 digests.
+  names, sizes and SHA-256 digests. It also revalidates both rehearsal
+  transitions, systemd/readiness exit evidence, complete per-phase WebSocket
+  reports, candidate restoration, and restored backend/model identity.
 - `/opt/turnalign/current/venv/bin/turnalign host-profile` must run from the
   active candidate on the Linux target host. It derives the source commit from
   the installed Wheel instead of requiring a production Git checkout, records
-  bounded platform inventory, and binds the Wheel version, versioned Python
+  bounded platform inventory plus the current Linux boot identity, and binds
+  the Wheel version, versioned Python
   executable/prefix, final source commit, and exact name, size and SHA-256
   identity of every other retained artifact. The aggregate gate independently
-  revalidates that complete set, so another installation or release cannot be
-  mixed in.
+  revalidates that complete set and requires the host profile and rollback
+  rehearsal to come from the same boot, so another installation, host run or
+  release cannot be mixed in.
 - The aggregate gate parses the retained systemd unit with continuation and
   full-line comment semantics. It independently requires loopback-only serving,
   credential-file authentication, preload, immutable model revisions, positive

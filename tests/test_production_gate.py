@@ -22,6 +22,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class ProductionGateTests(unittest.TestCase):
+    BOOT_ID = "12345678-1234-4234-8234-123456789abc"
+
     @staticmethod
     def _write_test_wheel(
         path: Path,
@@ -216,6 +218,88 @@ class ProductionGateTests(unittest.TestCase):
         return release, quality, websocket
 
     @staticmethod
+    def _rollback_rehearsal(websocket: Path) -> dict[str, object]:
+        candidate = json.loads(websocket.read_text(encoding="utf-8"))
+        previous = json.loads(websocket.read_text(encoding="utf-8"))
+        previous["source_commit"] = "c" * 40
+
+        def phase(
+            name: str,
+            from_commit: str,
+            target_commit: str,
+            started_at: str,
+            activated_at: str,
+            completed_at: str,
+            probe: dict[str, object],
+        ) -> dict[str, object]:
+            return {
+                "name": name,
+                "status": "passed",
+                "from_commit": from_commit,
+                "target_commit": target_commit,
+                "target_path": f"/opt/turnalign/releases/{target_commit}",
+                "started_at": started_at,
+                "activated_at": activated_at,
+                "completed_at": completed_at,
+                "activation_seconds": 0.01,
+                "restart": {
+                    "restart_exit_code": 0,
+                    "active_exit_code": 0,
+                    "seconds": 1.0,
+                    "failure": None,
+                },
+                "readiness": {
+                    "uri": "http://127.0.0.1:8765/readyz",
+                    "status_code": 200,
+                    "ready": True,
+                    "preloaded": True,
+                    "attempts": 2,
+                    "seconds": 1.0,
+                    "failure": None,
+                },
+                "websocket_report": probe,
+                "failures": [],
+            }
+
+        return {
+            "schema_version": 1,
+            "status": "passed",
+            "candidate_commit": "b" * 40,
+            "previous_commit": "c" * 40,
+            "boot_id": ProductionGateTests.BOOT_ID,
+            "release_root": "/opt/turnalign/releases",
+            "current_link": "/opt/turnalign/current",
+            "lock_path": "/run/lock/turnalign-deployment.lock",
+            "service": "turnalign.service",
+            "systemctl": "/usr/bin/systemctl",
+            "ready_uri": "http://127.0.0.1:8765/readyz",
+            "websocket_uri": "wss://asr.example.com/ws",
+            "started_at": "2026-09-01T08:00:00.000Z",
+            "completed_at": "2026-09-01T08:00:08.000Z",
+            "initial_active_commit": "b" * 40,
+            "final_active_commit": "b" * 40,
+            "rollback": phase(
+                "rollback",
+                "b" * 40,
+                "c" * 40,
+                "2026-09-01T08:00:00.000Z",
+                "2026-09-01T08:00:01.000Z",
+                "2026-09-01T08:00:03.000Z",
+                previous,
+            ),
+            "restore": phase(
+                "restore",
+                "c" * 40,
+                "b" * 40,
+                "2026-09-01T08:00:04.000Z",
+                "2026-09-01T08:00:05.000Z",
+                "2026-09-01T08:00:07.000Z",
+                candidate,
+            ),
+            "failures": [],
+        }
+
+    @staticmethod
     def _artifacts(root: Path) -> list[tuple[str, Path]]:
         artifacts = []
         for kind in REQUIRED_ARTIFACT_KINDS:
@@ -249,6 +333,16 @@ class ProductionGateTests(unittest.TestCase):
                 })
             elif kind == "model-manifest":
                 path.write_text("pending\n", encoding="utf-8")
+            elif kind == "rollback-rehearsal":
+                websocket_path = root / "websocket.json"
+                if not websocket_path.exists():
+                    _release, _quality, websocket_path = ProductionGateTests._reports(
+                        root
+                    )
+                write_json_report(
+                    path,
+                    ProductionGateTests._rollback_rehearsal(websocket_path),
+                )
             elif kind == "wheel":
                 ProductionGateTests._write_test_wheel(path)
             elif kind == "service-unit":
@@ -292,7 +386,15 @@ class ProductionGateTests(unittest.TestCase):
                 "turnalign_source_commit": "b" * 40,
                 "turnalign_version": "0.1.0",
             },
-        ), patch.object(production_gate_module.platform, "system", return_value="Linux"):
+        ), patch.object(
+            production_gate_module.platform,
+            "system",
+            return_value="Linux",
+        ), patch.object(
+            production_gate_module,
+            "_read_linux_boot_id",
+            return_value=ProductionGateTests.BOOT_ID,
+        ):
             write_json_report(
                 host_profile,
                 create_host_profile("b" * 40, profile_artifacts),
@@ -371,6 +473,7 @@ class ProductionGateTests(unittest.TestCase):
                 ("wss://asr.example.com/ws?token=secret", "must not contain"),
                 ("wss://asr.example.com/ws#secret", "must not contain"),
                 ("wss://asr.example.com:99999/ws", "invalid port"),
+                ("wss://bad host.example.com/ws", "public wss://"),
             ):
                 payload = json.loads(websocket.read_text(encoding="utf-8"))
                 payload["uri"] = uri
@@ -624,6 +727,12 @@ class ProductionGateTests(unittest.TestCase):
                     "complete typed platform evidence",
                 ),
                 (
+                    lambda payload: payload["platform"].update(
+                        boot_id="invalid"
+                    ),
+                    "complete typed platform evidence",
+                ),
+                (
                     lambda payload: payload["artifacts"][0].update(bytes=1),
                     "does not match the retained deployment artifacts",
                 ),
@@ -635,6 +744,85 @@ class ProductionGateTests(unittest.TestCase):
                 payload = json.loads(profile.read_text(encoding="utf-8"))
                 mutate(payload)
                 write_json_report(profile, payload)
+                report = run_production_gate(
+                    release,
+                    quality,
+                    websocket,
+                    source_commit="b" * 40,
+                    artifacts=artifacts,
+                )
+
+                with self.subTest(expected=expected):
+                    self.assertFalse(report.passed)
+                    self.assertIn(expected, "\n".join(report.failures))
+
+    def test_rejects_forged_or_incomplete_rollback_rehearsal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, quality, websocket = self._reports(root)
+            for mutate, expected in (
+                (
+                    lambda payload: payload.update(status="failed"),
+                    "rollback rehearsal report did not pass",
+                ),
+                (
+                    lambda payload: payload.update(previous_commit="b" * 40),
+                    "not bound to one prior and candidate release",
+                ),
+                (
+                    lambda payload: payload.update(final_active_commit="c" * 40),
+                    "not bound to one prior and candidate release",
+                ),
+                (
+                    lambda payload: payload.update(
+                        boot_id="87654321-4321-4321-8321-cba987654321"
+                    ),
+                    "identify different Linux boots",
+                ),
+                (
+                    lambda payload: payload.update(current_link="/tmp/current"),
+                    "production activation layout",
+                ),
+                (
+                    lambda payload: payload["rollback"].update(
+                        from_commit="c" * 40
+                    ),
+                    "rollback has an invalid transition",
+                ),
+                (
+                    lambda payload: payload["rollback"]["restart"].update(
+                        restart_exit_code=False
+                    ),
+                    "did not restart an active service",
+                ),
+                (
+                    lambda payload: payload["restore"]["readiness"].update(
+                        preloaded=False
+                    ),
+                    "did not prove preloaded readiness",
+                ),
+                (
+                    lambda payload: payload["rollback"][
+                        "websocket_report"
+                    ].update(source_commit="b" * 40),
+                    "not bound to source commit",
+                ),
+                (
+                    lambda payload: payload["restore"].update(
+                        started_at="2026-09-01T07:59:59.000Z"
+                    ),
+                    "phase timestamps are out of order",
+                ),
+            ):
+                artifacts = self._artifacts(root)
+                rehearsal_path = next(
+                    path
+                    for kind, path in artifacts
+                    if kind == "rollback-rehearsal"
+                )
+                payload = json.loads(rehearsal_path.read_text(encoding="utf-8"))
+                mutate(payload)
+                write_json_report(rehearsal_path, payload)
                 report = run_production_gate(
                     release,
                     quality,

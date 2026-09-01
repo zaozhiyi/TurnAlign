@@ -680,6 +680,60 @@ class CliIntegrationTests(unittest.TestCase):
                 "passed",
             )
 
+    def test_deployment_rehearsal_maps_safe_production_options(self):
+        captured = {}
+
+        class Report:
+            passed = True
+
+            @staticmethod
+            def to_dict():
+                return {"schema_version": 1, "status": "passed", "failures": []}
+
+        async def fake_rehearsal(previous, candidate, uri, **options):
+            captured.update({
+                "previous": previous,
+                "candidate": candidate,
+                "uri": uri,
+                **options,
+            })
+            return Report()
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "rehearsal.json"
+            with patch.object(
+                cli,
+                "run_deployment_rehearsal",
+                side_effect=fake_rehearsal,
+            ), patch(
+                "sys.argv",
+                [
+                    "turnalign",
+                    "deployment-rehearsal",
+                    "wss://asr.example.com/ws",
+                    "--previous-commit",
+                    "a" * 40,
+                    "--candidate-commit",
+                    "b" * 40,
+                    "--backend",
+                    "funasr-streaming",
+                    "--model",
+                    "paraformer-zh-streaming",
+                    "--report",
+                    str(output),
+                ],
+            ), patch("builtins.print"):
+                self.assertEqual(cli.main(), 0)
+
+            self.assertEqual(captured["previous"], "a" * 40)
+            self.assertEqual(captured["candidate"], "b" * 40)
+            self.assertEqual(captured["uri"], "wss://asr.example.com/ws")
+            probe = captured["probe"]
+            self.assertEqual(probe.backend, "funasr-streaming")
+            self.assertEqual(probe.model, "paraformer-zh-streaming")
+            self.assertEqual(probe.sessions, 2)
+            self.assertEqual(json.loads(output.read_text())["status"], "passed")
+
     def test_model_manifest_hashes_files_and_persists_provenance(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -743,13 +797,20 @@ class CliIntegrationTests(unittest.TestCase):
             ), patch(
                 "turnalign.production_gate.platform.system",
                 return_value="Linux",
+            ), patch(
+                "turnalign.production_gate._read_linux_boot_id",
+                return_value="12345678-1234-4234-8234-123456789abc",
             ), patch("sys.argv", arguments), patch("builtins.print"):
                 self.assertEqual(cli.main(), 0)
 
             payload = json.loads(output.read_text(encoding="utf-8"))
-            self.assertEqual(payload["schema_version"], 2)
+            self.assertEqual(payload["schema_version"], 3)
             self.assertEqual(payload["source_commit"], "a" * 40)
             self.assertEqual(payload["runtime"], runtime)
+            self.assertEqual(
+                payload["platform"]["boot_id"],
+                "12345678-1234-4234-8234-123456789abc",
+            )
             self.assertGreater(payload["platform"]["logical_cpu_count"], 0)
             self.assertEqual(
                 {item["kind"] for item in payload["artifacts"]},
