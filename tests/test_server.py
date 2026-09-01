@@ -15,6 +15,7 @@ from pathlib import Path
 from threading import Event
 from unittest.mock import patch
 
+from turnalign.model_pool import BackendPool
 from turnalign.models import Hypothesis
 from turnalign.plugins import BackendCapabilities
 from turnalign.policy import ServerPolicy
@@ -1750,11 +1751,19 @@ class WebSocketTests(unittest.IsolatedAsyncioTestCase):
         probe.close()
         blocking = PermanentlyBlockingCancelServerBackend()
         replacement = FakeServerBackend()
+        detached = Event()
+        real_detach = BackendPool.detach
+
+        def track_detach(pool, key):
+            backend = real_detach(pool, key)
+            detached.set()
+            return backend
+
         ten_seconds = array("h", [1500] * 160_000).tobytes()
         with patch(
             "turnalign.server.create_asr",
             side_effect=(blocking, replacement),
-        ) as create:
+        ) as create, patch.object(BackendPool, "detach", new=track_detach):
             server_task = asyncio.create_task(serve(
                 "127.0.0.1",
                 port,
@@ -1775,7 +1784,7 @@ class WebSocketTests(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue(
                         await asyncio.to_thread(blocking.cancel_started.wait, 1)
                     )
-                await asyncio.sleep(0.15)
+                self.assertTrue(await asyncio.to_thread(detached.wait, 2))
 
                 async with connect(f"ws://127.0.0.1:{port}") as second:
                     await second.send(json.dumps({"type": "start", "backend": "fake"}))
