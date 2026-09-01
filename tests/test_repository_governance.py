@@ -5,6 +5,21 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class RepositoryGovernanceTests(unittest.TestCase):
+    def test_ci_runs_checksum_verified_actionlint(self):
+        content = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('ACTIONLINT_VERSION: "1.7.12"', content)
+        self.assertIn(
+            "ACTIONLINT_SHA256: "
+            '"8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"',
+            content,
+        )
+        self.assertIn(
+            "https://github.com/rhysd/actionlint/releases/download/", content
+        )
+        self.assertIn('"$directory/actionlint" .github/workflows/*.yml', content)
+
     def test_codeql_uses_immutable_actions_and_fork_safe_upload(self):
         content = (ROOT / ".github" / "workflows" / "codeql.yml").read_text(
             encoding="utf-8"
