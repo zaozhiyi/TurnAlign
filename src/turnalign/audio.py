@@ -59,7 +59,8 @@ class AudioTimeline:
             self.end = chunk.start
         elif (chunk.sample_rate, chunk.channels) != (self.sample_rate, self.channels):
             raise ValueError("audio format changed while recording timeline")
-        assert self.start is not None
+        if self.start is None:
+            raise RuntimeError("audio timeline start was not initialized")
         frame_seconds = 1 / chunk.sample_rate
         if chunk.start < self.end - frame_seconds:
             raise ValueError("audio timeline chunks must not overlap or move backwards")
@@ -173,7 +174,10 @@ def file_chunks(path: Path, chunk_ms: int = 500, ffmpeg: str = "ffmpeg") -> Iter
         "-f", "s16le", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", "-",
     ]
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    assert process.stdout is not None
+    if process.stdout is None:
+        process.kill()
+        process.wait()
+        raise RuntimeError("ffmpeg stdout pipe was not created")
     size = _chunk_bytes(16_000, 1, chunk_ms)
     start = 0.0
     try:

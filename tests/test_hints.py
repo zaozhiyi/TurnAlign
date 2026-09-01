@@ -1,11 +1,12 @@
+import sys
 import unittest
 from array import array
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 from turnalign.backends.faster_whisper import FasterWhisperBackend
 from turnalign.backends.funasr import FunAsrBackend
-from turnalign.backends.transformers import TransformersWhisperBackend
+from turnalign.backends.transformers import GlmAsrBackend, TransformersWhisperBackend
 from turnalign.hints import AsrHints, glm_transcription_prompt, whisper_initial_prompt
 from turnalign.models import AudioChunk
 from turnalign.plugins import AsrConfig, BackendCapabilities
@@ -72,8 +73,14 @@ class HintContractTests(unittest.TestCase):
     def test_invalid_hint_limits_fail_before_model_loading(self):
         with self.assertRaisesRegex(ValueError, "one phrase per item"):
             AsrHints(("TERM_A\nTERM_B",))
-        with self.assertRaisesRegex(ValueError, "boost must be positive"):
+        with self.assertRaisesRegex(ValueError, "boost must be finite"):
             AsrHints(("TERM_A",), boost=0)
+        for boost in (True, "2", float("nan"), float("inf"), 1_001):
+            with self.subTest(boost=boost), self.assertRaises((TypeError, ValueError)):
+                AsrHints(boost=boost)
+        for context in (1, {}, [], b"topic"):
+            with self.subTest(context=context), self.assertRaises(TypeError):
+                AsrHints(context=context)
 
     def test_prompt_compilers_use_backend_specific_semantics(self):
         hints = AsrHints(("TERM_A",), context="topic")
@@ -97,6 +104,129 @@ class HintContractTests(unittest.TestCase):
 
 
 class BackendHintMappingTests(unittest.TestCase):
+    def test_default_batch_funasr_model_uses_immutable_revision(self):
+        captured = {}
+
+        class AutoModel:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        module = ModuleType("funasr")
+        module.AutoModel = AutoModel
+        with patch.dict(sys.modules, {"funasr": module}):
+            backend = FunAsrBackend(AsrConfig(device="cpu"))
+        self.assertRegex(backend.model_revision, r"^[0-9a-f]{40}$")
+        self.assertEqual(captured["model_revision"], backend.model_revision)
+        self.assertTrue(captured["disable_update"])
+
+    def test_default_transformers_models_use_immutable_revisions(self):
+        whisper_call = {}
+        whisper_module = ModuleType("transformers")
+
+        def fake_pipeline(*_args, **kwargs):
+            whisper_call.update(kwargs)
+            return CapturePipeline()
+
+        whisper_module.pipeline = fake_pipeline
+        with patch.dict(sys.modules, {"transformers": whisper_module}):
+            whisper = TransformersWhisperBackend(AsrConfig(device="cpu"))
+        self.assertRegex(whisper.model_revision, r"^[0-9a-f]{40}$")
+        self.assertEqual(whisper_call["revision"], whisper.model_revision)
+
+        processor_call = {}
+
+        class ProcessorLoader:
+            @classmethod
+            def from_pretrained(cls, _model_id, **kwargs):
+                processor_call.update(kwargs)
+                return object()
+
+        class LoadedModel:
+            def to(self, _device):
+                return self
+
+            def eval(self):
+                return None
+
+        class ModelLoader:
+            @classmethod
+            def from_pretrained(cls, _model_id, **_kwargs):
+                return LoadedModel()
+
+        glm_module = ModuleType("transformers")
+        glm_module.AutoProcessor = ProcessorLoader
+        glm_module.AutoModelForSeq2SeqLM = ModelLoader
+        with patch.dict(sys.modules, {"transformers": glm_module}):
+            glm = GlmAsrBackend(AsrConfig(device="cpu"))
+        self.assertRegex(glm.model_revision, r"^[0-9a-f]{40}$")
+        self.assertEqual(processor_call["revision"], glm.model_revision)
+
+    def test_transformers_backends_forward_one_explicit_model_revision(self):
+        revision = "a" * 40
+        whisper_call = {}
+
+        def fake_pipeline(*args, **kwargs):
+            whisper_call.update({"args": args, "kwargs": kwargs})
+            return CapturePipeline()
+
+        whisper_module = ModuleType("transformers")
+        whisper_module.pipeline = fake_pipeline
+        with patch.dict(sys.modules, {"transformers": whisper_module}):
+            whisper = TransformersWhisperBackend(AsrConfig(
+                device="cpu",
+                extra={"revision": revision, "local_files_only": True},
+            ))
+        self.assertEqual(whisper.model_revision, revision)
+        self.assertEqual(whisper_call["kwargs"]["revision"], revision)
+        self.assertTrue(whisper_call["kwargs"]["local_files_only"])
+
+        processor_call = {}
+        model_call = {}
+
+        class ProcessorLoader:
+            @classmethod
+            def from_pretrained(cls, model_id, **kwargs):
+                processor_call.update({"model_id": model_id, **kwargs})
+                return object()
+
+        class LoadedModel:
+            def to(self, device):
+                self.device = device
+                return self
+
+            def eval(self):
+                return None
+
+        class ModelLoader:
+            @classmethod
+            def from_pretrained(cls, model_id, **kwargs):
+                model_call.update({"model_id": model_id, **kwargs})
+                return LoadedModel()
+
+        glm_module = ModuleType("transformers")
+        glm_module.AutoProcessor = ProcessorLoader
+        glm_module.AutoModelForSeq2SeqLM = ModelLoader
+        with patch.dict(sys.modules, {"transformers": glm_module}):
+            glm = GlmAsrBackend(AsrConfig(
+                device="cpu",
+                extra={"revision": revision, "local_files_only": True},
+            ))
+        self.assertEqual(glm.model_revision, revision)
+        self.assertEqual(processor_call["revision"], revision)
+        self.assertTrue(processor_call["local_files_only"])
+        self.assertEqual(model_call["revision"], revision)
+        self.assertTrue(model_call["local_files_only"])
+
+    def test_transformers_revision_must_be_a_bounded_nonempty_string(self):
+        module = ModuleType("transformers")
+        module.pipeline = lambda *_args, **_kwargs: CapturePipeline()
+        for revision in ("", " ", 1, "x" * 201):
+            with self.subTest(revision=revision), patch.dict(
+                sys.modules,
+                {"transformers": module},
+            ), self.assertRaisesRegex(ValueError, "revision"):
+                TransformersWhisperBackend(AsrConfig(extra={"revision": revision}))
+
     def test_faster_whisper_receives_native_hotwords_and_initial_prompt(self):
         segment = SimpleNamespace(text="ok", start=0.0, end=0.2, words=[])
         info = SimpleNamespace(language="en")

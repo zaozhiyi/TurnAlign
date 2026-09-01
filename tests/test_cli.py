@@ -9,11 +9,80 @@ from unittest.mock import patch
 from turnalign import cli
 from turnalign.cli import replay, validate_events
 from turnalign.devices import Device
+from turnalign.models import TranscriptEvent
 from turnalign.plugins import Accelerator
 from turnalign.profiles import select_execution_profile
 
 
+class ClosableResource:
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
 class CliIntegrationTests(unittest.TestCase):
+    @staticmethod
+    def _write_event_stream(path, events):
+        path.write_text(
+            "\n".join(
+                json.dumps(event.to_dict(), ensure_ascii=False)
+                for event in events
+            ) + "\n",
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _transcribe_args(**overrides):
+        values = {
+            "execution_profile": "cpu-low-memory",
+            "backend": "fake",
+            "device": "cpu",
+            "model": None,
+            "language": None,
+            "compute_type": None,
+            "executable": None,
+            "model_path": None,
+            "backend_option": [],
+            "hotword": [],
+            "hotwords_file": [],
+            "context": None,
+            "context_file": None,
+            "hotword_boost": None,
+            "vad_backend": "none",
+            "vad_option": [],
+            "aligner": None,
+            "aligner_option": [],
+            "diarizer": None,
+            "diarizer_option": [],
+            "parallel_postprocess": None,
+            "source": Path("sample.wav"),
+            "chunk_ms": 100,
+            "ffmpeg": "ffmpeg",
+            "vad_output": None,
+            "output": None,
+            "output_format": "jsonl",
+            "vad_threshold": 0.012,
+            "silence_seconds": 0.7,
+            "max_utterance_seconds": 20.0,
+            "partial_seconds": 2.0,
+        }
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    @staticmethod
+    def _execution_profile():
+        return SimpleNamespace(
+            name="cpu-low-memory",
+            asr_device="cpu",
+            vad_device="cpu",
+            alignment_device="cpu",
+            alignment_batch_size=1,
+            diarization_device="cpu",
+            parallel_diarization=False,
+        )
+
     @patch.dict(os.environ, {}, clear=True)
     def test_whisper_cpp_vulkan_uses_cpu_profile_without_hiding_asr_device(self):
         devices = [Device(
@@ -103,6 +172,41 @@ class CliIntegrationTests(unittest.TestCase):
             self.assertEqual(hints.hotwords, ("TERM_A", "TERM_B"))
             self.assertEqual(hints.context, "topic")
 
+    def test_transcribe_setup_failure_closes_created_resources(self):
+        backend = ClosableResource()
+        vad = ClosableResource()
+        args = self._transcribe_args(vad_backend="energy", aligner="broken")
+        with (
+            patch.object(cli, "select_execution_profile", return_value=self._execution_profile()),
+            patch.object(cli, "create_asr", return_value=backend),
+            patch.object(
+                cli,
+                "create_component",
+                side_effect=[vad, RuntimeError("aligner failed")],
+            ),
+            self.assertRaisesRegex(RuntimeError, "aligner failed"),
+        ):
+            cli.transcribe_file(args)
+        self.assertTrue(backend.closed)
+        self.assertTrue(vad.closed)
+
+    def test_output_open_failure_closes_resources_before_pipeline_starts(self):
+        backend = ClosableResource()
+        with tempfile.TemporaryDirectory() as directory:
+            args = self._transcribe_args(output=Path(directory))
+            with (
+                patch.object(
+                    cli,
+                    "select_execution_profile",
+                    return_value=self._execution_profile(),
+                ),
+                patch.object(cli, "create_asr", return_value=backend),
+                patch.object(cli, "file_chunks", return_value=iter(())),
+                self.assertRaises(IsADirectoryError),
+            ):
+                cli.transcribe_file(args)
+        self.assertTrue(backend.closed)
+
     def test_file_transcription_defaults_to_energy_vad(self):
         captured = {}
 
@@ -158,6 +262,255 @@ class CliIntegrationTests(unittest.TestCase):
             "online_diarizer": "custom-online-speaker",
         })
 
+    def test_release_gate_exposes_real_model_thresholds(self):
+        captured = {}
+
+        def fake_gate(args):
+            captured.update({
+                "backend": args.backend,
+                "max_rtf": args.max_realtime_factor,
+                "max_commit": args.max_first_commit_seconds,
+                "min_audio": args.min_audio_seconds,
+                "native": args.require_native_streaming,
+                "immutable_revision": args.require_immutable_model_revision,
+            })
+            return 0
+
+        with patch.object(cli, "release_gate", fake_gate), patch(
+            "sys.argv",
+            [
+                "turnalign",
+                "release-gate",
+                "sample.wav",
+                "--backend",
+                "funasr-streaming",
+                "--max-realtime-factor",
+                "0.5",
+                "--max-first-commit-seconds",
+                "8",
+                "--min-audio-seconds",
+                "30",
+                "--require-immutable-model-revision",
+            ],
+        ):
+            self.assertEqual(cli.main(), 0)
+        self.assertEqual(captured, {
+            "backend": "funasr-streaming",
+            "max_rtf": 0.5,
+            "max_commit": 8.0,
+            "min_audio": 30.0,
+            "native": True,
+            "immutable_revision": True,
+        })
+
+    def test_release_gate_validates_audio_before_loading_backend(self):
+        args = SimpleNamespace(
+            source=Path("not-normalized.wav"),
+            chunk_ms=500,
+            ffmpeg="missing-ffmpeg",
+            output=None,
+        )
+        with patch.object(
+            cli,
+            "file_chunks",
+            side_effect=RuntimeError("ffmpeg is required"),
+        ), patch.object(cli, "create_asr") as create_asr, self.assertRaisesRegex(
+            RuntimeError, "ffmpeg is required"
+        ):
+            cli.release_gate(args)
+        create_asr.assert_not_called()
+
+    def test_serve_exposes_output_backpressure_timeout(self):
+        captured = {}
+
+        async def fake_serve(*_args, **options):
+            captured.update(options)
+
+        with patch.object(cli, "serve", fake_serve), patch.object(
+            cli.logging, "basicConfig"
+        ) as configure_logging, patch(
+            "sys.argv",
+            [
+                "turnalign",
+                "serve",
+                "--backend",
+                "glm-asr",
+                "--log-level",
+                "WARNING",
+                "--output-backpressure-timeout",
+                "2.5",
+            ],
+        ):
+            self.assertEqual(cli.main(), 0)
+        configure_logging.assert_called_once_with(
+            level=cli.logging.WARNING,
+            format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        )
+        self.assertEqual(captured["output_backpressure_timeout"], 2.5)
+
+    def test_serve_exposes_lifecycle_timeouts(self):
+        captured = {}
+
+        async def fake_serve(*_args, **options):
+            captured.update(options)
+
+        with patch.object(cli, "serve", fake_serve), patch(
+            "sys.argv",
+            [
+                "turnalign",
+                "serve",
+                "--backend",
+                "glm-asr",
+                "--language",
+                "zh",
+                "--compute-type",
+                "float16",
+                "--executable",
+                "/opt/whisper-cli",
+                "--model-path",
+                "/models/asr.bin",
+                "--backend-option",
+                "threads=4",
+                "--allow-language",
+                "en",
+                "--allow-compute-type",
+                "int8",
+                "--initialization-timeout",
+                "30",
+                "--worker-shutdown-timeout",
+                "1.5",
+                "--finalization-timeout",
+                "45",
+                "--max-concurrent-sessions",
+                "12",
+                "--max-recovery-sessions",
+                "10",
+                "--max-recovery-event-kib",
+                "256",
+                "--max-recovery-events-mib",
+                "4",
+                "--max-recovery-audio-mib",
+                "128",
+                "--max-recovery-total-mib",
+                "512",
+                "--recovery-ttl-seconds",
+                "90",
+                "--max-control-message-bytes",
+                "4096",
+                "--start-timeout",
+                "4",
+                "--client-idle-timeout",
+                "15",
+                "--shutdown-grace-timeout",
+                "20",
+                "--backend-replicas",
+                "2",
+                "--allow-origin",
+                "https://app.example",
+                "--preload",
+                "--require-immutable-model-revision",
+            ],
+        ):
+            self.assertEqual(cli.main(), 0)
+        self.assertEqual(captured["initialization_timeout"], 30.0)
+        self.assertEqual(captured["worker_shutdown_timeout"], 1.5)
+        self.assertEqual(captured["finalization_timeout"], 45.0)
+        self.assertEqual(captured["max_concurrent_sessions"], 12)
+        self.assertEqual(captured["max_recovery_sessions"], 10)
+        self.assertEqual(captured["max_recovery_event_bytes"], 256 * 1024)
+        self.assertEqual(
+            captured["max_recovery_event_bytes_per_session"],
+            4 * 1024 * 1024,
+        )
+        self.assertEqual(captured["max_recovery_audio_bytes"], 128 * 1024 * 1024)
+        self.assertEqual(captured["max_recovery_total_bytes"], 512 * 1024 * 1024)
+        self.assertEqual(captured["recovery_ttl_seconds"], 90.0)
+        self.assertEqual(captured["max_control_message_bytes"], 4096)
+        self.assertEqual(captured["start_timeout"], 4.0)
+        self.assertEqual(captured["client_idle_timeout"], 15.0)
+        self.assertEqual(captured["shutdown_grace_timeout"], 20.0)
+        self.assertEqual(captured["backend_replicas"], 2)
+        self.assertEqual(captured["allowed_origins"], (None, "https://app.example"))
+        self.assertTrue(captured["preload"])
+        self.assertTrue(captured["require_immutable_revision"])
+        self.assertEqual(captured["default_language"], "zh")
+        self.assertEqual(captured["default_compute_type"], "float16")
+        self.assertEqual(captured["default_executable"], "/opt/whisper-cli")
+        self.assertEqual(captured["default_model_path"], "/models/asr.bin")
+        self.assertEqual(captured["default_backend_options"], {"threads": 4})
+        self.assertEqual(captured["policy"].allowed_languages, frozenset({"zh", "en"}))
+        self.assertEqual(
+            captured["policy"].allowed_compute_types,
+            frozenset({"float16", "int8"}),
+        )
+
+    def test_serve_handles_operator_interrupt_without_traceback(self):
+        async def interrupted(*_args, **_options):
+            raise KeyboardInterrupt
+
+        with patch.object(cli, "serve", interrupted), patch(
+            "sys.argv",
+            ["turnalign", "serve", "--backend", "glm-asr"],
+        ):
+            self.assertEqual(cli.main(), 130)
+
+    def test_websocket_gate_maps_cli_options_without_literal_auth(self):
+        captured = {}
+
+        class Report:
+            passed = True
+
+            @staticmethod
+            def to_dict():
+                return {"status": "passed"}
+
+        async def fake_gate(uri, **options):
+            captured["uri"] = uri
+            captured.update(options)
+            return Report()
+
+        with patch.object(cli, "run_websocket_gate", fake_gate), patch.dict(
+            os.environ,
+            {"TURNALIGN_GATE_TOKEN": "private-token"},
+        ), patch(
+            "sys.argv",
+            [
+                "turnalign",
+                "websocket-gate",
+                "wss://asr.example/ws",
+                "--sessions",
+                "8",
+                "--audio-seconds",
+                "60",
+                "--realtime",
+                "--compute-type",
+                "int8",
+                "--min-audio-acks",
+                "2",
+                "--max-dropped-partials",
+                "1",
+                "--max-backpressure-pauses",
+                "3",
+                "--verify-recovery",
+                "--recovery-resume-timeout",
+                "7",
+                "--auth-token-env",
+                "TURNALIGN_GATE_TOKEN",
+            ],
+        ):
+            self.assertEqual(cli.main(), 0)
+        self.assertEqual(captured["uri"], "wss://asr.example/ws")
+        self.assertEqual(captured["sessions"], 8)
+        self.assertEqual(captured["audio_seconds"], 60.0)
+        self.assertTrue(captured["realtime"])
+        self.assertEqual(captured["compute_type"], "int8")
+        self.assertEqual(captured["min_audio_acks"], 2)
+        self.assertEqual(captured["max_dropped_partials"], 1)
+        self.assertEqual(captured["max_backpressure_pauses"], 3)
+        self.assertTrue(captured["verify_recovery"])
+        self.assertEqual(captured["recovery_resume_timeout"], 7.0)
+        self.assertEqual(captured["auth_token"], "private-token")
+
     def test_replay_creates_parent_and_valid_end_event(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -185,6 +538,87 @@ class CliIntegrationTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "missing end"):
                 validate_events(source)
+
+    def test_quality_gate_cli_passes_and_fails_with_nonzero_exit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            reference = root / "reference.jsonl"
+            matching = root / "matching.jsonl"
+            mismatching = root / "mismatching.jsonl"
+            end = TranscriptEvent("end", "session", 1, 1, 1)
+            self._write_event_stream(reference, [
+                TranscriptEvent("commit", "r", 1, 0, 1, "hello world"),
+                end,
+            ])
+            self._write_event_stream(matching, [
+                TranscriptEvent("commit", "h", 1, 0, 1, "hello world"),
+                end,
+            ])
+            self._write_event_stream(mismatching, [
+                TranscriptEvent("commit", "h", 1, 0, 1, "wrong"),
+                end,
+            ])
+
+            with patch("sys.argv", [
+                "turnalign", "quality-gate", str(reference), str(matching),
+                "--max-cer", "0", "--max-wer", "0",
+                "--min-reference-speech-seconds", "1",
+            ]), patch("builtins.print"):
+                self.assertEqual(cli.main(), 0)
+            with patch("sys.argv", [
+                "turnalign", "quality-gate", str(reference), str(mismatching),
+                "--max-cer", "0.1",
+            ]), patch("builtins.print"):
+                self.assertEqual(cli.main(), 1)
+
+    def test_quality_gate_cli_requires_complete_event_streams(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            incomplete = root / "incomplete.jsonl"
+            complete = root / "complete.jsonl"
+            commit = TranscriptEvent("commit", "s", 1, 0, 1, "text")
+            self._write_event_stream(incomplete, [commit])
+            self._write_event_stream(complete, [
+                commit,
+                TranscriptEvent("end", "session", 1, 1, 1),
+            ])
+            with patch("sys.argv", [
+                "turnalign", "quality-gate", str(incomplete), str(complete),
+                "--max-cer", "0",
+            ]), self.assertRaisesRegex(ValueError, "missing end"):
+                cli.main()
+
+    def test_quality_gate_cli_applies_and_reports_text_normalization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            reference = root / "reference.jsonl"
+            hypothesis = root / "hypothesis.jsonl"
+            end = TranscriptEvent("end", "session", 1, 1, 1)
+            self._write_event_stream(reference, [
+                TranscriptEvent("commit", "r", 1, 0, 1, "Ａ，Test"),
+                end,
+            ])
+            self._write_event_stream(hypothesis, [
+                TranscriptEvent("commit", "h", 1, 0, 1, "a test"),
+                end,
+            ])
+            with patch("sys.argv", [
+                "turnalign", "quality-gate", str(reference), str(hypothesis),
+                "--max-cer", "0", "--max-wer", "0",
+                "--unicode-normalization", "NFKC",
+                "--ignore-case", "--ignore-punctuation",
+            ]), patch("builtins.print") as output:
+                self.assertEqual(cli.main(), 0)
+            report = json.loads(output.call_args.args[0])
+            self.assertEqual(report["evaluation"]["character_error_rate"], 0)
+            self.assertEqual(
+                report["evaluation"]["text_normalization"],
+                {
+                    "unicode_form": "NFKC",
+                    "case_sensitive": False,
+                    "punctuation_sensitive": False,
+                },
+            )
 
 
 if __name__ == "__main__":

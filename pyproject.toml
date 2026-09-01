@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=68"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
 
 [project]
 name = "turnalign"
@@ -17,11 +17,29 @@ microphone = ["sounddevice>=0.5,<1"]
 server = ["websockets>=14,<18"]
 transformers = ["accelerate>=1.0,<3", "numpy>=1.26,<3", "transformers>=4.57,<6"]
 faster-whisper = ["faster-whisper>=1.1,<2", "numpy>=1.26,<3"]
-funasr = ["funasr>=1.2,<2", "numpy>=1.26,<3", "torchaudio>=2.0,<3"]
-funasr-pipeline = ["funasr>=1.2,<2", "numpy>=1.26,<3", "torchaudio>=2.0,<3"]
+funasr = ["funasr>=1.2,<2", "numpy>=1.26,<3", "torch>=2.0,<3", "torchaudio>=2.0,<3"]
+funasr-pipeline = ["funasr>=1.2,<2", "numpy>=1.26,<3", "torch>=2.0,<3", "torchaudio>=2.0,<3"]
 
 [project.scripts]
 turnalign = "turnalign.cli:main"
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.hatch.build.targets.wheel]
+packages = ["src/turnalign"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/ACKNOWLEDGEMENTS.md",
+  "/LICENSE",
+  "/README.md",
+  "/docs",
+  "/examples",
+  "/pyproject.toml",
+  "/src",
+  "/tests",
+]
+
+[tool.mypy]
+python_version = "3.10"
+files = ["src/turnalign"]
+ignore_missing_imports = true
+check_untyped_defs = true

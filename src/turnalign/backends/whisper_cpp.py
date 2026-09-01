@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import wave
 from collections.abc import Iterable
 from pathlib import Path
@@ -17,7 +18,7 @@ from .common import collect_pcm
 
 _INDEXED_DEVICE = re.compile(r"^(?:cuda|rocm|vulkan):(\d+)$")
 _UNINDEXED_DEVICES = {"auto", "cpu", "cuda", "rocm", "vulkan", "mps"}
-_ALLOWED_OPTIONS = {"threads", "flash_attention"}
+_ALLOWED_OPTIONS = {"threads", "flash_attention", "allow_prompt_argv"}
 
 
 def _bounded_integer(value: object, *, name: str, minimum: int, maximum: int) -> int:
@@ -53,6 +54,7 @@ def _windows_creationflags() -> int:
 
 class WhisperCppBackend:
     name = "whisper-cpp"
+    session_hints = True
     capabilities = BackendCapabilities(
         streaming=False,
         word_timestamps=False,
@@ -66,6 +68,7 @@ class WhisperCppBackend:
             Accelerator.CPU,
         ),
     )
+    cancel_grace_seconds = 1.0
 
     def __init__(self, config: AsrConfig):
         self.executable = config.executable or "whisper-cli"
@@ -88,16 +91,42 @@ class WhisperCppBackend:
         self.flash_attention = options.get("flash_attention")
         if self.flash_attention is not None and not isinstance(self.flash_attention, bool):
             raise ValueError("whisper-cpp flash_attention must be a boolean")
+        self.allow_prompt_argv = options.get("allow_prompt_argv", False)
+        if not isinstance(self.allow_prompt_argv, bool):
+            raise TypeError("whisper-cpp allow_prompt_argv must be a boolean")
         self.hints = config.hints
         self.initial_prompt = whisper_initial_prompt(config.hints)
+        if self.initial_prompt and not self.allow_prompt_argv:
+            raise ValueError(
+                "whisper-cpp only accepts prompts through process arguments; "
+                "private hints are disabled by default because other local users may "
+                "read the process list. Remove the hints or explicitly set backend "
+                "option allow_prompt_argv=true after accepting that risk"
+            )
         if not self.model_path:
             raise ValueError("whisper-cpp requires --model-path")
         if shutil.which(self.executable) is None and not Path(self.executable).is_file():
             raise RuntimeError(f"whisper.cpp executable not found: {self.executable}")
+        self._process_lock = threading.Lock()
+        self._process: subprocess.Popen[str] | None = None
+        self._cancel_requested = threading.Event()
+
+    def set_hints(self, hints) -> None:
+        initial_prompt = whisper_initial_prompt(hints)
+        if initial_prompt and not self.allow_prompt_argv:
+            raise ValueError(
+                "whisper-cpp only accepts prompts through process arguments; "
+                "private hints are disabled by default because other local users may "
+                "read the process list. Remove the hints or explicitly set backend "
+                "option allow_prompt_argv=true after accepting that risk"
+            )
+        self.hints = hints
+        self.initial_prompt = initial_prompt
 
     def transcribe(self, chunks: Iterable[AudioChunk]) -> Iterable[Hypothesis]:
+        self._cancel_requested.clear()
         data, sample_rate, channels, offset = collect_pcm(chunks)
-        if not data:
+        if not data or self._cancel_requested.is_set():
             return
         with tempfile.TemporaryDirectory(prefix="turnalign-") as directory:
             root = Path(directory)
@@ -122,15 +151,25 @@ class WhisperCppBackend:
                 command.append("-fa" if self.flash_attention else "-nfa")
             if self.initial_prompt:
                 command.extend(["--prompt", self.initial_prompt])
-            completed = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                check=False,
-                creationflags=_windows_creationflags(),
-            )
-            if completed.returncode:
-                raise RuntimeError(f"whisper.cpp failed: {completed.stderr.strip()}")
+            with self._process_lock:
+                if self._cancel_requested.is_set():
+                    return
+                process = subprocess.Popen(
+                    command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    creationflags=_windows_creationflags(),
+                )
+                self._process = process
+            try:
+                _, stderr = process.communicate()
+            finally:
+                with self._process_lock:
+                    if self._process is process:
+                        self._process = None
+            if process.returncode:
+                raise RuntimeError(f"whisper.cpp failed: {stderr.strip()}")
             payload = json.loads(output_base.with_suffix(".json").read_text(encoding="utf-8"))
             items = payload.get("transcription") or payload.get("segments") or []
             if not items and payload.get("text"):
@@ -158,5 +197,30 @@ class WhisperCppBackend:
                     ),
                 )
 
+    def cancel(self) -> None:
+        """Terminate the active CLI process so transport cancellation is real."""
+        self._cancel_requested.set()
+        with self._process_lock:
+            process = self._process
+        if process is not None and process.poll() is None:
+            process.terminate()
+            escalation = threading.Timer(
+                self.cancel_grace_seconds,
+                self._kill_if_active,
+                args=(process,),
+            )
+            escalation.daemon = True
+            escalation.start()
+
+    def _kill_if_active(self, process: subprocess.Popen[str]) -> None:
+        """Force-kill a CLI process that ignored the graceful termination."""
+        with self._process_lock:
+            active = self._process is process
+        if active and process.poll() is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+
     def close(self) -> None:
-        return None
+        self.cancel()

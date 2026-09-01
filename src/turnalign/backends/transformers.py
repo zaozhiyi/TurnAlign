@@ -7,6 +7,24 @@ from ..models import AudioChunk, Hypothesis, Word
 from ..plugins import Accelerator, AsrConfig, BackendCapabilities
 from .common import collect_pcm, pcm_to_float32
 
+_DEFAULT_WHISPER_MODEL = "openai/whisper-small"
+_DEFAULT_WHISPER_REVISION = "973afd24965f72e36ca33b3055d56a652f456b4d"
+_DEFAULT_GLM_MODEL = "zai-org/GLM-ASR-Nano-2512"
+_DEFAULT_GLM_REVISION = "61ba4e0b3309b6656edea3e93e419f7bd5c61957"
+
+
+def _model_revision(
+    options: dict[str, object],
+    *,
+    default: str | None = None,
+) -> str | None:
+    revision = options.pop("revision", default)
+    if revision is None:
+        return None
+    if not isinstance(revision, str) or not revision.strip() or len(revision) > 200:
+        raise ValueError("revision must be a non-empty string of at most 200 characters")
+    return revision.strip()
+
 
 def _pipeline_device(requested: str):
     requested = requested.lower()
@@ -20,6 +38,7 @@ def _pipeline_device(requested: str):
 
 class TransformersWhisperBackend:
     name = "transformers-whisper"
+    session_hints = True
     capabilities = BackendCapabilities(
         streaming=False,
         word_timestamps=True,
@@ -38,16 +57,29 @@ class TransformersWhisperBackend:
         except Exception as error:
             raise RuntimeError(f"Transformers dependency failed to initialize: {error}") from error
         options = dict(config.extra or {})
+        model_id = config.model or _DEFAULT_WHISPER_MODEL
+        self.model_revision = _model_revision(
+            options,
+            default=(
+                _DEFAULT_WHISPER_REVISION
+                if model_id == _DEFAULT_WHISPER_MODEL
+                else None
+            ),
+        )
         self.language = config.language
         self.hints = config.hints
         if config.compute_type:
             options.setdefault("dtype", config.compute_type)
         self.pipe = pipeline(
             "automatic-speech-recognition",
-            model=config.model or "openai/whisper-small",
+            model=model_id,
             device=_pipeline_device(config.device),
+            revision=self.model_revision,
             **options,
         )
+
+    def set_hints(self, hints) -> None:
+        self.hints = hints
 
     def transcribe(self, chunks: Iterable[AudioChunk]) -> Iterable[Hypothesis]:
         data, sample_rate, channels, offset = collect_pcm(chunks)
@@ -86,6 +118,7 @@ class TransformersWhisperBackend:
 
 class GlmAsrBackend:
     name = "glm-asr"
+    session_hints = True
     capabilities = BackendCapabilities(
         streaming=False,
         word_timestamps=False,
@@ -104,9 +137,20 @@ class GlmAsrBackend:
             raise RuntimeError(f"Transformers dependency failed to initialize: {error}") from error
         except Exception as error:
             raise RuntimeError(f"Transformers dependency failed to initialize: {error}") from error
-        model_id = config.model or "zai-org/GLM-ASR-Nano-2512"
-        self.processor = AutoProcessor.from_pretrained(model_id)
+        model_id = config.model or _DEFAULT_GLM_MODEL
         kwargs = dict(config.extra or {})
+        self.model_revision = _model_revision(
+            kwargs,
+            default=_DEFAULT_GLM_REVISION if model_id == _DEFAULT_GLM_MODEL else None,
+        )
+        processor_options: dict[str, object] = {"revision": self.model_revision}
+        if "local_files_only" in kwargs:
+            processor_options["local_files_only"] = kwargs["local_files_only"]
+        # Built-in defaults are immutable; release-gate checks custom revisions.
+        self.processor = AutoProcessor.from_pretrained(  # nosec B615
+            model_id,
+            **processor_options,
+        )
         model_device = config.device
         if model_device.startswith("rocm"):
             model_device = model_device.replace("rocm", "cuda", 1)
@@ -116,13 +160,22 @@ class GlmAsrBackend:
             "dtype",
             config.compute_type or ("float16" if model_device.startswith(("cuda", "mps")) else "auto"),
         )
-        self.model = AutoModelForSeq2SeqLM.from_pretrained(model_id, **kwargs)
+        # Keep processor and model on the exact same operator-selected snapshot.
+        self.model = AutoModelForSeq2SeqLM.from_pretrained(  # nosec B615
+            model_id,
+            revision=self.model_revision,
+            **kwargs,
+        )
         if model_device != "auto":
             self.model = self.model.to(model_device)
         self.model.eval()
         self.language = config.language
         self.hints = config.hints
         self.prompt = glm_transcription_prompt(config.hints)
+
+    def set_hints(self, hints) -> None:
+        self.hints = hints
+        self.prompt = glm_transcription_prompt(hints)
 
     def transcribe(self, chunks: Iterable[AudioChunk]) -> Iterable[Hypothesis]:
         data, sample_rate, channels, offset = collect_pcm(chunks)

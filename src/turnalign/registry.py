@@ -3,6 +3,7 @@ from __future__ import annotations
 from importlib.metadata import entry_points
 from typing import Any
 
+from .hints import AsrHints
 from .plugins import AsrConfig
 
 ENTRY_POINT_GROUPS = {
@@ -71,16 +72,33 @@ def available(kind: str) -> list[str]:
     return sorted(names)
 
 
-def create_asr(name: str, config: AsrConfig):
-    implementation = load("asr", name)
+def _validate_hints(name: str, implementation, hints: AsrHints) -> None:
     capabilities = getattr(implementation, "capabilities", None)
     if capabilities is not None:
-        if config.hints.hotwords and not capabilities.hotwords:
+        if hints.hotwords and not capabilities.hotwords:
             raise ValueError(f"ASR backend {name!r} does not support hotwords")
-        if config.hints.context and not capabilities.context_prompt:
+        if hints.context and not capabilities.context_prompt:
             raise ValueError(f"ASR backend {name!r} does not support context prompts")
-        if config.hints.boost is not None and not capabilities.hotword_boost:
+        if hints.boost is not None and not capabilities.hotword_boost:
             raise ValueError(f"ASR backend {name!r} does not support numeric hotword boost")
+
+
+def supports_session_hints(name: str) -> bool:
+    """Return whether a backend can change hints without reloading its model."""
+    try:
+        implementation = load("asr", name)
+    except LookupError:
+        return False
+    return bool(getattr(implementation, "session_hints", False))
+
+
+def validate_asr_hints(name: str, hints: AsrHints, implementation=None) -> None:
+    _validate_hints(name, implementation or load("asr", name), hints)
+
+
+def create_asr(name: str, config: AsrConfig):
+    implementation = load("asr", name)
+    _validate_hints(name, implementation, config.hints)
     factory = getattr(implementation, "create", None)
     if callable(factory):
         return factory(config)

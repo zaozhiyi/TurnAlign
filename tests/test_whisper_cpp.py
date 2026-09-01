@@ -4,9 +4,10 @@ import unittest
 from array import array
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from turnalign.backends.whisper_cpp import WhisperCppBackend, _windows_creationflags
+from turnalign.hints import AsrHints
 from turnalign.models import AudioChunk
 from turnalign.plugins import Accelerator, AsrConfig
 
@@ -52,6 +53,7 @@ class WhisperCppConfigurationTests(unittest.TestCase):
                 {"threads": True},
                 {"threads": "2"},
                 {"flash_attention": "false"},
+                {"allow_prompt_argv": "true"},
                 {"arguments": ["--no-gpu"]},
             )
             for options in invalid:
@@ -61,13 +63,32 @@ class WhisperCppConfigurationTests(unittest.TestCase):
                 ):
                     WhisperCppBackend(self._config(root, extra=options))
 
+    def test_private_prompt_requires_explicit_process_argument_opt_in(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            hinted = self._config(
+                root,
+                hints=AsrHints(("PRIVATE_TERM",), context="topic"),
+            )
+            with self.assertRaisesRegex(ValueError, "process arguments"):
+                WhisperCppBackend(hinted)
+
+            allowed = self._config(
+                root,
+                hints=hinted.hints,
+                extra={"allow_prompt_argv": True},
+            )
+            backend = WhisperCppBackend(allowed)
+            self.assertEqual(backend.initial_prompt, "topic\nPRIVATE_TERM")
+            self.assertTrue(backend.allow_prompt_argv)
+
     def test_vulkan_command_maps_only_validated_options(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             backend = WhisperCppBackend(self._config(root))
             captured = {}
 
-            def fake_run(command, **options):
+            def fake_popen(command, **options):
                 captured["command"] = command
                 captured["options"] = options
                 output_base = Path(command[command.index("-of") + 1])
@@ -75,10 +96,13 @@ class WhisperCppConfigurationTests(unittest.TestCase):
                     json.dumps({"text": "ok", "transcription": []}),
                     encoding="utf-8",
                 )
-                return SimpleNamespace(returncode=0, stderr="")
+                return SimpleNamespace(
+                    returncode=0,
+                    communicate=lambda: ("", ""),
+                )
 
             pcm = array("h", [1000] * 1600).tobytes()
-            with patch("turnalign.backends.whisper_cpp.subprocess.run", side_effect=fake_run):
+            with patch("turnalign.backends.whisper_cpp.subprocess.Popen", side_effect=fake_popen):
                 result = list(backend.transcribe([AudioChunk(pcm, 0.0)]))
 
             command = captured["command"]
@@ -90,6 +114,47 @@ class WhisperCppConfigurationTests(unittest.TestCase):
                 captured["options"]["creationflags"], _windows_creationflags()
             )
             self.assertEqual(result[0].text, "ok")
+
+    def test_cancel_terminates_the_active_process(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend = WhisperCppBackend(self._config(Path(directory)))
+            process = Mock()
+            process.poll.return_value = None
+            backend._process = process
+
+            backend.cancel()
+
+            process.terminate.assert_called_once_with()
+
+    def test_cancel_escalation_kills_the_same_active_process(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend = WhisperCppBackend(self._config(Path(directory)))
+            process = Mock()
+            process.poll.return_value = None
+            backend._process = process
+
+            backend._kill_if_active(process)
+
+            process.kill.assert_called_once_with()
+
+    def test_cancel_during_audio_collection_prevents_process_start(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend = WhisperCppBackend(self._config(Path(directory)))
+            pcm = array("h", [1000] * 1600).tobytes()
+
+            def collect_then_cancel(_chunks):
+                backend.cancel()
+                return pcm, 16_000, 1, 0.0
+
+            with (
+                patch(
+                    "turnalign.backends.whisper_cpp.collect_pcm",
+                    side_effect=collect_then_cancel,
+                ),
+                patch("turnalign.backends.whisper_cpp.subprocess.Popen") as popen,
+            ):
+                self.assertEqual(list(backend.transcribe([])), [])
+            popen.assert_not_called()
 
     def test_windows_runs_below_normal_when_the_platform_supports_it(self):
         if _windows_creationflags():

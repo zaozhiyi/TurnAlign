@@ -3,10 +3,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import os
 import re
+from contextlib import suppress
 from dataclasses import replace
+from itertools import chain
 from pathlib import Path
+from time import perf_counter
 
 from .audio import (
     AudioTimeline,
@@ -17,7 +21,7 @@ from .audio import (
 )
 from .backends.jsonl import JsonlBackend
 from .devices import runtime_report
-from .evaluation import evaluate_events
+from .evaluation import TextNormalization, evaluate_events, evaluate_quality_gate
 from .exporters import render_srt, render_text
 from .hints import AsrHints
 from .models import TranscriptEvent
@@ -28,9 +32,11 @@ from .policy import ServerPolicy
 from .profiles import PROFILE_NAMES, profile_catalog, select_execution_profile
 from .realtime import RealtimePipeline
 from .registry import available, create_asr, create_component
+from .release_gate import run_release_gate
 from .server import serve
 from .session import transcribe_events
 from .validation import EventStreamValidator
+from .websocket_gate import run_websocket_gate
 
 
 def replay(source: Path, output: Path | None) -> int:
@@ -97,23 +103,141 @@ def validate_events(source: Path) -> int:
     return 0
 
 
-def _read_events(source: Path) -> list[TranscriptEvent]:
+def _read_events(
+    source: Path,
+    *,
+    require_complete: bool = False,
+) -> list[TranscriptEvent]:
     events = []
+    validator = EventStreamValidator() if require_complete else None
     with source.open("r", encoding="utf-8-sig") as input_file:
         for line_number, line in enumerate(input_file, 1):
             if not line.strip():
                 continue
             try:
-                events.append(TranscriptEvent.from_dict(json.loads(line)))
+                event = TranscriptEvent.from_dict(json.loads(line))
+                if validator is not None:
+                    validator.accept(event)
+                events.append(event)
             except (TypeError, ValueError, json.JSONDecodeError) as error:
                 raise ValueError(f"{source}:{line_number}: {error}") from error
+    if validator is not None and not validator.ended:
+        raise ValueError(f"{source}: missing end event")
     return events
 
 
-def evaluate_files(reference: Path, hypothesis: Path) -> int:
-    report = evaluate_events(_read_events(reference), _read_events(hypothesis))
+def _text_normalization(args) -> TextNormalization:
+    return TextNormalization(
+        unicode_form=args.unicode_normalization,
+        case_sensitive=not args.ignore_case,
+        punctuation_sensitive=not args.ignore_punctuation,
+    )
+
+
+def evaluate_files(reference: Path, hypothesis: Path, args) -> int:
+    report = evaluate_events(
+        _read_events(reference),
+        _read_events(hypothesis),
+        text_normalization=_text_normalization(args),
+    )
     print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
     return 0
+
+
+def quality_gate_files(args) -> int:
+    report = evaluate_quality_gate(
+        _read_events(args.reference, require_complete=True),
+        _read_events(args.hypothesis, require_complete=True),
+        max_character_error_rate=args.max_cer,
+        max_word_error_rate=args.max_wer,
+        max_diarization_error_rate=args.max_diarization_error,
+        max_revision_updates_per_segment=args.max_revision_updates_per_segment,
+        min_reference_segments=args.min_reference_segments,
+        min_reference_characters=args.min_reference_characters,
+        min_reference_speech_seconds=args.min_reference_speech_seconds,
+        text_normalization=_text_normalization(args),
+    )
+    print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
+    return 0 if report.passed else 1
+
+
+def release_gate(args) -> int:
+    chunks = iter(file_chunks(args.source, args.chunk_ms, args.ffmpeg))
+    try:
+        first_chunk = next(chunks)
+    except StopIteration as error:
+        raise ValueError(f"{args.source}: audio input is empty") from error
+    chunks = chain((first_chunk,), chunks)
+
+    destination = None
+    if args.output is not None:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        destination = args.output.open("w", encoding="utf-8")
+
+    def write_event(event: TranscriptEvent) -> None:
+        if destination is not None:
+            destination.write(json.dumps(event.to_dict(), ensure_ascii=False) + "\n")
+            destination.flush()
+
+    try:
+        initialization_started = perf_counter()
+        backend = create_asr(args.backend, _config(args))
+        initialization_seconds = perf_counter() - initialization_started
+        report = run_release_gate(
+            chunks,
+            backend,
+            max_realtime_factor=args.max_realtime_factor,
+            max_first_partial_seconds=args.max_first_partial_seconds,
+            max_first_commit_seconds=args.max_first_commit_seconds,
+            max_initialization_seconds=args.max_initialization_seconds,
+            initialization_seconds=initialization_seconds,
+            min_audio_seconds=args.min_audio_seconds,
+            min_commits=args.min_commits,
+            require_partial=args.require_partial,
+            require_native_streaming=args.require_native_streaming,
+            require_immutable_model_revision=args.require_immutable_model_revision,
+            event_sink=write_event,
+        )
+    finally:
+        if destination is not None:
+            destination.close()
+    print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
+    return 0 if report.passed else 1
+
+
+def websocket_gate(args) -> int:
+    auth_token = None
+    if args.auth_token_env:
+        auth_token = os.environ.get(args.auth_token_env)
+        if not auth_token:
+            raise ValueError(
+                f"authentication token environment variable is empty: {args.auth_token_env}"
+            )
+    report = asyncio.run(run_websocket_gate(
+        args.uri,
+        sessions=args.sessions,
+        audio_seconds=args.audio_seconds,
+        sample_rate=args.sample_rate,
+        channels=args.channels,
+        frame_ms=args.frame_ms,
+        timeout=args.timeout,
+        min_commits=args.min_commits,
+        min_audio_acks=args.min_audio_acks,
+        max_dropped_partials=args.max_dropped_partials,
+        max_backpressure_pauses=args.max_backpressure_pauses,
+        max_ready_seconds=args.max_ready_seconds,
+        max_total_seconds=args.max_total_seconds,
+        realtime=args.realtime,
+        backend=args.backend,
+        model=args.model,
+        language=args.language,
+        compute_type=args.compute_type,
+        auth_token=auth_token,
+        verify_recovery=args.verify_recovery,
+        recovery_resume_timeout=args.recovery_resume_timeout,
+    ))
+    print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
+    return 0 if report.passed else 1
 
 
 def _effective_device(requested: str) -> str:
@@ -196,22 +320,23 @@ def _hints(args) -> AsrHints:
 
 
 def _write_events(events, output: Path | None, output_format: str = "jsonl") -> int:
-    if output_format != "jsonl":
-        rendered = (
-            render_srt(events)
-            if output_format == "srt"
-            else render_text(events)
-        )
+    destination = None
+    try:
+        if output_format != "jsonl":
+            rendered = (
+                render_srt(events)
+                if output_format == "srt"
+                else render_text(events)
+            )
+            if output:
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_text(rendered, encoding="utf-8")
+            else:
+                print(rendered, end="")
+            return 0
         if output:
             output.parent.mkdir(parents=True, exist_ok=True)
-            output.write_text(rendered, encoding="utf-8")
-        else:
-            print(rendered, end="")
-        return 0
-    if output:
-        output.parent.mkdir(parents=True, exist_ok=True)
-    destination = output.open("w", encoding="utf-8") if output else None
-    try:
+            destination = output.open("w", encoding="utf-8")
         for event in events:
             line = json.dumps(event.to_dict(), ensure_ascii=False)
             if destination:
@@ -223,6 +348,18 @@ def _write_events(events, output: Path | None, output_format: str = "jsonl") -> 
     finally:
         if destination:
             destination.close()
+        close = getattr(events, "close", None)
+        if callable(close):
+            close()
+
+
+def _close_resources(resources: list[object]) -> None:
+    """Best-effort cleanup for failures before a pipeline owns its resources."""
+    for resource in reversed(resources):
+        close = getattr(resource, "close", None)
+        if callable(close):
+            with suppress(Exception):
+                close()
 
 
 def transcribe_file(args) -> int:
@@ -233,47 +370,70 @@ def transcribe_file(args) -> int:
     explicit_device = args.device != "auto" or "TURNALIGN_DEVICE" in os.environ
     asr_device = _resolved_device(args.device) if explicit_device else profile.asr_device
     asr_config = _config(args, device=asr_device)
-    backend = create_asr(args.backend, asr_config)
-    vad_backend = None
-    if args.vad_backend != "none":
-        vad_options = _extra_options(args.vad_option)
-        if args.vad_backend == "energy":
-            vad_options.setdefault("min_silence_seconds", args.silence_seconds)
-            vad_options.setdefault("max_segment_seconds", args.max_utterance_seconds)
-        elif args.vad_backend == "fsmn-vad":
-            vad_options.setdefault("device", profile.vad_device)
-        vad_backend = create_component("vad", args.vad_backend, vad_options)
-    aligner_options = _extra_options(args.aligner_option)
-    diarizer_options = _extra_options(args.diarizer_option)
-    if args.aligner == "paraformer":
-        aligner_options.setdefault("device", profile.alignment_device)
-        aligner_options.setdefault("batch_size", profile.alignment_batch_size)
-    if args.diarizer == "campp":
-        diarizer_options.setdefault("device", profile.diarization_device)
-    aligner = create_component("alignment", args.aligner, aligner_options) if args.aligner else None
-    diarizer = create_component("diarization", args.diarizer, diarizer_options) if args.diarizer else None
-    parallel_diarization = bool(args.parallel_postprocess and diarizer is not None)
-    if args.parallel_postprocess is None and diarizer is not None:
-        parallel_diarization = profile.parallel_diarization
-    decoded = file_chunks(args.source, args.chunk_ms, args.ffmpeg)
-    recorded_timeline = AudioTimeline.from_chunks(decoded) if parallel_diarization else None
-    chunks = recorded_timeline.iter_chunks(args.chunk_ms) if recorded_timeline is not None else decoded
-    vad_output = args.vad_output
-    if vad_backend is not None and vad_output is None and args.output is not None:
-        vad_output = args.output.with_name(f"{args.output.stem}.vad.jsonl")
-    if vad_output is not None:
-        vad_output.parent.mkdir(parents=True, exist_ok=True)
-    audit_file = vad_output.open("w", encoding="utf-8") if vad_output is not None else None
-
-    def write_vad_audit(item: dict[str, object]) -> None:
-        if audit_file is None:
-            return
-        audit_file.write(json.dumps(item, ensure_ascii=False) + "\n")
-        audit_file.flush()
-
+    resources: list[object] = []
+    recorded_timeline = None
+    audit_file = None
+    resources_transferred = False
     try:
-        return _write_events(
-            transcribe_events(
+        backend = create_asr(args.backend, asr_config)
+        resources.append(backend)
+        vad_backend = None
+        if args.vad_backend != "none":
+            vad_options = _extra_options(args.vad_option)
+            if args.vad_backend == "energy":
+                vad_options.setdefault("min_silence_seconds", args.silence_seconds)
+                vad_options.setdefault("max_segment_seconds", args.max_utterance_seconds)
+            elif args.vad_backend == "fsmn-vad":
+                vad_options.setdefault("device", profile.vad_device)
+            vad_backend = create_component("vad", args.vad_backend, vad_options)
+            resources.append(vad_backend)
+        aligner_options = _extra_options(args.aligner_option)
+        diarizer_options = _extra_options(args.diarizer_option)
+        if args.aligner == "paraformer":
+            aligner_options.setdefault("device", profile.alignment_device)
+            aligner_options.setdefault("batch_size", profile.alignment_batch_size)
+        if args.diarizer == "campp":
+            diarizer_options.setdefault("device", profile.diarization_device)
+        aligner = (
+            create_component("alignment", args.aligner, aligner_options)
+            if args.aligner else None
+        )
+        if aligner is not None:
+            resources.append(aligner)
+        diarizer = (
+            create_component("diarization", args.diarizer, diarizer_options)
+            if args.diarizer else None
+        )
+        if diarizer is not None:
+            resources.append(diarizer)
+        parallel_diarization = bool(args.parallel_postprocess and diarizer is not None)
+        if args.parallel_postprocess is None and diarizer is not None:
+            parallel_diarization = profile.parallel_diarization
+        decoded = file_chunks(args.source, args.chunk_ms, args.ffmpeg)
+        recorded_timeline = (
+            AudioTimeline.from_chunks(decoded) if parallel_diarization else None
+        )
+        chunks = (
+            recorded_timeline.iter_chunks(args.chunk_ms)
+            if recorded_timeline is not None else decoded
+        )
+        vad_output = args.vad_output
+        if vad_backend is not None and vad_output is None and args.output is not None:
+            vad_output = args.output.with_name(f"{args.output.stem}.vad.jsonl")
+        if vad_output is not None:
+            vad_output.parent.mkdir(parents=True, exist_ok=True)
+            audit_file = vad_output.open("w", encoding="utf-8")
+
+        def write_vad_audit(item: dict[str, object]) -> None:
+            if audit_file is None:
+                return
+            audit_file.write(json.dumps(item, ensure_ascii=False) + "\n")
+            audit_file.flush()
+
+        def events():
+            nonlocal resources_transferred
+            resources_transferred = True
+            yield from transcribe_events(
                 chunks, backend, vad=vad_backend is not None,
                 vad_threshold=args.vad_threshold,
                 silence_seconds=args.silence_seconds,
@@ -286,7 +446,10 @@ def transcribe_file(args) -> int:
                 recorded_timeline=recorded_timeline,
                 parallel_diarization=parallel_diarization,
                 execution_profile=profile.name,
-            ),
+            )
+
+        return _write_events(
+            events(),
             args.output,
             args.output_format,
         )
@@ -295,65 +458,93 @@ def transcribe_file(args) -> int:
             audit_file.close()
         if recorded_timeline is not None:
             recorded_timeline.close()
+        if not resources_transferred:
+            _close_resources(resources)
 
 
 def listen(args) -> int:
     config = _config(args)
-    backend = create_asr(args.backend, config)
-    aligner = create_component("alignment", args.aligner, _extra_options(args.aligner_option)) if args.aligner else None
-    diarizer = create_component("diarization", args.diarizer, _extra_options(args.diarizer_option)) if args.diarizer else None
-    online_diarizer = create_component(
-        "online_diarization",
-        args.online_diarizer,
-        _extra_options(args.online_diarizer_option),
-    ) if args.online_diarizer else None
-    if args.warmup_file:
-        try:
-            list(backend.transcribe(file_chunks(args.warmup_file, args.chunk_ms, args.ffmpeg)))
-        except Exception:
-            backend.close()
-            raise
-    chunks = microphone_chunks(
-        device=_input_device(args.input_device),
-        sample_rate=args.sample_rate,
-        channels=1,
-        chunk_ms=args.chunk_ms,
-        duration=args.duration,
-    )
-    if args.refinement_backend:
-        refinement_backend = create_asr(
-            args.refinement_backend,
-            replace(config, model=args.refinement_model),
+    resources: list[object] = []
+    resources_transferred = False
+    try:
+        backend = create_asr(args.backend, config)
+        resources.append(backend)
+        aligner = (
+            create_component(
+                "alignment", args.aligner, _extra_options(args.aligner_option)
+            ) if args.aligner else None
         )
-        events = TwoPassPipeline(
-            RealtimePipeline(
+        if aligner is not None:
+            resources.append(aligner)
+        diarizer = (
+            create_component(
+                "diarization", args.diarizer, _extra_options(args.diarizer_option)
+            ) if args.diarizer else None
+        )
+        if diarizer is not None:
+            resources.append(diarizer)
+        online_diarizer = (
+            create_component(
+                "online_diarization",
+                args.online_diarizer,
+                _extra_options(args.online_diarizer_option),
+            ) if args.online_diarizer else None
+        )
+        if online_diarizer is not None:
+            resources.append(online_diarizer)
+        if args.warmup_file:
+            list(backend.transcribe(file_chunks(args.warmup_file, args.chunk_ms, args.ffmpeg)))
+        chunks = microphone_chunks(
+            device=_input_device(args.input_device),
+            sample_rate=args.sample_rate,
+            channels=1,
+            chunk_ms=args.chunk_ms,
+            duration=args.duration,
+        )
+        if args.refinement_backend:
+            refinement_backend = create_asr(
+                args.refinement_backend,
+                replace(config, model=args.refinement_model),
+            )
+            resources.append(refinement_backend)
+            pipeline_events = TwoPassPipeline(
+                RealtimePipeline(
+                    backend,
+                    vad_threshold=args.vad_threshold,
+                    silence_seconds=args.silence_seconds,
+                    max_utterance_seconds=args.max_utterance_seconds,
+                    partial_seconds=args.partial_seconds,
+                    online_diarizer=online_diarizer,
+                ),
+                OfflineRefinementPipeline(
+                    refinement_backend,
+                    aligner=aligner,
+                    diarizer=diarizer,
+                ),
+            ).events(chunks)
+        else:
+            pipeline_events = transcribe_events(
+                chunks,
                 backend,
+                live=True,
                 vad_threshold=args.vad_threshold,
                 silence_seconds=args.silence_seconds,
                 max_utterance_seconds=args.max_utterance_seconds,
                 partial_seconds=args.partial_seconds,
-                online_diarizer=online_diarizer,
-            ),
-            OfflineRefinementPipeline(
-                refinement_backend,
                 aligner=aligner,
                 diarizer=diarizer,
-            ),
-        ).events(chunks)
-    else:
-        events = transcribe_events(
-            chunks,
-            backend,
-            live=True,
-            vad_threshold=args.vad_threshold,
-            silence_seconds=args.silence_seconds,
-            max_utterance_seconds=args.max_utterance_seconds,
-            partial_seconds=args.partial_seconds,
-            aligner=aligner,
-            diarizer=diarizer,
-            online_diarizer=online_diarizer,
-        )
-    return _write_events(events, args.output, args.output_format)
+                online_diarizer=online_diarizer,
+            )
+
+        def events():
+            nonlocal resources_transferred
+            resources_transferred = True
+            yield from pipeline_events
+
+        return _write_events(events(), args.output, args.output_format)
+    finally:
+        if not resources_transferred:
+            _close_resources(resources)
 
 
 def _add_backend_arguments(parser: argparse.ArgumentParser) -> None:
@@ -427,6 +618,118 @@ def main() -> int:
     )
     evaluate_parser.add_argument("reference", type=Path)
     evaluate_parser.add_argument("hypothesis", type=Path)
+    quality_parser = commands.add_parser(
+        "quality-gate",
+        help="Enforce labelled transcript and speaker quality thresholds",
+    )
+    quality_parser.add_argument("reference", type=Path)
+    quality_parser.add_argument("hypothesis", type=Path)
+    quality_parser.add_argument("--max-cer", type=float)
+    quality_parser.add_argument("--max-wer", type=float)
+    quality_parser.add_argument("--max-diarization-error", type=float)
+    quality_parser.add_argument("--max-revision-updates-per-segment", type=float)
+    quality_parser.add_argument("--min-reference-segments", type=int, default=1)
+    quality_parser.add_argument("--min-reference-characters", type=int, default=1)
+    quality_parser.add_argument(
+        "--min-reference-speech-seconds",
+        type=float,
+        default=0.0,
+    )
+    for evaluation_parser in (evaluate_parser, quality_parser):
+        evaluation_parser.add_argument(
+            "--unicode-normalization",
+            choices=("none", "NFC", "NFKC"),
+            default="none",
+        )
+        evaluation_parser.add_argument("--ignore-case", action="store_true")
+        evaluation_parser.add_argument("--ignore-punctuation", action="store_true")
+    gate_parser = commands.add_parser(
+        "release-gate",
+        help="Run a real ASR backend against measurable release thresholds",
+    )
+    gate_parser.add_argument("source", type=Path)
+    gate_parser.add_argument("--output", type=Path, help="Optional event JSONL evidence")
+    gate_parser.add_argument("--chunk-ms", type=int, default=100)
+    gate_parser.add_argument("--ffmpeg", default="ffmpeg")
+    gate_parser.add_argument("--max-realtime-factor", type=float, default=1.0)
+    gate_parser.add_argument("--max-first-partial-seconds", type=float, default=3.0)
+    gate_parser.add_argument(
+        "--max-first-commit-seconds",
+        type=float,
+        help="Optional wall-clock ceiling from inference start to first commit",
+    )
+    gate_parser.add_argument("--max-initialization-seconds", type=float, default=120.0)
+    gate_parser.add_argument("--min-audio-seconds", type=float, default=10.0)
+    gate_parser.add_argument("--min-commits", type=int, default=1)
+    gate_parser.add_argument(
+        "--require-partial",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    gate_parser.add_argument(
+        "--require-native-streaming",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    gate_parser.add_argument(
+        "--require-immutable-model-revision",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Require the backend revision to be a 40- or 64-character commit hash",
+    )
+    _add_backend_arguments(gate_parser)
+    websocket_gate_parser = commands.add_parser(
+        "websocket-gate",
+        help="Run concurrent transport and lifecycle checks against a deployed server",
+    )
+    websocket_gate_parser.add_argument("uri")
+    websocket_gate_parser.add_argument("--sessions", type=int, default=4)
+    websocket_gate_parser.add_argument("--audio-seconds", type=float, default=5.0)
+    websocket_gate_parser.add_argument("--sample-rate", type=int, default=16_000)
+    websocket_gate_parser.add_argument("--channels", type=int, default=1)
+    websocket_gate_parser.add_argument("--frame-ms", type=int, default=100)
+    websocket_gate_parser.add_argument("--timeout", type=float, default=120.0)
+    websocket_gate_parser.add_argument("--min-commits", type=int, default=0)
+    websocket_gate_parser.add_argument("--min-audio-acks", type=int, default=1)
+    websocket_gate_parser.add_argument(
+        "--max-dropped-partials",
+        type=int,
+        default=0,
+        help="Maximum dropped partial events allowed per session",
+    )
+    websocket_gate_parser.add_argument(
+        "--max-backpressure-pauses",
+        type=int,
+        help="Optional maximum flow-control pauses allowed per session",
+    )
+    websocket_gate_parser.add_argument("--max-ready-seconds", type=float)
+    websocket_gate_parser.add_argument("--max-total-seconds", type=float)
+    websocket_gate_parser.add_argument(
+        "--realtime",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Pace generated silence in real time instead of sending a burst",
+    )
+    websocket_gate_parser.add_argument(
+        "--verify-recovery",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Inject one acknowledged disconnect and require successful resume",
+    )
+    websocket_gate_parser.add_argument(
+        "--recovery-resume-timeout",
+        type=float,
+        default=5.0,
+        help="Seconds allowed for a disconnected recovery session to become resumable",
+    )
+    websocket_gate_parser.add_argument("--backend")
+    websocket_gate_parser.add_argument("--model")
+    websocket_gate_parser.add_argument("--language")
+    websocket_gate_parser.add_argument("--compute-type")
+    websocket_gate_parser.add_argument(
+        "--auth-token-env",
+        help="Environment variable containing the start-message auth token",
+    )
     doctor_parser = commands.add_parser("doctor", help="Detect and select the local inference device")
     doctor_parser.add_argument(
         "--device",
@@ -503,10 +806,38 @@ def main() -> int:
     serve_parser = commands.add_parser("serve", help="Serve raw PCM transcription over WebSocket")
     serve_parser.add_argument("--host", default="127.0.0.1")
     serve_parser.add_argument("--port", type=int, default=8765)
+    serve_parser.add_argument(
+        "--log-level",
+        choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"),
+        default="INFO",
+        help="Server log level written to stderr",
+    )
     serve_parser.add_argument("--backend", default="transformers-whisper", choices=available("asr"))
     serve_parser.add_argument("--model")
     serve_parser.add_argument("--device", default="auto")
+    serve_parser.add_argument("--language")
+    serve_parser.add_argument("--compute-type")
+    serve_parser.add_argument("--executable", help="Default executable for command backends")
+    serve_parser.add_argument("--model-path", help="Default local model path")
+    serve_parser.add_argument(
+        "--backend-option",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Trusted server-side backend option; repeat as needed",
+    )
     serve_parser.add_argument("--warmup-file", type=Path)
+    serve_parser.add_argument(
+        "--preload",
+        action="store_true",
+        help="Load all default backend replicas before accepting connections",
+    )
+    serve_parser.add_argument(
+        "--require-immutable-model-revision",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Reject backends without an exact 40- or 64-character model commit",
+    )
     serve_parser.add_argument("--ffmpeg", default="ffmpeg")
     serve_parser.add_argument(
         "--allow-backend",
@@ -520,6 +851,18 @@ def main() -> int:
         action="append",
         default=[],
         help="Additional model identifier clients may request; repeat as needed",
+    )
+    serve_parser.add_argument(
+        "--allow-language",
+        action="append",
+        default=[],
+        help="Additional language clients may request; repeat as needed",
+    )
+    serve_parser.add_argument(
+        "--allow-compute-type",
+        action="append",
+        default=[],
+        help="Additional compute type clients may request; repeat as needed",
     )
     serve_parser.add_argument(
         "--allow-component",
@@ -538,15 +881,129 @@ def main() -> int:
         "--auth-token-env",
         help="Environment variable containing the required start-message auth token",
     )
+    serve_parser.add_argument(
+        "--allow-origin",
+        action="append",
+        default=[],
+        help="Exact browser Origin allowed to open WebSockets; repeat as needed",
+    )
     serve_parser.add_argument("--max-session-seconds", type=float, default=14_400.0)
     serve_parser.add_argument("--internal-chunk-ms", type=int, default=100)
+    serve_parser.add_argument(
+        "--max-control-message-bytes",
+        type=int,
+        default=64 * 1024,
+        help="Maximum UTF-8 size of start and later JSON control messages",
+    )
+    serve_parser.add_argument(
+        "--initialization-timeout",
+        type=float,
+        default=120.0,
+        help="Seconds allowed for model and component initialization",
+    )
+    serve_parser.add_argument(
+        "--worker-shutdown-timeout",
+        type=float,
+        default=5.0,
+        help="Seconds allowed for a cancelled inference worker to stop",
+    )
+    serve_parser.add_argument(
+        "--finalization-timeout",
+        type=float,
+        default=120.0,
+        help="Seconds allowed for final ASR and post-processing after end",
+    )
+    serve_parser.add_argument(
+        "--output-backpressure-timeout",
+        type=float,
+        default=5.0,
+        help="Seconds a durable output event may wait for a stalled client",
+    )
+    serve_parser.add_argument(
+        "--max-recovery-events",
+        type=int,
+        default=2_048,
+        help="Maximum replayable events retained per in-process recovery session",
+    )
+    serve_parser.add_argument(
+        "--max-recovery-event-kib",
+        type=int,
+        default=512,
+        help="Maximum serialized size of one recoverable WebSocket event in KiB",
+    )
+    serve_parser.add_argument(
+        "--max-recovery-events-mib",
+        type=int,
+        default=8,
+        help="Maximum serialized recovery-event data retained per session in MiB",
+    )
+    serve_parser.add_argument(
+        "--max-recovery-sessions",
+        type=int,
+        default=32,
+        help="Maximum active or resumable recovery sessions retained per process",
+    )
+    serve_parser.add_argument(
+        "--max-recovery-audio-mib",
+        type=int,
+        default=512,
+        help="Maximum temporary recovery audio per session in MiB",
+    )
+    serve_parser.add_argument(
+        "--max-recovery-total-mib",
+        type=int,
+        default=2_048,
+        help="Maximum temporary recovery audio retained by the process in MiB",
+    )
+    serve_parser.add_argument(
+        "--recovery-ttl-seconds",
+        type=float,
+        default=300.0,
+        help="Seconds an inactive recovery session remains resumable",
+    )
+    serve_parser.add_argument(
+        "--max-concurrent-sessions",
+        type=int,
+        default=32,
+        help="Maximum accepted WebSocket sessions per process",
+    )
+    serve_parser.add_argument(
+        "--start-timeout",
+        type=float,
+        default=10.0,
+        help="Seconds allowed for the first start message",
+    )
+    serve_parser.add_argument(
+        "--client-idle-timeout",
+        type=float,
+        default=60.0,
+        help="Seconds allowed between client audio or control frames",
+    )
+    serve_parser.add_argument(
+        "--shutdown-grace-timeout",
+        type=float,
+        default=30.0,
+        help="Seconds allowed for active handlers to stop after SIGTERM",
+    )
+    serve_parser.add_argument(
+        "--backend-replicas",
+        type=int,
+        default=1,
+        help="Loaded model instances allowed per backend configuration (1-8)",
+    )
     args = parser.parse_args()
     if args.command == "replay":
         return replay(args.source, args.output)
     if args.command == "validate-events":
         return validate_events(args.source)
     if args.command == "evaluate":
-        return evaluate_files(args.reference, args.hypothesis)
+        return evaluate_files(args.reference, args.hypothesis, args)
+    if args.command == "quality-gate":
+        return quality_gate_files(args)
+    if args.command == "release-gate":
+        return release_gate(args)
+    if args.command == "websocket-gate":
+        return websocket_gate(args)
     if args.command == "doctor":
         print(json.dumps(runtime_report(args.device), ensure_ascii=False, indent=2))
         return 0
@@ -586,6 +1043,10 @@ def main() -> int:
         except KeyboardInterrupt:
             return 130
     if args.command == "serve":
+        logging.basicConfig(
+            level=getattr(logging, args.log_level),
+            format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        )
         auth_token = None
         if args.auth_token_env:
             auth_token = os.environ.get(args.auth_token_env)
@@ -598,6 +1059,12 @@ def main() -> int:
             allowed_models=frozenset(
                 model for model in [args.model, *args.allow_model] if model
             ),
+            allowed_languages=frozenset(
+                language for language in [args.language, *args.allow_language] if language
+            ),
+            allowed_compute_types=frozenset(
+                value for value in [args.compute_type, *args.allow_compute_type] if value
+            ),
             allowed_components=frozenset(args.allow_component),
             allow_client_paths=args.allow_client_paths,
             allow_component_options=args.allow_component_options,
@@ -605,12 +1072,41 @@ def main() -> int:
             auth_token=auth_token,
             max_session_seconds=args.max_session_seconds,
         )
-        asyncio.run(serve(
+        try:
+            asyncio.run(serve(
             args.host, args.port, default_backend=args.backend,
             default_model=args.model, default_device=_resolved_device(args.device),
-            warmup_file=args.warmup_file, ffmpeg=args.ffmpeg,
-            policy=policy, internal_chunk_ms=args.internal_chunk_ms,
-        ))
+            default_language=args.language, default_compute_type=args.compute_type,
+                default_executable=args.executable,
+                default_model_path=args.model_path,
+                default_backend_options=_extra_options(args.backend_option),
+                warmup_file=args.warmup_file, ffmpeg=args.ffmpeg,
+                policy=policy, internal_chunk_ms=args.internal_chunk_ms,
+                max_control_message_bytes=args.max_control_message_bytes,
+                initialization_timeout=args.initialization_timeout,
+                finalization_timeout=args.finalization_timeout,
+                worker_shutdown_timeout=args.worker_shutdown_timeout,
+                output_backpressure_timeout=args.output_backpressure_timeout,
+                max_recovery_events=args.max_recovery_events,
+                max_recovery_event_bytes=args.max_recovery_event_kib * 1024,
+                max_recovery_event_bytes_per_session=(
+                    args.max_recovery_events_mib * 1024 * 1024
+                ),
+                max_recovery_sessions=args.max_recovery_sessions,
+                max_recovery_audio_bytes=args.max_recovery_audio_mib * 1024 * 1024,
+                max_recovery_total_bytes=args.max_recovery_total_mib * 1024 * 1024,
+                recovery_ttl_seconds=args.recovery_ttl_seconds,
+                max_concurrent_sessions=args.max_concurrent_sessions,
+                start_timeout=args.start_timeout,
+                client_idle_timeout=args.client_idle_timeout,
+                shutdown_grace_timeout=args.shutdown_grace_timeout,
+                backend_replicas=args.backend_replicas,
+                preload=args.preload,
+                require_immutable_revision=args.require_immutable_model_revision,
+                allowed_origins=(None, *args.allow_origin),
+            ))
+        except KeyboardInterrupt:
+            return 130
         return 0
     return 2
 

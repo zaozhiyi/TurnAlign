@@ -1,6 +1,8 @@
 import unittest
 
-from turnalign.policy import ServerPolicy
+from turnalign.model_pool import BackendPoolCapacityError
+from turnalign.policy import ServerBusyError, ServerPolicy
+from turnalign.recovery import RecoveryCapacityError, RecoveryConflictError
 
 
 class ServerPolicyTests(unittest.TestCase):
@@ -12,7 +14,7 @@ class ServerPolicyTests(unittest.TestCase):
                 default_backend="funasr",
                 default_model="approved-model",
             ),
-            ("funasr", "approved-model"),
+            ("funasr", "approved-model", None, None),
         )
         with self.assertRaisesRegex(ValueError, "backend"):
             policy.validate_start(
@@ -52,12 +54,58 @@ class ServerPolicyTests(unittest.TestCase):
                 default_model=None,
             )
 
+    def test_language_and_compute_variations_require_allowlisting(self):
+        policy = ServerPolicy(
+            allowed_backends=frozenset({"fake"}),
+            allowed_languages=frozenset({"en"}),
+            allowed_compute_types=frozenset({"int8"}),
+        )
+        self.assertEqual(
+            policy.validate_start(
+                {"language": "zh", "compute_type": "float16"},
+                default_backend="fake",
+                default_model=None,
+                default_language="zh",
+                default_compute_type="float16",
+            ),
+            ("fake", None, "zh", "float16"),
+        )
+        self.assertEqual(
+            policy.validate_start(
+                {"language": "en", "compute_type": "int8"},
+                default_backend="fake",
+                default_model=None,
+                default_language="zh",
+                default_compute_type="float16",
+            ),
+            ("fake", None, "en", "int8"),
+        )
+        with self.assertRaisesRegex(ValueError, "language"):
+            policy.validate_start(
+                {"language": "fr"},
+                default_backend="fake",
+                default_model=None,
+                default_language="zh",
+            )
+        with self.assertRaisesRegex(ValueError, "compute"):
+            policy.validate_start(
+                {"compute_type": "float32"},
+                default_backend="fake",
+                default_model=None,
+                default_compute_type="float16",
+            )
+
     def test_remote_bind_requires_explicit_opt_in(self):
         policy = ServerPolicy.defaults("fake")
         policy.validate_bind("127.0.0.1")
         policy.validate_bind("::1")
         with self.assertRaisesRegex(ValueError, "allow_remote"):
             policy.validate_bind("0.0.0.0")
+
+    def test_session_limit_must_be_finite_and_positive(self):
+        for value in (0, -1, float("nan"), float("inf")):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                ServerPolicy(max_session_seconds=value)
 
     def test_authentication_uses_public_generic_error(self):
         policy = ServerPolicy(
@@ -74,6 +122,20 @@ class ServerPolicyTests(unittest.TestCase):
         payload = policy.public_error(RuntimeError("failed at /Users/private/model.bin"))
         self.assertEqual(payload["code"], "session_error")
         self.assertNotIn("/Users/private", payload["message"])
+
+    def test_capacity_and_timeout_errors_have_actionable_public_codes(self):
+        policy = ServerPolicy()
+        self.assertEqual(policy.public_error(ServerBusyError())["code"], "server_busy")
+        self.assertEqual(
+            policy.public_error(BackendPoolCapacityError())["code"],
+            "server_busy",
+        )
+        self.assertEqual(policy.public_error(RecoveryCapacityError())["code"], "server_busy")
+        self.assertEqual(
+            policy.public_error(RecoveryConflictError())["code"],
+            "session_conflict",
+        )
+        self.assertEqual(policy.public_error(TimeoutError())["code"], "timeout")
 
 
 if __name__ == "__main__":

@@ -2,8 +2,16 @@ from __future__ import annotations
 
 import hmac
 import ipaddress
+import math
 from dataclasses import dataclass, field
 from typing import Any
+
+from .model_pool import BackendPoolCapacityError
+from .recovery import RecoveryCapacityError, RecoveryConflictError
+
+
+class ServerBusyError(RuntimeError):
+    pass
 
 
 def _is_loopback(host: str) -> bool:
@@ -21,6 +29,8 @@ class ServerPolicy:
 
     allowed_backends: frozenset[str] = field(default_factory=frozenset)
     allowed_models: frozenset[str] = field(default_factory=frozenset)
+    allowed_languages: frozenset[str] = field(default_factory=frozenset)
+    allowed_compute_types: frozenset[str] = field(default_factory=frozenset)
     allowed_components: frozenset[str] = field(default_factory=frozenset)
     allow_client_paths: bool = False
     allow_component_options: bool = False
@@ -30,8 +40,8 @@ class ServerPolicy:
     redact_errors: bool = True
 
     def __post_init__(self) -> None:
-        if self.max_session_seconds <= 0:
-            raise ValueError("max_session_seconds must be positive")
+        if not math.isfinite(self.max_session_seconds) or self.max_session_seconds <= 0:
+            raise ValueError("max_session_seconds must be finite and positive")
 
     @classmethod
     def defaults(cls, backend: str, model: str | None = None) -> ServerPolicy:
@@ -50,7 +60,9 @@ class ServerPolicy:
         *,
         default_backend: str,
         default_model: str | None,
-    ) -> tuple[str, str | None]:
+        default_language: str | None = None,
+        default_compute_type: str | None = None,
+    ) -> tuple[str, str | None, str | None, str | None]:
         if self.auth_token is not None:
             supplied = request.get("auth")
             if not isinstance(supplied, str) or not hmac.compare_digest(supplied, self.auth_token):
@@ -64,6 +76,20 @@ class ServerPolicy:
         model = str(model_value) if model_value else default_model
         if model != default_model and (model is None or model not in self.allowed_models):
             raise ValueError("requested model is not allowed by server policy")
+
+        language_value = request.get("language")
+        language = str(language_value) if language_value else default_language
+        if language != default_language and (
+            language is None or language not in self.allowed_languages
+        ):
+            raise ValueError("requested language is not allowed by server policy")
+
+        compute_value = request.get("compute_type")
+        compute_type = str(compute_value) if compute_value else default_compute_type
+        if compute_type != default_compute_type and (
+            compute_type is None or compute_type not in self.allowed_compute_types
+        ):
+            raise ValueError("requested compute type is not allowed by server policy")
 
         if not self.allow_client_paths:
             forbidden = [key for key in ("executable", "model_path") if request.get(key)]
@@ -93,11 +119,33 @@ class ServerPolicy:
                 raise ValueError(f"{key} must be a JSON object")
             if value and not self.allow_component_options:
                 raise ValueError("client-controlled component options are disabled")
-        return backend, model
+        return backend, model, language, compute_type
 
-    def public_error(self, error: BaseException) -> dict[str, str]:
+    def public_error(self, error: BaseException) -> dict[str, object]:
         if isinstance(error, PermissionError):
             return {"type": "error", "code": "unauthorized", "message": "authentication failed"}
+        if isinstance(error, (
+            ServerBusyError,
+            BackendPoolCapacityError,
+            RecoveryCapacityError,
+        )):
+            return {
+                "type": "error",
+                "code": "server_busy",
+                "message": "server session capacity reached; retry later",
+            }
+        if isinstance(error, RecoveryConflictError):
+            return {
+                "type": "error",
+                "code": "session_conflict",
+                "message": "recovery session is still active; retry later",
+            }
+        if isinstance(error, TimeoutError):
+            return {
+                "type": "error",
+                "code": "timeout",
+                "message": "session timed out",
+            }
         if not self.redact_errors:
             return {"type": "error", "code": "session_error", "message": str(error)}
         if isinstance(error, (TypeError, ValueError, KeyError, LookupError)):

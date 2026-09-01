@@ -85,7 +85,7 @@ turnalign transcribe audio.mp3 --backend glm-asr \
 | `transformers-whisper` | Whisper initial prompt | 支持 |
 | `faster-whisper` | 原生 `hotwords` | 支持，通过 `initial_prompt` |
 | `funasr` | 原生 `hotword` | 不支持 |
-| `whisper-cpp` | `--prompt` | 支持 |
+| `whisper-cpp` | `--prompt` | 默认禁用；接受本机进程列表泄露风险后，显式设置 `--backend-option allow_prompt_argv=true` |
 
 实际词表和上下文不会复制到 TurnAlign 事件或 WebSocket ready 消息；只记录使用方式、词条数量和是否使用上下文。不支持的组合会在加载模型权重前失败，不会静默忽略。
 
@@ -137,8 +137,9 @@ turnalign transcribe audio.mp3 --backend glm-asr \
 - 说话人结果没有人工标注真值，暂时无法给出可靠的 DER。
 - 很短的应答、抢话和重叠语音仍可能分到相邻说话人。
 - 在线说话人会话接口已经存在，但仓库尚未内置经过人工 DER 验证的在线说话人模型；CAM++ 仍用于离线全局修正。
-- WebSocket v1 可在同一服务进程内按 `session_id` 断线续传并重放未确认事件；跨进程恢复仍需客户端保留源音频。
-- 公共音频时间线和对齐切片已磁盘化并有界分批；当前 FSMN-VAD/CAM++ 上游离线 API 仍会为模型生成完整浮点输入。
+- WebSocket v1 可在同一服务进程内按 `session_id` 断线续传，并在有界事件窗口内重放未确认事件；确认点过旧或跨进程恢复仍需客户端保留源音频。
+- 公共音频时间线和对齐切片已磁盘化并有界分批；当前 FSMN-VAD/CAM++ 上游离线 API 仍会为模型生成完整浮点输入，因此默认拒绝超过 3 小时的单次输入。可用 `--vad-option max_materialized_seconds=...` 或 `--diarizer-option max_materialized_seconds=...` 显式调整，但应先按部署内存容量测算。
+- whisper.cpp 官方 CLI 只接受命令行 `--prompt`；TurnAlign 因此默认拒绝向该后端传递私有热词或上下文。只有能接受同机用户通过进程列表读取提示词的部署，才应显式设置 `--backend-option allow_prompt_argv=true`。
 - GLM 正文按 30 秒窗口与 Paraformer 时间轴对齐，边界属于近似结果。
 - Vulkan 的设备稳定性取决于具体可执行包、驱动和 GPU；本机核显短样本可运行不代表质量合格，固定 v1.8.4 包的 RX 7650 GRE 路径未通过。
 
@@ -171,14 +172,36 @@ turnalign listen --backend transformers-whisper --model openai/whisper-small --l
 turnalign listen --backend funasr-streaming --model paraformer-zh-streaming --language zh
 turnalign listen --backend funasr-streaming --refinement-backend funasr \
   --refinement-model paraformer-zh --aligner paraformer --diarizer campp
+turnalign release-gate sample-30s.wav --backend funasr-streaming \
+  --model paraformer-zh-streaming --device cpu --output release-events.jsonl \
+  --max-initialization-seconds 120 --max-first-partial-seconds 3 \
+  --max-first-commit-seconds "$MAX_FIRST_COMMIT_SECONDS" \
+  --require-immutable-model-revision \
+  --max-realtime-factor 1
+turnalign quality-gate reference.jsonl release-events.jsonl \
+  --max-cer "$MAX_CER" --min-reference-speech-seconds "$MIN_LABELLED_SECONDS"
 turnalign audio-devices
 turnalign record sample.wav --duration 10
-turnalign serve --backend glm-asr --device auto
+turnalign serve --backend glm-asr --device auto --language zh
 # 非本机部署必须显式 --allow-remote，并建议配置反向代理 TLS 与认证：
 TURNALIGN_AUTH_TOKEN=replace-me turnalign serve --backend glm-asr \
-  --allow-remote --auth-token-env TURNALIGN_AUTH_TOKEN
+  --language zh --allow-remote --auth-token-env TURNALIGN_AUTH_TOKEN --preload \
+  --require-immutable-model-revision --allow-origin https://app.example
+turnalign websocket-gate wss://asr.example/ws --sessions 8 \
+  --audio-seconds 60 --realtime --max-ready-seconds 10 \
+  --max-total-seconds 75 --min-audio-acks 600 \
+  --max-dropped-partials 0 --verify-recovery \
+  --auth-token-env TURNALIGN_AUTH_TOKEN
 python examples/websocket_file_client.py sample.wav --backend glm-asr --language zh
 ```
+
+`release-gate` 必须调用真实后端，而不是 mock。它会验证事件状态机、原生流式声明、首个 partial、可选的首次 commit 延迟、最少 commit 数、初始化时间和 RTF，并在任一门槛失败时返回非零退出码。默认要求至少 10 秒音频；应将 `--output` 生成的 JSONL 与命令输出一并保存为发布证据。准确率发布门禁使用人工标注 JSONL 执行 `turnalign quality-gate`：至少配置一项 CER、WER、说话人错误或修订稳定性上限，并按目标场景设定最小标注规模；任一条件失败时返回非零退出码。中文参考没有人工分词时应以 CER 为主。说话人指标是单活跃说话人区间分数，不等同于支持重叠语音与 collar 的标准 DER。阈值必须由实际产品容忍度和代表性语料得出，仓库不提供虚构的通用阈值。`turnalign evaluate` 仍可用于只生成指标、不阻断发布的分析。
+
+`websocket-gate` 使用生成的静音并发检查已部署服务的协议、流控、确认、完成率和延迟，不保存识别文本。默认要求每会话至少一个 ACK 且不允许丢弃 partial，可用 `--min-audio-acks`、`--max-dropped-partials` 和 `--max-backpressure-pauses` 收紧目标环境门槛。它只证明传输与生命周期，不证明识别质量；突发测试不加 `--realtime`，长稳测试则加上该参数。生产 TLS 应由反向代理或服务网格终止，门槛直接访问外部 `wss://` 地址。非浏览器客户默认允许；浏览器 Origin 默认拒绝，必须用 `--allow-origin` 精确放行。`GET /healthz` 和 `GET /readyz` 可用作存活/就绪探针。进程收到 `SIGTERM` 后会停止接入、关闭现有连接并在 `--shutdown-grace-timeout` 后强制取消未退出的处理器。恢复音频默认限制为每会话 512 MiB、每进程 2 GiB，完成后立即释放临时文件；断线会话的默认恢复窗口为 300 秒，超时由后台任务自动清理。相关上限均可通过 `serve --help` 调整。服务进程默认最多接受 32 个会话，但同一模型默认只有一个实例；需要进程内并行时显式设置 `--backend-replicas N`（最多 8，模型内存也近似乘以 N），或部署多个单副本进程。生产服务应加 `--preload`，在监听端口前加载全部副本；配合 `--warmup-file` 可在启动阶段执行真实推理。首次消息、客户端空闲、模型初始化、结束收尾和工作线程退出时间均有界，可通过 `turnalign serve --help` 调整。命令行后端的可执行文件、模型路径和参数可由运维侧通过 `--executable`、`--model-path` 和 `--backend-option KEY=VALUE` 固定，无需开放客户端路径权限。内置后端的私密热词按租约注入并在归还时清空，不同热词会话可复用同一大模型实例。
+
+内置 GLM-ASR、Transformers Whisper 和 Paraformer 别名现在固定到不可变提交。正式发布的 `release-gate` 和 `serve` 都应启用 `--require-immutable-model-revision`；服务会在预加载或首次创建后端时拒绝浮动版本。自定义 Hugging Face 模型用 `--backend-option revision=COMMIT_SHA`，自定义 FunASR 模型用 `--backend-option model_revision=COMMIT_SHA`。不提供提交版本元数据的后端应改用经过校验的本地模型制品，并且不要启用该门禁。
+
+文本比较默认严格区分大小写、标点和 Unicode 表示。只有标注规范明确要求时，才使用 `--unicode-normalization NFC|NFKC`、`--ignore-case` 或 `--ignore-punctuation`；实际策略会写入质量报告，避免预处理变化悄悄改变发布结论。
 
 源码运行：
 
@@ -192,6 +215,7 @@ python -m turnalign.cli replay `
 
 python -m turnalign.cli validate-events demo-events.jsonl
 python -m turnalign.cli evaluate reference.jsonl hypothesis.jsonl
+python -m turnalign.cli quality-gate reference.jsonl hypothesis.jsonl --max-cer "$MAX_CER"
 python -m unittest discover -s tests -v
 ```
 
@@ -290,7 +314,7 @@ turnalign transcribe audio.mp3 --backend glm-asr \
 | `transformers-whisper` | Whisper initial prompt | supported |
 | `faster-whisper` | native `hotwords` | supported through `initial_prompt` |
 | `funasr` | native `hotword` | unsupported |
-| `whisper-cpp` | `--prompt` | supported |
+| `whisper-cpp` | `--prompt` | disabled by default; explicitly set `--backend-option allow_prompt_argv=true` only after accepting local process-list exposure |
 
 TurnAlign events and WebSocket ready messages never copy the actual phrases or context. They report only the application method, phrase count, and whether context was used. Unsupported combinations fail before model weights are loaded instead of being silently ignored.
 
@@ -342,8 +366,9 @@ See [docs/validation.md](docs/validation.md) for the full run log and metrics.
 - The speaker output has no human-labelled reference, so a reliable DER is not available.
 - Very short responses, interruptions, and overlapping speech may be assigned to a neighbouring speaker.
 - The online diarization session contract is implemented, but the repository does not yet ship an online speaker model validated against human-labelled DER; CAM++ remains an offline refinement component.
-- WebSocket v1 resumes by `session_id` and replays unacknowledged events within the same server process; clients still retain source audio for cross-process recovery.
-- The common timeline and alignment slices are disk-backed and bounded in batches; current upstream FSMN-VAD/CAM++ offline APIs still materialize one full float input for the model.
+- WebSocket v1 resumes by `session_id` and replays unacknowledged events within a bounded in-process window; clients retain source audio for stale-window or cross-process recovery.
+- The common timeline and alignment slices are disk-backed and bounded in batches. Current upstream FSMN-VAD/CAM++ offline APIs still materialize one full float input, so TurnAlign rejects inputs longer than three hours by default. Override with `--vad-option max_materialized_seconds=...` or `--diarizer-option max_materialized_seconds=...` only after sizing deployment memory.
+- The official whisper.cpp CLI accepts prompts only through `--prompt`, so TurnAlign rejects private hints for this backend by default. Set `--backend-option allow_prompt_argv=true` only on deployments that accept prompt visibility in the local process list.
 - GLM text is aligned to the Paraformer timeline inside 30-second source windows, so speaker boundaries are approximate.
 - Vulkan device stability is specific to the executable build, driver, and GPU. A runnable integrated-GPU short sample is not a quality result, and the pinned v1.8.4 build did not pass on the RX 7650 GRE.
 
@@ -371,8 +396,101 @@ turnalign listen --backend transformers-whisper --model openai/whisper-small
 turnalign listen --backend funasr-streaming --model paraformer-zh-streaming
 turnalign listen --backend funasr-streaming --refinement-backend funasr \
   --refinement-model paraformer-zh --aligner paraformer --diarizer campp
-turnalign serve --backend glm-asr --device auto
+turnalign release-gate sample-30s.wav --backend funasr-streaming \
+  --model paraformer-zh-streaming --device cpu --output release-events.jsonl \
+  --max-initialization-seconds 120 --max-first-partial-seconds 3 \
+  --max-first-commit-seconds "$MAX_FIRST_COMMIT_SECONDS" \
+  --require-immutable-model-revision \
+  --max-realtime-factor 1
+turnalign quality-gate reference.jsonl release-events.jsonl \
+  --max-cer "$MAX_CER" --min-reference-speech-seconds "$MIN_LABELLED_SECONDS"
+turnalign serve --backend glm-asr --device auto --language zh
+turnalign websocket-gate wss://asr.example/ws --sessions 8 \
+  --audio-seconds 60 --realtime --max-ready-seconds 10 \
+  --max-total-seconds 75 --min-audio-acks 600 \
+  --max-dropped-partials 0 --verify-recovery \
+  --auth-token-env TURNALIGN_AUTH_TOKEN
 ```
+
+`release-gate` must invoke a real backend rather than a mock. It validates the
+event state machine, native-streaming declaration, first partial, optional
+first-commit latency, minimum commit count, initialization latency, and
+real-time factor, returning a non-zero exit
+code when any threshold fails. The default sample minimum is ten seconds. Keep
+the `--output` JSONL and command report as release evidence. Use
+`--require-immutable-model-revision` for both `release-gate` and `serve` in
+production; built-in model aliases use fixed commit hashes, while custom
+Hugging Face models accept
+`--backend-option revision=COMMIT_SHA` and custom FunASR models accept
+`--backend-option model_revision=COMMIT_SHA`. The server enforces this during
+preload or first backend creation. Backends without revision metadata must use
+a separately verified local model artifact and leave this gate disabled. Use
+`turnalign quality-gate` with human-labelled common-event JSONL for the accuracy
+release decision. Configure at least one CER, WER, speaker-error, or revision
+stability ceiling plus corpus-size minima derived from the actual product and
+target scenarios; any failure returns a non-zero exit code. Prefer CER for
+Mandarin references without word segmentation. The speaker score assumes one
+active speaker and is not an overlap/collar-aware standard DER. The repository
+does not invent universal acceptance values. Use `turnalign evaluate` when a
+non-blocking metric report is sufficient.
+
+Text comparison is strict by default. Enable `--unicode-normalization NFC|NFKC`,
+`--ignore-case`, or `--ignore-punctuation` only when the annotation policy calls
+for it. The selected policy is serialized in the quality report so preprocessing
+changes cannot silently move the release metric.
+
+`websocket-gate` uses generated silence to validate concurrent deployed-server
+protocol, flow control, acknowledgements, completion and latency without
+retaining transcript text. It is a transport/lifecycle gate, not an accuracy
+test. At least one acknowledgement and zero dropped partials are required by
+default; the acknowledgement, partial-drop and flow-pause limits are
+configurable. Run without `--realtime` for bursts and with it for a soak. TLS
+should terminate at a reverse proxy or service mesh, and the gate should target
+the public `wss://` endpoint. A server
+process accepts at most 32 sessions by default, but one model instance per
+configuration serializes same-model inference. Set `--backend-replicas N` (up
+to eight, with roughly N times model memory) or deploy multiple one-replica
+processes for parallel inference. Initial-message, client-idle,
+model-initialization, finalization and worker-shutdown time are bounded; see
+`serve --help`.
+Browser origins are rejected by default; add each trusted exact origin with
+`--allow-origin`. Non-browser clients without an Origin header remain accepted.
+`GET /healthz` and `GET /readyz` provide orchestration probes. `SIGTERM` stops
+admission, closes existing connections with a service-restart code, and bounds
+handler cleanup with `--shutdown-grace-timeout`.
+Recovery audio is bounded to 512 MiB per session and 2 GiB per process by
+default, and its temporary file is closed immediately when a session completes.
+See `serve --help` for the session, event, per-session audio, and total-audio
+limits.
+Inactive disconnected sessions expire after 300 seconds by default and are
+removed by a background sweeper; configure the resume window with
+`--recovery-ttl-seconds`.
+The server writes timestamped lifecycle logs to stderr at `INFO` by default;
+change verbosity with `--log-level`. Session logs include identifiers and
+transport counts, never transcript text or private hint values.
+Start and control JSON messages are limited to 64 KiB of UTF-8 by default even
+though larger binary PCM frames are supported; tune this separately with
+`--max-control-message-bytes`.
+Recoverable output events are limited to 512 KiB each and 8 MiB retained per
+session by default. The replay window evicts oldest events by both count and
+serialized byte size; an oversized backend result is rejected with a redacted
+session error rather than sent to the client.
+Use `--preload` to load all replicas before opening the listening socket;
+`--warmup-file` additionally runs inference during startup. Production images
+should pre-download and checksum weights instead of downloading on first boot.
+Trusted command-backend defaults can be supplied with `--executable`,
+`--model-path`, and repeated `--backend-option KEY=VALUE`; they do not require
+enabling client-controlled paths. Built-in backends apply private hints per
+lease, clear them on release, and reuse the heavy model across different hint
+sets.
+Add `--verify-recovery` to run one extra fault probe after the normal sessions.
+It disconnects only after audio is durably acknowledged on a zero-buffer
+boundary, retries transient `session_conflict` responses, resumes the same
+session, and requires continuous audio sequence numbers plus a terminal event.
+The report contains only counters and sequence metadata, never transcript text.
+Run the probe through the public load balancer. Since recovery is process-local,
+multi-instance deployments require session affinity for the configured recovery
+TTL; the probe will fail if reconnects reach another instance.
 
 Run from source:
 
@@ -380,6 +498,7 @@ Run from source:
 export PYTHONPATH="$PWD/src"
 python -m turnalign.cli doctor --device auto
 python -m turnalign.cli evaluate reference.jsonl hypothesis.jsonl
+python -m turnalign.cli quality-gate reference.jsonl hypothesis.jsonl --max-cer "$MAX_CER"
 python -m unittest discover -s tests -v
 ```
 

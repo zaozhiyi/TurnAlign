@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Iterable, Iterator
 from difflib import SequenceMatcher
 
 from ..audio import AudioTimeline
-from ..backends.common import collect_pcm, pcm_to_float32
+from ..backends.common import pcm_to_float32
 from ..models import AudioChunk, SpeakerTurn, SpeechSegment, Word
 
 
@@ -32,6 +33,41 @@ def _result_item(result) -> dict:
     return item if isinstance(item, dict) else {}
 
 
+def _materialization_limit(value: float) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError("max_materialized_seconds must be a number")
+    value = float(value)
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError("max_materialized_seconds must be finite and positive")
+    return value
+
+
+def _collect_pcm_bounded(
+    chunks: Iterable[AudioChunk],
+    *,
+    max_seconds: float,
+) -> tuple[bytes, int, int, float]:
+    data = bytearray()
+    sample_rate = 0
+    channels = 0
+    start = 0.0
+    for index, chunk in enumerate(chunks):
+        if index == 0:
+            sample_rate, channels, start = chunk.sample_rate, chunk.channels, chunk.start
+        elif (chunk.sample_rate, chunk.channels) != (sample_rate, channels):
+            raise ValueError("audio format changed during diarization")
+        maximum_bytes = round(max_seconds * sample_rate * channels * 2)
+        if len(data) + len(chunk.pcm_s16le) > maximum_bytes:
+            raise ValueError(
+                "CAM++ input exceeds max_materialized_seconds; split the recording "
+                "or explicitly raise the diarizer limit after sizing memory"
+            )
+        data.extend(chunk.pcm_s16le)
+    if not data:
+        return b"", 16_000, 1, 0.0
+    return bytes(data), sample_rate, channels, start
+
+
 class FsmnVadBackend:
     name = "fsmn-vad"
 
@@ -42,6 +78,7 @@ class FsmnVadBackend:
         device: str = "cpu",
         batch_size_s: int = 300,
         max_segment_seconds: float = 20.0,
+        max_materialized_seconds: float = 10_800.0,
         hub: str = "ms",
         disable_update: bool = True,
         **model_options,
@@ -56,6 +93,9 @@ class FsmnVadBackend:
         self.model_id = model
         self.batch_size_s = int(batch_size_s)
         self.max_segment_seconds = float(max_segment_seconds)
+        self.max_materialized_seconds = _materialization_limit(
+            max_materialized_seconds
+        )
 
     def segment(self, chunks: Iterable[AudioChunk]) -> Iterator[SpeechSegment]:
         with AudioTimeline.from_chunks(iter(chunks)) as timeline:
@@ -63,6 +103,11 @@ class FsmnVadBackend:
                 return
             if timeline.sample_rate != 16_000:
                 raise ValueError("FSMN-VAD expects 16 kHz audio")
+            if timeline.duration > self.max_materialized_seconds:
+                raise ValueError(
+                    "FSMN-VAD input exceeds max_materialized_seconds; split the "
+                    "recording or explicitly raise the VAD limit after sizing memory"
+                )
             full_audio = timeline.slice(timeline.start, timeline.end)
             result = self.model.generate(
                 input=pcm_to_float32(full_audio.pcm_s16le, timeline.channels),
@@ -154,8 +199,14 @@ def _aligned_words(
         while cursor < len(result_times) and result_times[cursor] is None:
             cursor += 1
         run_end = cursor
-        left = result_times[run_start - 1][1] if run_start else offset
-        right = result_times[run_end][0] if run_end < len(result_times) else absolute_end
+        left_anchor = result_times[run_start - 1] if run_start else None
+        right_anchor = result_times[run_end] if run_end < len(result_times) else None
+        if run_start and left_anchor is None:
+            raise RuntimeError("alignment interpolation lost its left anchor")
+        if run_end < len(result_times) and right_anchor is None:
+            raise RuntimeError("alignment interpolation lost its right anchor")
+        left = left_anchor[1] if left_anchor is not None else offset
+        right = right_anchor[0] if right_anchor is not None else absolute_end
         right = max(left, right)
         width = (right - left) / max(1, run_end - run_start)
         for index in range(run_start, run_end):
@@ -165,7 +216,8 @@ def _aligned_words(
     words: list[Word] = []
     previous_end = offset
     for unit, raw_time in zip(target, result_times):
-        assert raw_time is not None
+        if raw_time is None:
+            raise RuntimeError("alignment interpolation left an unresolved timestamp")
         start = max(previous_end, raw_time[0])
         end = max(start, raw_time[1])
         end = min(absolute_end, end)
@@ -251,6 +303,7 @@ class CamppDiarizationBackend:
         hub: str = "ms",
         disable_update: bool = True,
         merge_gap_seconds: float = 0.2,
+        max_materialized_seconds: float = 10_800.0,
         **model_options,
     ):
         AutoModel = _auto_model()
@@ -265,9 +318,15 @@ class CamppDiarizationBackend:
         )
         self.batch_size_s = int(batch_size_s)
         self.merge_gap_seconds = float(merge_gap_seconds)
+        self.max_materialized_seconds = _materialization_limit(
+            max_materialized_seconds
+        )
 
     def diarize(self, chunks: Iterable[AudioChunk]) -> Iterable[SpeakerTurn]:
-        data, sample_rate, channels, offset = collect_pcm(chunks)
+        data, sample_rate, channels, offset = _collect_pcm_bounded(
+            chunks,
+            max_seconds=self.max_materialized_seconds,
+        )
         if not data:
             return []
         if sample_rate != 16_000:

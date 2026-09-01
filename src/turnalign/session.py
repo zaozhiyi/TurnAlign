@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import logging
+import math
 from array import array
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Generator, Iterable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from threading import Event
 from time import perf_counter
@@ -23,6 +25,9 @@ from .plugins import (
     OnlineDiarizationBackend,
     VadBackend,
 )
+from .resources import close_resources
+
+LOGGER = logging.getLogger(__name__)
 from .stabilizer import LocalAgreement
 
 
@@ -43,7 +48,12 @@ def utterances(
     max_seconds: float = 20.0,
 ) -> Iterator[list[AudioChunk]]:
     """Simple dependency-free endpointing for batch ASR backends."""
-    if threshold < 0 or silence_seconds < 0 or max_seconds <= 0:
+    if (
+        not all(math.isfinite(value) for value in (threshold, silence_seconds, max_seconds))
+        or threshold < 0
+        or silence_seconds < 0
+        or max_seconds <= 0
+    ):
         raise ValueError("invalid utterance segmentation settings")
     active: list[AudioChunk] = []
     preroll: AudioChunk | None = None
@@ -85,8 +95,17 @@ def live_windows(
     partial_seconds: float = 2.0,
 ) -> Iterator[tuple[list[AudioChunk], bool]]:
     """Yield growing partial windows and final endpointed utterances."""
-    if partial_seconds <= 0:
-        raise ValueError("partial_seconds must be positive")
+    if (
+        not all(
+            math.isfinite(value)
+            for value in (threshold, silence_seconds, max_seconds, partial_seconds)
+        )
+        or threshold < 0
+        or silence_seconds < 0
+        or max_seconds <= 0
+        or partial_seconds <= 0
+    ):
+        raise ValueError("invalid live window segmentation settings")
     active: list[AudioChunk] = []
     preroll: AudioChunk | None = None
     silence = 0.0
@@ -170,7 +189,7 @@ def _speaker_from_words(words: list[Word]) -> str | None:
     for word in words:
         if word.speaker:
             totals[word.speaker] = totals.get(word.speaker, 0.0) + word.end - word.start
-    return max(totals, key=totals.get) if totals else None
+    return max(totals, key=totals.__getitem__) if totals else None
 
 
 def transcribe_events(
@@ -196,7 +215,7 @@ def transcribe_events(
     emit_end: bool = True,
     online_diarizer: OnlineDiarizationBackend | None = None,
     segment_index_start: int = 0,
-) -> Iterator[TranscriptEvent]:
+) -> Generator[TranscriptEvent, None, None]:
     """Run either a native-streaming backend or endpointed batch backend."""
     started = perf_counter()
     if segment_index_start < 0:
@@ -213,11 +232,26 @@ def transcribe_events(
     )
     timeline = recorded_timeline
     owns_timeline = False
-    if needs_recording and timeline is None:
-        timeline = AudioTimeline()
-        owns_timeline = True
-        for recorded_chunk in recorded_audio or []:
-            timeline.append(recorded_chunk)
+    try:
+        if needs_recording and timeline is None:
+            timeline = AudioTimeline()
+            owns_timeline = True
+            for recorded_chunk in recorded_audio or []:
+                timeline.append(recorded_chunk)
+    except BaseException:
+        close_resources(
+            (
+                timeline if owns_timeline else None,
+                online_diarizer,
+                backend if close_backend else None,
+                vad_backend,
+                aligner,
+                diarizer,
+            ),
+            logger=LOGGER,
+            reason="transcription setup failure",
+        )
+        raise
     record_from_source = needs_recording and recorded_audio is None and (
         recorded_timeline is None or recorded_timeline.chunk_count == 0
     )
@@ -230,7 +264,7 @@ def transcribe_events(
     alignment_seconds = 0.0
     diarization_executor: ThreadPoolExecutor | None = None
     diarization_future: Future[list[SpeakerTurn]] | None = None
-    online_session = online_diarizer.start_session() if online_diarizer is not None else None
+    online_session = None
     online_turns: list[SpeakerTurn] = []
 
     def observed_chunks() -> Iterator[AudioChunk]:
@@ -241,7 +275,8 @@ def transcribe_events(
             audio_seconds += chunk.duration
             input_end = max(input_end, chunk.start + chunk.duration)
             if record_from_source:
-                assert timeline is not None
+                if timeline is None:
+                    raise RuntimeError("recording timeline was not initialized")
                 timeline.append(chunk)
             if online_session is not None:
                 online_turns.extend(online_session.accept_audio(chunk))
@@ -266,18 +301,13 @@ def transcribe_events(
         nonlocal diarization_seconds
         if diarizer is None:
             return []
-        assert timeline is not None
+        if timeline is None:
+            raise RuntimeError("diarization timeline was not initialized")
         component_started = perf_counter()
         try:
             return list(diarizer.diarize(timeline.iter_chunks()))
         finally:
             diarization_seconds = perf_counter() - component_started
-
-    if parallel_diarization:
-        if diarizer is None or timeline is None or timeline.chunk_count == 0:
-            raise ValueError("parallel diarization requires a diarizer and preloaded audio timeline")
-        diarization_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="turnalign-diarizer")
-        diarization_future = diarization_executor.submit(run_diarizer)
 
     def audit_region(
         decision: str,
@@ -305,7 +335,8 @@ def transcribe_events(
 
     def audited_segments() -> Iterator[list[AudioChunk]]:
         nonlocal vad_speech_seconds, vad_regions, vad_forced_splits, vad_last_end
-        assert vad_backend is not None
+        if vad_backend is None:
+            raise RuntimeError("VAD backend was not initialized")
         for segment in vad_backend.segment(source):
             if segment.start < vad_last_end:
                 raise ValueError("VAD returned overlapping or out-of-order speech segments")
@@ -319,6 +350,18 @@ def transcribe_events(
         audit_region("silence", vad_last_end, input_end)
 
     try:
+        if online_diarizer is not None:
+            online_session = online_diarizer.start_session()
+        if parallel_diarization:
+            if diarizer is None or timeline is None or timeline.chunk_count == 0:
+                raise ValueError(
+                    "parallel diarization requires a diarizer and preloaded audio timeline"
+                )
+            diarization_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="turnalign-diarizer",
+            )
+            diarization_future = diarization_executor.submit(run_diarizer)
         if backend.capabilities.streaming:
             streaming_session = None
             start_session = getattr(backend, "start_session", None)
@@ -337,7 +380,11 @@ def transcribe_events(
                         yield from streaming_session.accept_audio(source_chunk)
                     yield from streaming_session.finish()
                 finally:
-                    streaming_session.close()
+                    close_resources(
+                        (streaming_session,),
+                        logger=LOGGER,
+                        reason="streaming session shutdown",
+                    )
 
             for hypothesis in streaming_hypotheses():
                 if cancel_event is not None and cancel_event.is_set():
@@ -365,16 +412,16 @@ def transcribe_events(
                 ):
                     if cancel_event is not None and cancel_event.is_set():
                         break
-                    hypothesis = _merge_hypotheses(backend.transcribe(group), final)
-                    if hypothesis is None:
+                    merged = _merge_hypotheses(backend.transcribe(group), final)
+                    if merged is None:
                         continue
-                    stabilized = agreement.update(hypothesis.text, final=final)
+                    stabilized = agreement.update(merged.text, final=final)
                     if final:
-                        hypothesis.text = stabilized.replace or agreement.committed
+                        merged.text = stabilized.replace or agreement.committed
                     else:
-                        hypothesis.text = agreement.committed + stabilized.partial
-                    hypothesis.metadata["stabilized"] = True
-                    event = decorate_online(_event(hypothesis, index, revision))
+                        merged.text = agreement.committed + stabilized.partial
+                    merged.metadata["stabilized"] = True
+                    event = decorate_online(_event(merged, index, revision))
                     last_end = max(last_end, event.end)
                     yield event
                     if final:
@@ -384,20 +431,21 @@ def transcribe_events(
                         agreement.reset()
                     else:
                         revision += 1
-            elif vad_backend is not None:
-                groups = audited_segments()
-            elif vad:
-                groups: Iterable[Iterable[AudioChunk]] = utterances(
-                    source,
-                    threshold=vad_threshold,
-                    silence_seconds=silence_seconds,
-                    max_seconds=max_utterance_seconds,
-                )
-            else:
-                groups = (source,)
             if not live:
-                for group in groups:
-                    for hypothesis in backend.transcribe(group):
+                groups: Iterable[Iterable[AudioChunk]]
+                if vad_backend is not None:
+                    groups = audited_segments()
+                elif vad:
+                    groups = utterances(
+                        source,
+                        threshold=vad_threshold,
+                        silence_seconds=silence_seconds,
+                        max_seconds=max_utterance_seconds,
+                    )
+                else:
+                    groups = (source,)
+                for batch_group in groups:
+                    for hypothesis in backend.transcribe(batch_group):
                         if not hypothesis.text:
                             continue
                         hypothesis.final = True
@@ -420,7 +468,8 @@ def transcribe_events(
         aligned_words: list[list[Word]] | None = None
         if aligner is not None:
             alignment_started = perf_counter()
-            assert timeline is not None
+            if timeline is None:
+                raise RuntimeError("alignment timeline was not initialized")
             align_many = getattr(aligner, "align_many", None)
             if callable(align_many):
                 aligned_words = []
@@ -489,6 +538,9 @@ def transcribe_events(
             "alignment_seconds": round(alignment_seconds, 3),
             "parallel_diarization": diarization_future is not None,
         }
+        model_revision = getattr(backend, "model_revision", None)
+        if isinstance(model_revision, str) and model_revision:
+            metadata["model_revision"] = model_revision
         if execution_profile is not None:
             metadata["execution_profile"] = execution_profile
         if vad_backend is not None:
@@ -510,16 +562,20 @@ def transcribe_events(
             )
     finally:
         if diarization_executor is not None:
-            diarization_executor.shutdown(wait=True, cancel_futures=True)
-        if owns_timeline and timeline is not None:
-            timeline.close()
-        if online_session is not None:
-            online_session.close()
-        if online_diarizer is not None:
-            online_diarizer.close()
-        if close_backend:
-            backend.close()
-        for component in (vad_backend, aligner, diarizer):
-            close = getattr(component, "close", None)
-            if callable(close):
-                close()
+            try:
+                diarization_executor.shutdown(wait=True, cancel_futures=True)
+            except Exception:
+                LOGGER.warning("diarization executor shutdown failed", exc_info=True)
+        close_resources(
+            (
+                timeline if owns_timeline else None,
+                online_session,
+                online_diarizer,
+                backend if close_backend else None,
+                vad_backend,
+                aligner,
+                diarizer,
+            ),
+            logger=LOGGER,
+            reason="transcription shutdown",
+        )
