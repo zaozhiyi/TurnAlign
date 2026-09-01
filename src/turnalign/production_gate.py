@@ -13,6 +13,7 @@ from urllib.parse import unquote, urlsplit
 
 _COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
 _MODEL_REVISION_PATTERN = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})")
+_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _MAX_REPORT_BYTES = 2 * 1024 * 1024
 _MAX_SBOM_BYTES = 16 * 1024 * 1024
 _MAX_LOCK_BYTES = 4 * 1024 * 1024
@@ -28,6 +29,9 @@ REQUIRED_ARTIFACT_KINDS = frozenset({
     "host-profile",
     "model",
     "nginx-config",
+    "quality-hypothesis",
+    "quality-reference",
+    "release-audio",
     "service-unit",
     "sbom",
     "wheel",
@@ -234,6 +238,16 @@ def _passed_report(name: str, report: dict[str, object], failures: list[str]) ->
         failures.append(f"{name} report contains failures")
 
 
+def _validate_report_source(
+    name: str,
+    report: dict[str, object],
+    source_commit: str,
+    failures: list[str],
+) -> None:
+    if report.get("source_commit") != source_commit:
+        failures.append(f"{name} report is not bound to source commit {source_commit}")
+
+
 def _validate_release(report: dict[str, object], failures: list[str]) -> None:
     _passed_report("release", report, failures)
     if report.get("require_native_streaming") is not True:
@@ -299,6 +313,9 @@ def _validate_quality(report: dict[str, object], failures: list[str]) -> None:
         failures.append("quality report has no positive reference character minimum")
     if not _positive_number(report.get("min_reference_speech_seconds")):
         failures.append("quality report has no positive labelled-speech minimum")
+    revision = report.get("model_revision")
+    if not isinstance(revision, str) or _MODEL_REVISION_PATTERN.fullmatch(revision) is None:
+        failures.append("quality report does not identify an immutable model revision")
     evaluation = report.get("evaluation")
     if not isinstance(evaluation, dict):
         failures.append("quality report has no evaluation evidence")
@@ -570,6 +587,7 @@ def run_production_gate(
     artifact_evidence = []
     kinds = set()
     artifact_paths: dict[str, list[Path]] = {}
+    artifact_digests: dict[str, list[str]] = {}
     for kind, path in artifacts:
         if kind not in REQUIRED_ARTIFACT_KINDS:
             raise ValueError(f"unsupported artifact kind: {kind}")
@@ -578,6 +596,7 @@ def run_production_gate(
         artifact_evidence.append(ArtifactEvidence(kind, path.name, digest, size))
         kinds.add(kind)
         artifact_paths.setdefault(kind, []).append(path)
+        artifact_digests.setdefault(kind, []).append(digest)
     for missing in sorted(REQUIRED_ARTIFACT_KINDS - kinds):
         failures.append(f"missing required artifact kind: {missing}")
     for kind in sorted(REQUIRED_ARTIFACT_KINDS - {"model"}):
@@ -601,6 +620,30 @@ def run_production_gate(
             failures.append(
                 f"SBOM does not match locked runtime requirement: {name}=={version}"
             )
+
+    for name, report in (
+        ("release", release),
+        ("quality", quality),
+        ("websocket", websocket),
+    ):
+        _validate_report_source(name, report, source_commit, failures)
+    if release.get("model_revision") != quality.get("model_revision"):
+        failures.append("quality and release reports identify different model revisions")
+    for report, field, kind, label in (
+        (release, "input_audio_sha256", "release-audio", "release audio"),
+        (quality, "reference_sha256", "quality-reference", "quality reference"),
+        (quality, "hypothesis_sha256", "quality-hypothesis", "quality hypothesis"),
+    ):
+        reported_digest = report.get(field)
+        if (
+            not isinstance(reported_digest, str)
+            or _SHA256_PATTERN.fullmatch(reported_digest) is None
+        ):
+            failures.append(f"{label} report digest is missing or invalid")
+        elif len(artifact_digests.get(kind, [])) == 1 and (
+            artifact_digests[kind][0] != reported_digest
+        ):
+            failures.append(f"{label} report digest does not match its artifact")
 
     return ProductionGateReport(
         schema_version=1,

@@ -15,6 +15,8 @@ from .validation import EventStreamValidator
 @dataclass(frozen=True, slots=True)
 class ReleaseGateReport:
     status: str
+    source_commit: str | None
+    input_audio_sha256: str | None
     backend: str
     native_streaming: bool
     model_revision: str | None
@@ -61,6 +63,8 @@ def run_release_gate(
     require_partial: bool = True,
     require_native_streaming: bool = True,
     require_immutable_model_revision: bool = False,
+    source_commit: str | None = None,
+    input_audio_sha256: str | None = None,
     event_sink: Callable[[TranscriptEvent], None] | None = None,
 ) -> ReleaseGateReport:
     """Run a real backend and turn release expectations into a pass/fail result."""
@@ -194,6 +198,8 @@ def run_release_gate(
 
     return ReleaseGateReport(
         status="failed" if failures else "passed",
+        source_commit=source_commit,
+        input_audio_sha256=input_audio_sha256,
         backend=backend.name,
         native_streaming=native_streaming,
         model_revision=revision,

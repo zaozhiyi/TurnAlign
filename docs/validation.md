@@ -21,7 +21,7 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   materialization limit before constructing the float model input.
 - All source and test modules pass `compileall`.
 - Ruff is enforced in CI and passes over `src` and `tests`.
-- The built wheel passes all 244 tests from site-packages on Python 3.10 with
+- The built wheel passes all 247 tests from site-packages on Python 3.10 with
   `websockets` 14.0 and on Python 3.12 with `websockets` 17.1. The Python 3.12
   run also passes under `python -O`, so production invariants do not depend on
   removable `assert` statements.
@@ -65,8 +65,10 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
 - All three executable gates can atomically persist their JSON verdict with
   `--report`. `turnalign production-gate` independently rechecks the critical
   thresholds, requires a public `wss://` concurrent recovery/soak result, and
-  binds the source commit plus seven required artifact classes and all reports by
-  SHA-256 into one final pass/fail record.
+  binds the source commit plus ten required artifact classes and all reports by
+  SHA-256 into one final pass/fail record. Each component gate must name the same
+  source commit; release-audio and labelled-quality input digests are checked
+  against retained artifacts, and release/quality model revisions must agree.
 - WebSocket processes now bound active sessions and time out clients that do
   not send the initial start message or become idle. Initialization, worker
   shutdown, output pressure and recovery-event retention are independently

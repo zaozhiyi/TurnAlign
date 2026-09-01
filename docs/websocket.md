@@ -310,7 +310,8 @@ turnalign websocket-gate wss://asr.example/ws --sessions 8 \
   --audio-seconds 60 --realtime --max-ready-seconds 10 \
   --max-total-seconds 75 --min-audio-acks 600 \
   --max-dropped-partials 0 --verify-recovery \
-  --auth-token-file /path/to/restricted/auth-token
+  --auth-token-file /path/to/restricted/auth-token \
+  --source-commit "$(git rev-parse HEAD)"
 ```
 
 The gate requires at least one audio acknowledgement per session and permits no

@@ -1,3 +1,4 @@
+import hashlib
 import json
 import tempfile
 import unittest
@@ -18,6 +19,10 @@ class ProductionGateTests(unittest.TestCase):
         websocket = root / "websocket.json"
         write_json_report(release, {
             "status": "passed",
+            "source_commit": "b" * 40,
+            "input_audio_sha256": hashlib.sha256(
+                b"immutable release-audio\n"
+            ).hexdigest(),
             "failures": [],
             "require_native_streaming": True,
             "native_streaming": True,
@@ -39,6 +44,14 @@ class ProductionGateTests(unittest.TestCase):
         })
         write_json_report(quality, {
             "status": "passed",
+            "source_commit": "b" * 40,
+            "reference_sha256": hashlib.sha256(
+                b"immutable quality-reference\n"
+            ).hexdigest(),
+            "hypothesis_sha256": hashlib.sha256(
+                b"immutable quality-hypothesis\n"
+            ).hexdigest(),
+            "model_revision": "a" * 40,
             "failures": [],
             "max_character_error_rate": 0.1,
             "max_word_error_rate": None,
@@ -59,6 +72,7 @@ class ProductionGateTests(unittest.TestCase):
         })
         write_json_report(websocket, {
             "status": "passed",
+            "source_commit": "b" * 40,
             "uri": "wss://asr.example.com/ws",
             "sessions": 8,
             "passed_sessions": 8,
@@ -211,6 +225,50 @@ class ProductionGateTests(unittest.TestCase):
                     source_commit="B" * 40,
                     artifacts=self._artifacts(root),
                 )
+
+    def test_rejects_stale_reports_and_mismatched_input_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, quality, websocket = self._reports(root)
+            release_payload = json.loads(release.read_text(encoding="utf-8"))
+            release_payload["source_commit"] = "c" * 40
+            release_payload["input_audio_sha256"] = "d" * 64
+            write_json_report(release, release_payload)
+
+            report = run_production_gate(
+                release,
+                quality,
+                websocket,
+                source_commit="b" * 40,
+                artifacts=self._artifacts(root),
+            )
+
+            self.assertFalse(report.passed)
+            failures = "\n".join(report.failures)
+            self.assertIn("release report is not bound to source commit", failures)
+            self.assertIn("release audio report digest does not match", failures)
+
+    def test_rejects_quality_evidence_from_a_different_model_revision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, quality, websocket = self._reports(root)
+            quality_payload = json.loads(quality.read_text(encoding="utf-8"))
+            quality_payload["model_revision"] = "c" * 40
+            write_json_report(quality, quality_payload)
+
+            report = run_production_gate(
+                release,
+                quality,
+                websocket,
+                source_commit="b" * 40,
+                artifacts=self._artifacts(root),
+            )
+
+            self.assertFalse(report.passed)
+            self.assertIn(
+                "quality and release reports identify different model revisions",
+                report.failures,
+            )
 
     def test_rejects_malformed_or_incomplete_sbom(self):
         with tempfile.TemporaryDirectory() as directory:

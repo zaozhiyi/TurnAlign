@@ -149,6 +149,29 @@ class EvaluationTests(unittest.TestCase):
             for item in failed.failures
         ))
 
+    def test_quality_gate_reports_one_immutable_hypothesis_model_revision(self):
+        revision = "a" * 40
+        reference = [TranscriptEvent("commit", "r", 1, 0, 1, "text")]
+        hypothesis = [
+            TranscriptEvent(
+                "commit",
+                "h",
+                1,
+                0,
+                1,
+                "text",
+                metadata={"model_revision": revision},
+            )
+        ]
+
+        report = evaluate_quality_gate(
+            reference,
+            hypothesis,
+            max_character_error_rate=0,
+        )
+
+        self.assertEqual(report.model_revision, revision)
+
     def test_quality_gate_rejects_meaningless_or_invalid_thresholds(self):
         event = [TranscriptEvent("commit", "s", 1, 0, 1, "text")]
         with self.assertRaisesRegex(ValueError, "at least one maximum metric"):

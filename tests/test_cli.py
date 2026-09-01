@@ -273,6 +273,7 @@ class CliIntegrationTests(unittest.TestCase):
                 "min_audio": args.min_audio_seconds,
                 "native": args.require_native_streaming,
                 "immutable_revision": args.require_immutable_model_revision,
+                "source_commit": args.source_commit,
             })
             return 0
 
@@ -291,6 +292,8 @@ class CliIntegrationTests(unittest.TestCase):
                 "--min-audio-seconds",
                 "30",
                 "--require-immutable-model-revision",
+                "--source-commit",
+                "a" * 40,
             ],
         ):
             self.assertEqual(cli.main(), 0)
@@ -301,6 +304,7 @@ class CliIntegrationTests(unittest.TestCase):
             "min_audio": 30.0,
             "native": True,
             "immutable_revision": True,
+            "source_commit": "a" * 40,
         })
 
     def test_release_gate_validates_audio_before_loading_backend(self):
@@ -684,13 +688,15 @@ class CliIntegrationTests(unittest.TestCase):
                 "turnalign", "quality-gate", str(reference), str(matching),
                 "--max-cer", "0", "--max-wer", "0",
                 "--min-reference-speech-seconds", "1",
+                "--source-commit", "a" * 40,
                 "--report", str(report_path),
             ]), patch("builtins.print"):
                 self.assertEqual(cli.main(), 0)
-            self.assertEqual(
-                json.loads(report_path.read_text(encoding="utf-8"))["status"],
-                "passed",
-            )
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(report["status"], "passed")
+            self.assertEqual(report["source_commit"], "a" * 40)
+            self.assertEqual(report["reference_sha256"], cli._sha256_file(reference))
+            self.assertEqual(report["hypothesis_sha256"], cli._sha256_file(matching))
             with patch("sys.argv", [
                 "turnalign", "quality-gate", str(reference), str(mismatching),
                 "--max-cer", "0.1",

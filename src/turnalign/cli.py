@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -45,6 +46,39 @@ from .validation import EventStreamValidator
 from .websocket_gate import run_websocket_gate
 
 _MAX_AUTH_TOKEN_BYTES = 8 * 1024
+_SOURCE_COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
+
+
+def _source_commit_argument(value: str) -> str:
+    if _SOURCE_COMMIT_PATTERN.fullmatch(value) is None:
+        raise argparse.ArgumentTypeError(
+            "source commit must be a lowercase 40-character Git commit"
+        )
+    return value
+
+
+def _sha256_file(path: Path) -> str:
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if not nofollow and path.is_symlink():
+        raise ValueError(f"evidence must be a regular non-symlink file: {path}")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ValueError(f"cannot securely open evidence file: {path}") from error
+    digest = hashlib.sha256()
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError(f"evidence must be a regular non-symlink file: {path}")
+        with os.fdopen(descriptor, "rb") as source:
+            descriptor = -1
+            for block in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(block)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    return digest.hexdigest()
 
 
 def _read_auth_token_file(path: Path) -> str:
@@ -224,6 +258,7 @@ def evaluate_files(reference: Path, hypothesis: Path, args) -> int:
 
 
 def quality_gate_files(args) -> int:
+    source_commit = getattr(args, "source_commit", None)
     report = evaluate_quality_gate(
         _read_events(args.reference, require_complete=True),
         _read_events(args.hypothesis, require_complete=True),
@@ -235,12 +270,23 @@ def quality_gate_files(args) -> int:
         min_reference_characters=args.min_reference_characters,
         min_reference_speech_seconds=args.min_reference_speech_seconds,
         text_normalization=_text_normalization(args),
+        source_commit=source_commit,
+        reference_sha256=(
+            _sha256_file(args.reference) if source_commit is not None else None
+        ),
+        hypothesis_sha256=(
+            _sha256_file(args.hypothesis) if source_commit is not None else None
+        ),
     )
     _emit_gate_report(report, getattr(args, "report", None))
     return 0 if report.passed else 1
 
 
 def release_gate(args) -> int:
+    source_commit = getattr(args, "source_commit", None)
+    input_audio_sha256 = (
+        _sha256_file(args.source) if source_commit is not None else None
+    )
     chunks = iter(file_chunks(args.source, args.chunk_ms, args.ffmpeg))
     try:
         first_chunk = next(chunks)
@@ -275,6 +321,8 @@ def release_gate(args) -> int:
             require_partial=args.require_partial,
             require_native_streaming=args.require_native_streaming,
             require_immutable_model_revision=args.require_immutable_model_revision,
+            source_commit=source_commit,
+            input_audio_sha256=input_audio_sha256,
             event_sink=write_event,
         )
     finally:
@@ -308,6 +356,7 @@ def websocket_gate(args) -> int:
         auth_token=auth_token,
         verify_recovery=args.verify_recovery,
         recovery_resume_timeout=args.recovery_resume_timeout,
+        source_commit=getattr(args, "source_commit", None),
     ))
     _emit_gate_report(report, getattr(args, "report", None))
     return 0 if report.passed else 1
@@ -710,6 +759,7 @@ def main() -> int:
     quality_parser.add_argument("reference", type=Path)
     quality_parser.add_argument("hypothesis", type=Path)
     quality_parser.add_argument("--report", type=Path, help="Persist the JSON gate report")
+    quality_parser.add_argument("--source-commit", type=_source_commit_argument)
     quality_parser.add_argument("--max-cer", type=float)
     quality_parser.add_argument("--max-wer", type=float)
     quality_parser.add_argument("--max-diarization-error", type=float)
@@ -736,6 +786,7 @@ def main() -> int:
     gate_parser.add_argument("source", type=Path)
     gate_parser.add_argument("--output", type=Path, help="Optional event JSONL evidence")
     gate_parser.add_argument("--report", type=Path, help="Persist the JSON gate report")
+    gate_parser.add_argument("--source-commit", type=_source_commit_argument)
     gate_parser.add_argument("--chunk-ms", type=int, default=100)
     gate_parser.add_argument("--ffmpeg", default="ffmpeg")
     gate_parser.add_argument("--max-realtime-factor", type=float, default=1.0)
@@ -771,6 +822,7 @@ def main() -> int:
     )
     websocket_gate_parser.add_argument("uri")
     websocket_gate_parser.add_argument("--report", type=Path, help="Persist the JSON gate report")
+    websocket_gate_parser.add_argument("--source-commit", type=_source_commit_argument)
     websocket_gate_parser.add_argument("--sessions", type=int, default=4)
     websocket_gate_parser.add_argument("--audio-seconds", type=float, default=5.0)
     websocket_gate_parser.add_argument("--sample-rate", type=int, default=16_000)
@@ -831,7 +883,9 @@ def main() -> int:
     production_gate_parser.add_argument("release_report", type=Path)
     production_gate_parser.add_argument("quality_report", type=Path)
     production_gate_parser.add_argument("websocket_report", type=Path)
-    production_gate_parser.add_argument("--source-commit", required=True)
+    production_gate_parser.add_argument(
+        "--source-commit", type=_source_commit_argument, required=True
+    )
     production_gate_parser.add_argument(
         "--artifact",
         action="append",

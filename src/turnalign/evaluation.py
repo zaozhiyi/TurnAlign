@@ -225,6 +225,10 @@ def evaluate_events(
 @dataclass(frozen=True, slots=True)
 class QualityGateReport:
     status: str
+    source_commit: str | None
+    reference_sha256: str | None
+    hypothesis_sha256: str | None
+    model_revision: str | None
     evaluation: EvaluationReport
     max_character_error_rate: float | None
     max_word_error_rate: float | None
@@ -255,6 +259,9 @@ def evaluate_quality_gate(
     min_reference_characters: int = 1,
     min_reference_speech_seconds: float = 0.0,
     text_normalization: TextNormalization | None = None,
+    source_commit: str | None = None,
+    reference_sha256: str | None = None,
+    hypothesis_sha256: str | None = None,
 ) -> QualityGateReport:
     maxima = {
         "max_character_error_rate": max_character_error_rate,
@@ -292,6 +299,15 @@ def evaluate_quality_gate(
         reference,
         hypothesis,
         text_normalization=text_normalization,
+    )
+    model_revisions = {
+        revision
+        for event in hypothesis
+        if isinstance((revision := event.metadata.get("model_revision")), str)
+        and revision
+    }
+    hypothesis_model_revision = (
+        next(iter(model_revisions)) if len(model_revisions) == 1 else None
     )
     failures: list[str] = []
     if evaluation.reference_segments < min_reference_segments:
@@ -338,6 +354,10 @@ def evaluate_quality_gate(
             )
     return QualityGateReport(
         status="passed" if not failures else "failed",
+        source_commit=source_commit,
+        reference_sha256=reference_sha256,
+        hypothesis_sha256=hypothesis_sha256,
+        model_revision=hypothesis_model_revision,
         evaluation=evaluation,
         max_character_error_rate=max_character_error_rate,
         max_word_error_rate=max_word_error_rate,

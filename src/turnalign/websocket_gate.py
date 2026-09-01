@@ -45,6 +45,7 @@ class WebSocketRecoveryResult:
 @dataclass(frozen=True, slots=True)
 class WebSocketGateReport:
     status: str
+    source_commit: str | None
     uri: str
     sessions: int
     passed_sessions: int
@@ -164,7 +165,7 @@ def _validate_uri(uri: str) -> None:
     if parsed.username or parsed.password or parsed.query or parsed.fragment:
         raise ValueError(
             "uri credentials, query strings and fragments are forbidden; "
-            "use --auth-token-env"
+            "use --auth-token-file or --auth-token-env"
         )
 
 
@@ -756,6 +757,7 @@ async def run_websocket_gate(
     auth_token: str | None = None,
     verify_recovery: bool = False,
     recovery_resume_timeout: float = 5.0,
+    source_commit: str | None = None,
 ) -> WebSocketGateReport:
     """Exercise a deployed WebSocket endpoint without retaining transcript text."""
 
@@ -826,6 +828,7 @@ async def run_websocket_gate(
             if passed == sessions and (recovery_probe is None or recovery_probe.passed)
             else "failed"
         ),
+        source_commit=source_commit,
         uri=uri,
         sessions=sessions,
         passed_sessions=passed,

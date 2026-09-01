@@ -174,14 +174,14 @@ turnalign listen --backend funasr-streaming --refinement-backend funasr \
   --refinement-model paraformer-zh --aligner paraformer --diarizer campp
 turnalign release-gate sample-30s.wav --backend funasr-streaming \
   --model paraformer-zh-streaming --device cpu --output release-events.jsonl \
-  --report release-report.json \
+  --source-commit "$(git rev-parse HEAD)" --report release-report.json \
   --max-initialization-seconds 120 --max-first-partial-seconds 3 \
   --max-first-commit-seconds "$MAX_FIRST_COMMIT_SECONDS" \
   --require-immutable-model-revision \
   --max-realtime-factor 1
 turnalign quality-gate reference.jsonl release-events.jsonl \
   --max-cer "$MAX_CER" --min-reference-speech-seconds "$MIN_LABELLED_SECONDS" \
-  --report quality-report.json
+  --source-commit "$(git rev-parse HEAD)" --report quality-report.json
 turnalign audio-devices
 turnalign record sample.wav --duration 10
 turnalign serve --backend glm-asr --device auto --language zh
@@ -193,11 +193,15 @@ turnalign websocket-gate wss://asr.example/ws --sessions 8 \
   --audio-seconds 60 --realtime --max-ready-seconds 10 \
   --max-total-seconds 75 --min-audio-acks 600 \
   --max-dropped-partials 0 --max-backpressure-pauses 0 --verify-recovery \
-  --auth-token-file /path/to/restricted/auth-token --report websocket-report.json
+  --auth-token-file /path/to/restricted/auth-token \
+  --source-commit "$(git rev-parse HEAD)" --report websocket-report.json
 turnalign production-gate release-report.json quality-report.json websocket-report.json \
   --source-commit "$(git rev-parse HEAD)" \
   --artifact wheel=dist/turnalign.whl --artifact dependency-lock=requirements.lock \
   --artifact sbom=sbom.cdx.json \
+  --artifact release-audio=sample-30s.wav \
+  --artifact quality-reference=reference.jsonl \
+  --artifact quality-hypothesis=release-events.jsonl \
   --artifact model=/models/model.safetensors --artifact nginx-config=/etc/nginx/nginx.conf \
   --artifact service-unit=/etc/systemd/system/turnalign.service \
   --artifact host-profile=host-profile.json --report production-report.json
@@ -208,7 +212,7 @@ python examples/websocket_file_client.py sample.wav --backend glm-asr --language
 
 `websocket-gate` 使用生成的静音并发检查已部署服务的协议、流控、确认、完成率和延迟，不保存识别文本或恢复凭证。默认要求每会话至少一个 ACK 且不允许丢弃 partial，可用 `--min-audio-acks`、`--max-dropped-partials` 和 `--max-backpressure-pauses` 收紧目标环境门槛。它只证明传输与生命周期，不证明识别质量；突发测试不加 `--realtime`，长稳测试则加上该参数。生产 TLS 应由反向代理或服务网格终止，门槛直接访问外部 `wss://` 地址。非浏览器客户默认允许；浏览器 Origin 默认拒绝，必须用 `--allow-origin` 精确放行。`GET /healthz` 和 `GET /readyz` 可用作存活/就绪探针；仅回环访问的 `GET /metrics` 提供不含标签、文本和凭证的 Prometheus 运行指标，示例 Nginx 明确拒绝公网 `/metrics`。进程收到 `SIGTERM` 后会停止接入、关闭现有连接并在 `--shutdown-grace-timeout` 后强制取消未退出的处理器。恢复音频默认限制为每会话 512 MiB、每进程 2 GiB，完成后立即释放临时文件；断线会话的默认恢复窗口为 300 秒，超时由后台任务自动清理。相关上限均可通过 `serve --help` 调整。服务进程默认最多接受 32 个会话，但同一模型默认只有一个实例；需要进程内并行时显式设置 `--backend-replicas N`（最多 8，模型内存也近似乘以 N），或部署多个单副本进程。生产服务应加 `--preload`，在监听端口前加载全部副本；配合 `--warmup-file` 可在启动阶段执行真实推理。首次消息、客户端空闲、模型初始化、结束收尾和工作线程退出时间均有界，可通过 `turnalign serve --help` 调整。命令行后端的可执行文件、模型路径和参数可由运维侧通过 `--executable`、`--model-path` 和 `--backend-option KEY=VALUE` 固定，无需开放客户端路径权限。内置后端的私密热词按租约注入并在归还时清空，不同热词会话可复用同一大模型实例。
 
-三个门禁都可用 `--report` 原子保存 JSON 结论。`production-gate` 只在真实模型、人工标注质量和公网 WebSocket 报告均通过，并且报告证明不可变模型、原生流式、`wss://`、实时压测、延迟上限及断线恢复已启用时放行；它还要求 wheel、依赖锁、CycloneDX SBOM、模型、Nginx、systemd 和主机规格七类制品，并把所有证据的 SHA-256 与源码提交写入单一报告。依赖锁必须使用带 SHA-256 的精确版本，SBOM 必须标识 TurnAlign 根组件、WebSocket 运行依赖和依赖图，并与所有无条件锁定版本一致；缺项或弱化的门禁会返回非零退出码。
+三个门禁都可用 `--report` 原子保存 JSON 结论。`production-gate` 只在真实模型、人工标注质量和公网 WebSocket 报告均通过，并且报告证明不可变模型、原生流式、`wss://`、实时压测、延迟上限及断线恢复已启用时放行；它要求 wheel、依赖锁、CycloneDX SBOM、发布音频、质量参考/输出、模型、Nginx、systemd 和主机规格十类制品。三份门禁报告必须绑定同一源码提交，音频和质量输入的 SHA-256 必须与聚合制品匹配，防止误用旧报告。依赖锁必须使用带 SHA-256 的精确版本，SBOM 必须标识 TurnAlign 根组件、WebSocket 运行依赖和依赖图，并与所有无条件锁定版本一致；缺项或弱化的门禁会返回非零退出码。
 
 仓库提供一套范围明确的 [Linux CPU systemd + Nginx 参考部署](deploy/README.md)，包含回环绑定、TLS 代理、速率限制、低权限运行、预加载和发布门禁清单。GPU/MPS 部署必须按目标硬件单独验证，不能直接套用这份 CPU 安全单元。
 
@@ -411,24 +415,28 @@ turnalign listen --backend funasr-streaming --refinement-backend funasr \
   --refinement-model paraformer-zh --aligner paraformer --diarizer campp
 turnalign release-gate sample-30s.wav --backend funasr-streaming \
   --model paraformer-zh-streaming --device cpu --output release-events.jsonl \
-  --report release-report.json \
+  --source-commit "$(git rev-parse HEAD)" --report release-report.json \
   --max-initialization-seconds 120 --max-first-partial-seconds 3 \
   --max-first-commit-seconds "$MAX_FIRST_COMMIT_SECONDS" \
   --require-immutable-model-revision \
   --max-realtime-factor 1
 turnalign quality-gate reference.jsonl release-events.jsonl \
   --max-cer "$MAX_CER" --min-reference-speech-seconds "$MIN_LABELLED_SECONDS" \
-  --report quality-report.json
+  --source-commit "$(git rev-parse HEAD)" --report quality-report.json
 turnalign serve --backend glm-asr --device auto --language zh
 turnalign websocket-gate wss://asr.example/ws --sessions 8 \
   --audio-seconds 60 --realtime --max-ready-seconds 10 \
   --max-total-seconds 75 --min-audio-acks 600 \
   --max-dropped-partials 0 --max-backpressure-pauses 0 --verify-recovery \
-  --auth-token-file /path/to/restricted/auth-token --report websocket-report.json
+  --auth-token-file /path/to/restricted/auth-token \
+  --source-commit "$(git rev-parse HEAD)" --report websocket-report.json
 turnalign production-gate release-report.json quality-report.json websocket-report.json \
   --source-commit "$(git rev-parse HEAD)" \
   --artifact wheel=dist/turnalign.whl --artifact dependency-lock=requirements.lock \
   --artifact sbom=sbom.cdx.json \
+  --artifact release-audio=sample-30s.wav \
+  --artifact quality-reference=reference.jsonl \
+  --artifact quality-hypothesis=release-events.jsonl \
   --artifact model=/models/model.safetensors --artifact nginx-config=/etc/nginx/nginx.conf \
   --artifact service-unit=/etc/systemd/system/turnalign.service \
   --artifact host-profile=host-profile.json --report production-report.json
@@ -523,8 +531,11 @@ All three gates accept `--report` to atomically persist their JSON verdict.
 `production-gate` releases only when the real-model, labelled-quality and public
 WebSocket reports passed with production-strength requirements, then binds the
 source commit and SHA-256 digests of the reports, wheel, dependency lock,
-CycloneDX SBOM, model, Nginx configuration, systemd unit and host profile into
-one auditable verdict. Lock entries must be exact, SHA-256-protected versions;
+CycloneDX SBOM, release audio, quality reference and hypothesis, model, Nginx
+configuration, systemd unit and host profile into one auditable verdict. Every
+gate report must name the same source commit, and the recorded input digests
+must match the aggregated evidence, preventing stale-report reuse. Lock entries
+must be exact, SHA-256-protected versions;
 the SBOM must identify TurnAlign and the WebSocket runtime, include a dependency
 graph, and match every unconditional locked version.
 Missing or weakened evidence returns a non-zero exit code.
