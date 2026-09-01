@@ -1,0 +1,199 @@
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+from turnalign.production_gate import (
+    REQUIRED_ARTIFACT_KINDS,
+    run_production_gate,
+    write_json_report,
+)
+
+
+class ProductionGateTests(unittest.TestCase):
+    @staticmethod
+    def _reports(root: Path) -> tuple[Path, Path, Path]:
+        release = root / "release.json"
+        quality = root / "quality.json"
+        websocket = root / "websocket.json"
+        write_json_report(release, {
+            "status": "passed",
+            "failures": [],
+            "require_native_streaming": True,
+            "native_streaming": True,
+            "require_partial": True,
+            "require_immutable_model_revision": True,
+            "model_revision": "a" * 40,
+            "min_audio_seconds": 30.0,
+            "min_commits": 1,
+            "max_realtime_factor": 1.0,
+            "max_first_partial_seconds": 3.0,
+            "max_first_commit_seconds": 8.0,
+            "max_initialization_seconds": 120.0,
+            "realtime_factor": 0.5,
+            "first_partial_seconds": 0.5,
+            "first_commit_seconds": 2.0,
+            "initialization_seconds": 10.0,
+            "audio_seconds": 30.0,
+            "commits": 2,
+        })
+        write_json_report(quality, {
+            "status": "passed",
+            "failures": [],
+            "max_character_error_rate": 0.1,
+            "max_word_error_rate": None,
+            "max_diarization_error_rate": None,
+            "max_revision_updates_per_segment": None,
+            "min_reference_segments": 10,
+            "min_reference_characters": 100,
+            "min_reference_speech_seconds": 60.0,
+            "evaluation": {
+                "character_error_rate": 0.05,
+                "word_error_rate": 0.1,
+                "diarization_error_rate": None,
+                "revision_updates_per_segment": 0.1,
+                "reference_segments": 10,
+                "reference_characters": 100,
+                "reference_speech_seconds": 60.0,
+            },
+        })
+        write_json_report(websocket, {
+            "status": "passed",
+            "uri": "wss://asr.example.com/ws",
+            "sessions": 8,
+            "passed_sessions": 8,
+            "failed_sessions": 0,
+            "realtime_pacing": True,
+            "recovery_probe_required": True,
+            "recovery_probe": {"passed": True},
+            "max_ready_seconds": 10.0,
+            "max_total_seconds": 75.0,
+            "min_audio_acks_per_session": 600,
+            "max_dropped_partials_per_session": 0,
+            "max_backpressure_pauses_per_session": 0,
+            "audio_seconds_per_session": 60.0,
+            "ready_seconds_p95": 2.0,
+            "total_seconds_p95": 62.0,
+            "results": [{"passed": True} for _ in range(8)],
+        })
+        return release, quality, websocket
+
+    @staticmethod
+    def _artifacts(root: Path) -> list[tuple[str, Path]]:
+        artifacts = []
+        for kind in REQUIRED_ARTIFACT_KINDS:
+            path = root / f"{kind}.evidence"
+            path.write_text(f"immutable {kind}\n", encoding="utf-8")
+            artifacts.append((kind, path))
+        return artifacts
+
+    def test_passes_and_hash_binds_all_required_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, quality, websocket = self._reports(root)
+            report = run_production_gate(
+                release,
+                quality,
+                websocket,
+                source_commit="b" * 40,
+                artifacts=self._artifacts(root),
+            )
+
+            self.assertTrue(report.passed)
+            self.assertEqual(report.schema_version, 1)
+            self.assertEqual(len(report.artifacts), len(REQUIRED_ARTIFACT_KINDS))
+            self.assertEqual(len(report.release_report.sha256), 64)
+            self.assertEqual(
+                {artifact.kind for artifact in report.artifacts},
+                REQUIRED_ARTIFACT_KINDS,
+            )
+
+    def test_reports_every_weakened_production_requirement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, quality, websocket = self._reports(root)
+            release_payload = json.loads(release.read_text(encoding="utf-8"))
+            release_payload["require_immutable_model_revision"] = False
+            write_json_report(release, release_payload)
+            quality_payload = json.loads(quality.read_text(encoding="utf-8"))
+            quality_payload["min_reference_speech_seconds"] = 0
+            write_json_report(quality, quality_payload)
+            websocket_payload = json.loads(websocket.read_text(encoding="utf-8"))
+            websocket_payload["uri"] = "wss://127.0.0.1:8765/ws"
+            websocket_payload["recovery_probe_required"] = False
+            websocket_payload["sessions"] = 1
+            websocket_payload["passed_sessions"] = 1
+            websocket_payload["results"] = [{"passed": True}]
+            websocket_payload["max_backpressure_pauses_per_session"] = None
+            write_json_report(websocket, websocket_payload)
+
+            report = run_production_gate(
+                release,
+                quality,
+                websocket,
+                source_commit="b" * 40,
+                artifacts=[],
+            )
+
+            self.assertFalse(report.passed)
+            failures = "\n".join(report.failures)
+            self.assertIn("immutable model revision", failures)
+            self.assertIn("labelled-speech", failures)
+            self.assertIn("public wss://", failures)
+            self.assertIn("recovery verification", failures)
+            self.assertIn("concurrent sessions", failures)
+            self.assertIn("backpressure-pause ceiling", failures)
+            for kind in REQUIRED_ARTIFACT_KINDS:
+                self.assertIn(f"missing required artifact kind: {kind}", failures)
+
+    def test_rejects_ambiguous_or_mutable_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, quality, websocket = self._reports(root)
+            release.write_text('{"status":"passed","status":"failed"}', encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "duplicate JSON key"):
+                run_production_gate(
+                    release,
+                    quality,
+                    websocket,
+                    source_commit="b" * 40,
+                    artifacts=self._artifacts(root),
+                )
+
+            release.unlink()
+            release.symlink_to(quality)
+            with self.assertRaisesRegex(ValueError, "non-symlink"):
+                run_production_gate(
+                    release,
+                    quality,
+                    websocket,
+                    source_commit="b" * 40,
+                    artifacts=self._artifacts(root),
+                )
+
+    def test_rejects_noncanonical_source_commit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, quality, websocket = self._reports(root)
+            with self.assertRaisesRegex(ValueError, "lowercase 40-character"):
+                run_production_gate(
+                    release,
+                    quality,
+                    websocket,
+                    source_commit="B" * 40,
+                    artifacts=self._artifacts(root),
+                )
+
+    def test_atomic_writer_creates_parent_and_valid_json(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "nested" / "report.json"
+            write_json_report(output, {"status": "passed"})
+            self.assertEqual(
+                json.loads(output.read_text(encoding="utf-8")),
+                {"status": "passed"},
+            )
+            self.assertEqual(list(output.parent.glob("*.tmp")), [])
+
+
+if __name__ == "__main__":
+    unittest.main()

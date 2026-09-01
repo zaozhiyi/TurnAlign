@@ -511,6 +511,53 @@ class CliIntegrationTests(unittest.TestCase):
         self.assertEqual(captured["recovery_resume_timeout"], 7.0)
         self.assertEqual(captured["auth_token"], "private-token")
 
+    def test_production_gate_maps_evidence_and_persists_verdict(self):
+        captured = {}
+
+        class Report:
+            passed = True
+
+            @staticmethod
+            def to_dict():
+                return {"schema_version": 1, "status": "passed", "failures": []}
+
+        def fake_gate(release, quality, websocket, **options):
+            captured.update({
+                "reports": (release, quality, websocket),
+                **options,
+            })
+            return Report()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "nested" / "production.json"
+            arguments = [
+                "turnalign",
+                "production-gate",
+                "release.json",
+                "quality.json",
+                "websocket.json",
+                "--source-commit",
+                "a" * 40,
+            ]
+            for kind in sorted(cli.REQUIRED_ARTIFACT_KINDS):
+                arguments.extend(("--artifact", f"{kind}={kind}.evidence"))
+            arguments.extend(("--report", str(output)))
+            with patch.object(cli, "run_production_gate", fake_gate), patch(
+                "sys.argv", arguments
+            ), patch("builtins.print"):
+                self.assertEqual(cli.main(), 0)
+
+            self.assertEqual(captured["source_commit"], "a" * 40)
+            self.assertEqual(
+                {kind for kind, _path in captured["artifacts"]},
+                cli.REQUIRED_ARTIFACT_KINDS,
+            )
+            self.assertEqual(
+                json.loads(output.read_text(encoding="utf-8"))["status"],
+                "passed",
+            )
+
     def test_replay_creates_parent_and_valid_end_event(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -545,6 +592,7 @@ class CliIntegrationTests(unittest.TestCase):
             reference = root / "reference.jsonl"
             matching = root / "matching.jsonl"
             mismatching = root / "mismatching.jsonl"
+            report_path = root / "reports" / "quality.json"
             end = TranscriptEvent("end", "session", 1, 1, 1)
             self._write_event_stream(reference, [
                 TranscriptEvent("commit", "r", 1, 0, 1, "hello world"),
@@ -563,8 +611,13 @@ class CliIntegrationTests(unittest.TestCase):
                 "turnalign", "quality-gate", str(reference), str(matching),
                 "--max-cer", "0", "--max-wer", "0",
                 "--min-reference-speech-seconds", "1",
+                "--report", str(report_path),
             ]), patch("builtins.print"):
                 self.assertEqual(cli.main(), 0)
+            self.assertEqual(
+                json.loads(report_path.read_text(encoding="utf-8"))["status"],
+                "passed",
+            )
             with patch("sys.argv", [
                 "turnalign", "quality-gate", str(reference), str(mismatching),
                 "--max-cer", "0.1",

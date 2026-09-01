@@ -174,12 +174,14 @@ turnalign listen --backend funasr-streaming --refinement-backend funasr \
   --refinement-model paraformer-zh --aligner paraformer --diarizer campp
 turnalign release-gate sample-30s.wav --backend funasr-streaming \
   --model paraformer-zh-streaming --device cpu --output release-events.jsonl \
+  --report release-report.json \
   --max-initialization-seconds 120 --max-first-partial-seconds 3 \
   --max-first-commit-seconds "$MAX_FIRST_COMMIT_SECONDS" \
   --require-immutable-model-revision \
   --max-realtime-factor 1
 turnalign quality-gate reference.jsonl release-events.jsonl \
-  --max-cer "$MAX_CER" --min-reference-speech-seconds "$MIN_LABELLED_SECONDS"
+  --max-cer "$MAX_CER" --min-reference-speech-seconds "$MIN_LABELLED_SECONDS" \
+  --report quality-report.json
 turnalign audio-devices
 turnalign record sample.wav --duration 10
 turnalign serve --backend glm-asr --device auto --language zh
@@ -190,14 +192,22 @@ TURNALIGN_AUTH_TOKEN=replace-me turnalign serve --backend glm-asr \
 turnalign websocket-gate wss://asr.example/ws --sessions 8 \
   --audio-seconds 60 --realtime --max-ready-seconds 10 \
   --max-total-seconds 75 --min-audio-acks 600 \
-  --max-dropped-partials 0 --verify-recovery \
-  --auth-token-env TURNALIGN_AUTH_TOKEN
+  --max-dropped-partials 0 --max-backpressure-pauses 0 --verify-recovery \
+  --auth-token-env TURNALIGN_AUTH_TOKEN --report websocket-report.json
+turnalign production-gate release-report.json quality-report.json websocket-report.json \
+  --source-commit "$(git rev-parse HEAD)" \
+  --artifact wheel=dist/turnalign.whl --artifact dependency-lock=requirements.lock \
+  --artifact model=/models/model.safetensors --artifact nginx-config=/etc/nginx/nginx.conf \
+  --artifact service-unit=/etc/systemd/system/turnalign.service \
+  --artifact host-profile=host-profile.json --report production-report.json
 python examples/websocket_file_client.py sample.wav --backend glm-asr --language zh
 ```
 
 `release-gate` 必须调用真实后端，而不是 mock。它会验证事件状态机、原生流式声明、首个 partial、可选的首次 commit 延迟、最少 commit 数、初始化时间和 RTF，并在任一门槛失败时返回非零退出码。默认要求至少 10 秒音频；应将 `--output` 生成的 JSONL 与命令输出一并保存为发布证据。准确率发布门禁使用人工标注 JSONL 执行 `turnalign quality-gate`：至少配置一项 CER、WER、说话人错误或修订稳定性上限，并按目标场景设定最小标注规模；任一条件失败时返回非零退出码。中文参考没有人工分词时应以 CER 为主。说话人指标是单活跃说话人区间分数，不等同于支持重叠语音与 collar 的标准 DER。阈值必须由实际产品容忍度和代表性语料得出，仓库不提供虚构的通用阈值。`turnalign evaluate` 仍可用于只生成指标、不阻断发布的分析。
 
 `websocket-gate` 使用生成的静音并发检查已部署服务的协议、流控、确认、完成率和延迟，不保存识别文本或恢复凭证。默认要求每会话至少一个 ACK 且不允许丢弃 partial，可用 `--min-audio-acks`、`--max-dropped-partials` 和 `--max-backpressure-pauses` 收紧目标环境门槛。它只证明传输与生命周期，不证明识别质量；突发测试不加 `--realtime`，长稳测试则加上该参数。生产 TLS 应由反向代理或服务网格终止，门槛直接访问外部 `wss://` 地址。非浏览器客户默认允许；浏览器 Origin 默认拒绝，必须用 `--allow-origin` 精确放行。`GET /healthz` 和 `GET /readyz` 可用作存活/就绪探针。进程收到 `SIGTERM` 后会停止接入、关闭现有连接并在 `--shutdown-grace-timeout` 后强制取消未退出的处理器。恢复音频默认限制为每会话 512 MiB、每进程 2 GiB，完成后立即释放临时文件；断线会话的默认恢复窗口为 300 秒，超时由后台任务自动清理。相关上限均可通过 `serve --help` 调整。服务进程默认最多接受 32 个会话，但同一模型默认只有一个实例；需要进程内并行时显式设置 `--backend-replicas N`（最多 8，模型内存也近似乘以 N），或部署多个单副本进程。生产服务应加 `--preload`，在监听端口前加载全部副本；配合 `--warmup-file` 可在启动阶段执行真实推理。首次消息、客户端空闲、模型初始化、结束收尾和工作线程退出时间均有界，可通过 `turnalign serve --help` 调整。命令行后端的可执行文件、模型路径和参数可由运维侧通过 `--executable`、`--model-path` 和 `--backend-option KEY=VALUE` 固定，无需开放客户端路径权限。内置后端的私密热词按租约注入并在归还时清空，不同热词会话可复用同一大模型实例。
+
+三个门禁都可用 `--report` 原子保存 JSON 结论。`production-gate` 只在真实模型、人工标注质量和公网 WebSocket 报告均通过，并且报告证明不可变模型、原生流式、`wss://`、实时压测、延迟上限及断线恢复已启用时放行；它还要求 wheel、依赖锁、模型、Nginx、systemd 和主机规格六类制品，并把所有证据的 SHA-256 与源码提交写入单一报告。缺项或弱化的门禁会返回非零退出码。
 
 仓库提供一套范围明确的 [Linux CPU systemd + Nginx 参考部署](deploy/README.md)，包含回环绑定、TLS 代理、速率限制、低权限运行、预加载和发布门禁清单。GPU/MPS 部署必须按目标硬件单独验证，不能直接套用这份 CPU 安全单元。
 
@@ -400,18 +410,26 @@ turnalign listen --backend funasr-streaming --refinement-backend funasr \
   --refinement-model paraformer-zh --aligner paraformer --diarizer campp
 turnalign release-gate sample-30s.wav --backend funasr-streaming \
   --model paraformer-zh-streaming --device cpu --output release-events.jsonl \
+  --report release-report.json \
   --max-initialization-seconds 120 --max-first-partial-seconds 3 \
   --max-first-commit-seconds "$MAX_FIRST_COMMIT_SECONDS" \
   --require-immutable-model-revision \
   --max-realtime-factor 1
 turnalign quality-gate reference.jsonl release-events.jsonl \
-  --max-cer "$MAX_CER" --min-reference-speech-seconds "$MIN_LABELLED_SECONDS"
+  --max-cer "$MAX_CER" --min-reference-speech-seconds "$MIN_LABELLED_SECONDS" \
+  --report quality-report.json
 turnalign serve --backend glm-asr --device auto --language zh
 turnalign websocket-gate wss://asr.example/ws --sessions 8 \
   --audio-seconds 60 --realtime --max-ready-seconds 10 \
   --max-total-seconds 75 --min-audio-acks 600 \
-  --max-dropped-partials 0 --verify-recovery \
-  --auth-token-env TURNALIGN_AUTH_TOKEN
+  --max-dropped-partials 0 --max-backpressure-pauses 0 --verify-recovery \
+  --auth-token-env TURNALIGN_AUTH_TOKEN --report websocket-report.json
+turnalign production-gate release-report.json quality-report.json websocket-report.json \
+  --source-commit "$(git rev-parse HEAD)" \
+  --artifact wheel=dist/turnalign.whl --artifact dependency-lock=requirements.lock \
+  --artifact model=/models/model.safetensors --artifact nginx-config=/etc/nginx/nginx.conf \
+  --artifact service-unit=/etc/systemd/system/turnalign.service \
+  --artifact host-profile=host-profile.json --report production-report.json
 ```
 
 `release-gate` must invoke a real backend rather than a mock. It validates the
@@ -455,6 +473,7 @@ to eight, with roughly N times model memory) or deploy multiple one-replica
 processes for parallel inference. Initial-message, client-idle,
 model-initialization, finalization and worker-shutdown time are bounded; see
 `serve --help`.
+
 Browser origins are rejected by default; add each trusted exact origin with
 `--allow-origin`. Non-browser clients without an Origin header remain accepted.
 `GET /healthz` and `GET /readyz` provide orchestration probes. `SIGTERM` stops
@@ -494,6 +513,13 @@ The report contains only counters and sequence metadata, never transcript text.
 Run the probe through the public load balancer. Since recovery is process-local,
 multi-instance deployments require session affinity for the configured recovery
 TTL; the probe will fail if reconnects reach another instance.
+
+All three gates accept `--report` to atomically persist their JSON verdict.
+`production-gate` releases only when the real-model, labelled-quality and public
+WebSocket reports passed with production-strength requirements, then binds the
+source commit and SHA-256 digests of the reports, wheel, dependency lock, model,
+Nginx configuration, systemd unit and host profile into one auditable verdict.
+Missing or weakened evidence returns a non-zero exit code.
 
 A scoped [Linux CPU systemd and Nginx reference deployment](deploy/README.md)
 is included with loopback binding, TLS proxying, rate limits, an unprivileged

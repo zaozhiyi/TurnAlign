@@ -21,7 +21,7 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   materialization limit before constructing the float model input.
 - All source and test modules pass `compileall`.
 - Ruff is enforced in CI and passes over `src` and `tests`.
-- The built wheel passes all 229 tests from site-packages on Python 3.10 with
+- The built wheel passes all 235 tests from site-packages on Python 3.10 with
   `websockets` 14.0 and on Python 3.12 with `websockets` 17.1. The Python 3.12
   run also passes under `python -O`, so production invariants do not depend on
   removable `assert` statements.
@@ -31,7 +31,7 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   implements only `align()` (without the optional batch method) previously
   treated an already-extracted text string as a hypothesis object. A dedicated
   regression now exercises that plugin contract.
-- Bandit reports no medium- or high-severity source findings. Its four remaining
+- Bandit reports no medium- or high-severity source findings. Its five remaining
   low-severity findings are the deliberate `subprocess` imports/calls used by
   the local audio and whisper.cpp adapters; calls use argument arrays with
   `shell=False`. Minimal server installations with both tested WebSocket
@@ -58,6 +58,11 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   dropped partials fail by default; pause and latency limits are configurable.
   Generated silence intentionally
   keeps transport/load evidence separate from speech-quality evidence.
+- All three executable gates can atomically persist their JSON verdict with
+  `--report`. `turnalign production-gate` independently rechecks the critical
+  thresholds, requires a public `wss://` concurrent recovery/soak result, and
+  binds the source commit plus six required artifact classes and all reports by
+  SHA-256 into one final pass/fail record.
 - WebSocket processes now bound active sessions and time out clients that do
   not send the initial start message or become idle. Initialization, worker
   shutdown, output pressure and recovery-event retention are independently

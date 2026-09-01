@@ -452,7 +452,7 @@ async def _run_recovery_probe(
         flow_allowed.set()
         counters = {"events": 0, "commits": 0, "audio_acks": 0}
         session_id = ""
-        resume_token = ""
+        resume_token: str | None = None
         last_acknowledged_sequence: int | None = None
         final_buffered_bytes: int | None = None
         highest_event_sequence = -1
@@ -476,6 +476,8 @@ async def _run_recovery_probe(
                 if value is not None:
                     request[key] = value
             if resume_session_id is not None:
+                if resume_token is None:
+                    raise RuntimeError("recovery probe has no resume token")
                 request["resume_session_id"] = resume_session_id
                 request["resume_token"] = resume_token
                 request["acknowledged_event_sequence"] = highest_event_sequence

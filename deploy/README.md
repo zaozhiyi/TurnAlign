@@ -87,6 +87,12 @@ Before routing users, retain all of the following with the release artifact:
 5. Rollback is tested by restoring the preceding immutable artifact and model
    bundle, not by mutating the running environment.
 
+Persist each gate with `--report`, then run `turnalign production-gate` with the
+source commit and all six required artifact kinds shown in the root README. Keep
+the resulting aggregate report beside the release artifact; it rejects local
+`ws://`, missing recovery/latency controls, mutable model revisions, undersized
+quality evidence, and incomplete artifact sets.
+
 WebSocket recovery is process-local. Keep one process behind this reference
 upstream. A multi-process or multi-host topology must either provide sticky
 routing for the recovery window or implement a shared durable recovery store;

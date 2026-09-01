@@ -29,6 +29,11 @@ from .offline import OfflineRefinementPipeline
 from .pipelines import TwoPassPipeline
 from .plugins import AsrConfig
 from .policy import ServerPolicy
+from .production_gate import (
+    REQUIRED_ARTIFACT_KINDS,
+    run_production_gate,
+    write_json_report,
+)
 from .profiles import PROFILE_NAMES, profile_catalog, select_execution_profile
 from .realtime import RealtimePipeline
 from .registry import available, create_asr, create_component
@@ -37,6 +42,23 @@ from .server import serve
 from .session import transcribe_events
 from .validation import EventStreamValidator
 from .websocket_gate import run_websocket_gate
+
+
+def _emit_gate_report(report, path: Path | None) -> None:
+    payload = report.to_dict()
+    if path is not None:
+        write_json_report(path, payload)
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def _artifact_argument(value: str) -> tuple[str, Path]:
+    kind, separator, raw_path = value.partition("=")
+    if not separator or not raw_path:
+        raise argparse.ArgumentTypeError("artifact must use KIND=PATH")
+    if kind not in REQUIRED_ARTIFACT_KINDS:
+        choices = ", ".join(sorted(REQUIRED_ARTIFACT_KINDS))
+        raise argparse.ArgumentTypeError(f"artifact KIND must be one of: {choices}")
+    return kind, Path(raw_path)
 
 
 def replay(source: Path, output: Path | None) -> int:
@@ -157,7 +179,7 @@ def quality_gate_files(args) -> int:
         min_reference_speech_seconds=args.min_reference_speech_seconds,
         text_normalization=_text_normalization(args),
     )
-    print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
+    _emit_gate_report(report, getattr(args, "report", None))
     return 0 if report.passed else 1
 
 
@@ -201,7 +223,7 @@ def release_gate(args) -> int:
     finally:
         if destination is not None:
             destination.close()
-    print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
+    _emit_gate_report(report, getattr(args, "report", None))
     return 0 if report.passed else 1
 
 
@@ -236,7 +258,19 @@ def websocket_gate(args) -> int:
         verify_recovery=args.verify_recovery,
         recovery_resume_timeout=args.recovery_resume_timeout,
     ))
-    print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
+    _emit_gate_report(report, getattr(args, "report", None))
+    return 0 if report.passed else 1
+
+
+def production_gate(args) -> int:
+    report = run_production_gate(
+        args.release_report,
+        args.quality_report,
+        args.websocket_report,
+        source_commit=args.source_commit,
+        artifacts=args.artifact,
+    )
+    _emit_gate_report(report, args.report)
     return 0 if report.passed else 1
 
 
@@ -624,6 +658,7 @@ def main() -> int:
     )
     quality_parser.add_argument("reference", type=Path)
     quality_parser.add_argument("hypothesis", type=Path)
+    quality_parser.add_argument("--report", type=Path, help="Persist the JSON gate report")
     quality_parser.add_argument("--max-cer", type=float)
     quality_parser.add_argument("--max-wer", type=float)
     quality_parser.add_argument("--max-diarization-error", type=float)
@@ -649,6 +684,7 @@ def main() -> int:
     )
     gate_parser.add_argument("source", type=Path)
     gate_parser.add_argument("--output", type=Path, help="Optional event JSONL evidence")
+    gate_parser.add_argument("--report", type=Path, help="Persist the JSON gate report")
     gate_parser.add_argument("--chunk-ms", type=int, default=100)
     gate_parser.add_argument("--ffmpeg", default="ffmpeg")
     gate_parser.add_argument("--max-realtime-factor", type=float, default=1.0)
@@ -683,6 +719,7 @@ def main() -> int:
         help="Run concurrent transport and lifecycle checks against a deployed server",
     )
     websocket_gate_parser.add_argument("uri")
+    websocket_gate_parser.add_argument("--report", type=Path, help="Persist the JSON gate report")
     websocket_gate_parser.add_argument("--sessions", type=int, default=4)
     websocket_gate_parser.add_argument("--audio-seconds", type=float, default=5.0)
     websocket_gate_parser.add_argument("--sample-rate", type=int, default=16_000)
@@ -729,6 +766,27 @@ def main() -> int:
     websocket_gate_parser.add_argument(
         "--auth-token-env",
         help="Environment variable containing the start-message auth token",
+    )
+    production_gate_parser = commands.add_parser(
+        "production-gate",
+        help="Bind production gate reports and immutable artifacts into one verdict",
+    )
+    production_gate_parser.add_argument("release_report", type=Path)
+    production_gate_parser.add_argument("quality_report", type=Path)
+    production_gate_parser.add_argument("websocket_report", type=Path)
+    production_gate_parser.add_argument("--source-commit", required=True)
+    production_gate_parser.add_argument(
+        "--artifact",
+        action="append",
+        type=_artifact_argument,
+        required=True,
+        metavar="KIND=PATH",
+        help="Immutable release artifact; repeat for every required kind",
+    )
+    production_gate_parser.add_argument(
+        "--report",
+        type=Path,
+        help="Persist the aggregate JSON verdict",
     )
     doctor_parser = commands.add_parser("doctor", help="Detect and select the local inference device")
     doctor_parser.add_argument(
@@ -1004,6 +1062,8 @@ def main() -> int:
         return release_gate(args)
     if args.command == "websocket-gate":
         return websocket_gate(args)
+    if args.command == "production-gate":
+        return production_gate(args)
     if args.command == "doctor":
         print(json.dumps(runtime_report(args.device), ensure_ascii=False, indent=2))
         return 0
