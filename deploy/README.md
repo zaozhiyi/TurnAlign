@@ -143,6 +143,11 @@ Before routing users, retain all of the following with the release artifact:
    hypotheses as potentially sensitive data and restrict their storage.
 6. Rollback is tested by restoring the preceding immutable artifact and model
    bundle, not by mutating the running environment.
+7. For tagged upstream distributions,
+   `gh attestation verify FILE --repo GuanZhengPM/TurnAlign` verifies the signed
+   GitHub/Sigstore build provenance.
+   This supplements rather than replaces the final eleven-artifact deployment
+   gate, whose model, host and production-corpus evidence is environment-specific.
 
 Persist each gate with `--report`, generate retained-model provenance with
 `turnalign model-manifest`, and run `turnalign host-profile` on the target host

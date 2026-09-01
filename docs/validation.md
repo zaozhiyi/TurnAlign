@@ -21,7 +21,7 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   materialization limit before constructing the float model input.
 - All source and test modules pass `compileall`.
 - Ruff is enforced in CI and passes over `src` and `tests`.
-- The built wheel passes all 277 tests from site-packages on Python 3.10 with
+- The built wheel passes all 278 tests from site-packages on Python 3.10 with
   `websockets` 14.0 and on Python 3.12 with `websockets` 17.1. The Python 3.12
   run also passes under `python -O`, so production invariants do not depend on
   removable `assert` statements.
@@ -29,6 +29,12 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   protected file. The aggregate gate rejects an unbound, stale, missing or
   mismatched identity instead of allowing a Wheel from another commit to be
   combined with otherwise current reports.
+- A separate release workflow grants OIDC and attestation writes only to an
+  upstream version-tag job. It requires the tag to match the project version
+  and be reachable from `main`, reruns static checks, reproducible builds, both
+  normal and optimized test suites, and emits independently verifiable
+  GitHub/Sigstore provenance plus a CycloneDX SBOM attestation. Fork pull
+  requests exercise only a read-only validation job.
 - The package job creates a validated CycloneDX 1.6 SBOM from an isolated
   wheel-installed server environment, requires two byte-identical reproducible
   generations, and includes its digest in `SHA256SUMS`. The production gate
@@ -202,7 +208,9 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   hashes across two independent builds. The Wheel also embeds the CI checkout's
   exact source commit through a deterministic custom build hook. CI enforces
   that comparison and identity, emits a
-  SHA-256 manifest, and retains the checked artifacts for 14 days. Build tools
+  SHA-256 manifest, and retains the checked artifacts for 14 days. A valid
+  upstream version tag repeats these checks, signs the distribution provenance,
+  and retains the attested artifacts for 90 days. Build tools
   are version-pinned, while first-party GitHub Actions are pinned to immutable
   commit hashes with checkout credential persistence disabled.
 - The rebuilt wheel installs into a clean target directory and its packaged

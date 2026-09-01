@@ -229,6 +229,8 @@ python examples/websocket_file_client.py sample.wav --backend glm-asr --language
 
 三个门禁都可用 `--report` 原子保存 JSON 结论。`production-gate` 只在真实模型、人工标注质量和公网 WebSocket 报告均通过，并且报告证明不可变模型、原生流式、`wss://`、实时压测、延迟上限及断线恢复已启用时放行；它要求 wheel、依赖锁、CycloneDX SBOM、发布音频、质量参考/输出、模型文件、模型清单、Nginx、systemd 和主机规格十一类制品。三份门禁报告必须绑定同一源码提交，音频和质量输入的 SHA-256 必须与聚合制品匹配，模型清单的 revision、文件名、大小和 SHA-256 必须与报告及保留的模型文件完全一致，防止任意文件冒充已验证模型。`host-profile` 必须在目标主机生成，并将该主机的平台信息、源码提交和其余十类工件的名称、大小、SHA-256 绑定为同一批部署证据。Wheel 必须是有界且路径安全的纯 Python TurnAlign 包，其内嵌源码 commit 必须与聚合门禁一致，控制台入口和 `RECORD` 中每个文件的 SHA-256/大小也必须完整匹配。systemd unit 会按实际指令而非注释重新解析，并验证回环监听、凭据文件、预加载、不可变模型、容量/生命周期边界、网络隔离、非 root 身份和最小权限设置。Nginx 配置也会按语法树重新解析，并与公网 `wss://` 报告及 systemd 端点交叉验证 TLS、WebSocket Upgrade、回环 upstream、限流、禁止重试、私有 metrics 和超时关系。依赖锁必须使用带 SHA-256 的精确版本，SBOM 必须标识 TurnAlign 根组件、WebSocket 运行依赖和依赖图，并与所有无条件锁定版本一致；缺项或弱化的门禁会返回非零退出码。
 
+上游仓库推送与 `pyproject.toml` 版本完全一致的 `vX.Y.Z` 标签时，专用发布工作流会重新执行静态检查、两次可复现构建、Wheel 全量测试和 SBOM 生成，然后为 Wheel、sdist、SBOM 和校验和生成 GitHub/Sigstore provenance，保留 90 天。fork PR 只运行无写权限的工作流验证，不能签发制品。下载后可用 `gh attestation verify FILE --repo GuanZhengPM/TurnAlign` 复验构建身份。该工作流不会自动发布 PyPI 或创建 GitHub Release。
+
 仓库提供一套范围明确的 [Linux CPU systemd + Nginx 参考部署](deploy/README.md)，包含回环绑定、TLS 代理、速率限制、低权限运行、预加载和发布门禁清单。GPU/MPS 部署必须按目标硬件单独验证，不能直接套用这份 CPU 安全单元。
 
 内置 GLM-ASR、Transformers Whisper 和 Paraformer 别名现在固定到不可变提交。正式发布的 `release-gate` 和 `serve` 都应启用 `--require-immutable-model-revision`；服务会在预加载或首次创建后端时拒绝浮动版本。自定义 Hugging Face 模型用 `--backend-option revision=COMMIT_SHA`，自定义 FunASR 模型用 `--backend-option model_revision=COMMIT_SHA`。不提供提交版本元数据的后端应改用经过校验的本地模型制品，并且不要启用该门禁。
@@ -585,6 +587,16 @@ metrics, disabled retries, and safe proxy/application timeout ordering;
 the SBOM must identify TurnAlign and the WebSocket runtime, include a dependency
 graph, and match every unconditional locked version.
 Missing or weakened evidence returns a non-zero exit code.
+
+When the upstream repository receives a `vX.Y.Z` tag that exactly matches the
+project version, the dedicated release workflow repeats static checks, two
+reproducible builds, the full Wheel-installed suite and SBOM generation before
+creating GitHub/Sigstore provenance for the Wheel, sdist, SBOM and checksums.
+Fork pull requests run only the read-only workflow validation and cannot attest
+artifacts. Verify a downloaded file with
+`gh attestation verify FILE --repo GuanZhengPM/TurnAlign`. The workflow retains
+artifacts for 90 days; it does not
+publish to PyPI or create a GitHub Release.
 
 A scoped [Linux CPU systemd and Nginx reference deployment](deploy/README.md)
 is included with loopback binding, TLS proxying, rate limits, an unprivileged

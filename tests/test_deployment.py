@@ -6,6 +6,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SERVICE = ROOT / "deploy" / "systemd" / "turnalign.service"
 NGINX = ROOT / "deploy" / "nginx" / "turnalign.conf.example"
 LEGACY_ENVIRONMENT = ROOT / "deploy" / "systemd" / "turnalign.env.example"
+RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
 
 
 def option_number(content: str, option: str) -> float:
@@ -94,6 +95,27 @@ class DeploymentArtifactTests(unittest.TestCase):
         self.assertIn('"/deploy"', pyproject)
         self.assertIn('"/hatch_build.py"', pyproject)
         self.assertIn("[tool.hatch.build.targets.wheel.hooks.custom]", pyproject)
+
+    def test_release_workflow_is_upstream_tag_only_and_attested(self):
+        content = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        for requirement in (
+            'tags: ["v*.*.*"]',
+            "pull_request:",
+            (
+                "if: github.event_name == 'push' && github.repository == "
+                "'GuanZhengPM/TurnAlign'"
+            ),
+            "artifact-metadata: write",
+            "attestations: write",
+            "id-token: write",
+            "persist-credentials: false",
+            'git merge-base --is-ancestor "$GITHUB_SHA" origin/main',
+            "actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6",
+            "sbom-path: dist-a/sbom.cdx.json",
+            'gh attestation verify "$artifact"',
+            "retention-days: 90",
+        ):
+            self.assertIn(requirement, content)
 
 
 if __name__ == "__main__":
