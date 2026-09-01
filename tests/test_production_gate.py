@@ -616,7 +616,11 @@ class ProductionGateTests(unittest.TestCase):
                 self.assert_encoding = encoding
                 return self.value
 
-        with patch.object(production_gate_module.sys, "prefix", prefix), patch.object(
+        with patch.object(
+            production_gate_module.os.path,
+            "abspath",
+            side_effect=lambda value: value,
+        ), patch.object(production_gate_module.sys, "prefix", prefix), patch.object(
             production_gate_module.sys,
             "executable",
             f"{prefix}/bin/python",
@@ -636,7 +640,11 @@ class ProductionGateTests(unittest.TestCase):
         ), self.assertRaisesRegex(ValueError, "versioned production"):
             production_gate_module._installed_runtime_identity(source_commit)
 
-        with patch.object(production_gate_module.sys, "prefix", prefix), patch.object(
+        with patch.object(
+            production_gate_module.os.path,
+            "abspath",
+            side_effect=lambda value: value,
+        ), patch.object(production_gate_module.sys, "prefix", prefix), patch.object(
             production_gate_module.sys,
             "executable",
             f"{prefix}/bin/python",
