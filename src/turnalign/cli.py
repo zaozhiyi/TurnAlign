@@ -34,6 +34,7 @@ from .plugins import AsrConfig
 from .policy import AUTH_TOKEN_MAX_BYTES, ServerPolicy, validate_auth_token
 from .production_gate import (
     REQUIRED_ARTIFACT_KINDS,
+    create_model_manifest,
     run_production_gate,
     write_json_report,
 )
@@ -380,6 +381,17 @@ def production_gate(args) -> int:
     )
     _emit_gate_report(report, args.report)
     return 0 if report.passed else 1
+
+
+def model_manifest(args) -> int:
+    payload = create_model_manifest(
+        args.model_id,
+        args.model_revision,
+        args.file,
+    )
+    write_json_report(args.output, payload)
+    print(json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False))
+    return 0
 
 
 def _effective_device(requested: str) -> str:
@@ -911,6 +923,20 @@ def main() -> int:
         type=Path,
         help="Persist the aggregate JSON verdict",
     )
+    model_manifest_parser = commands.add_parser(
+        "model-manifest",
+        help="Hash retained model files into production provenance evidence",
+    )
+    model_manifest_parser.add_argument("--model-id", required=True)
+    model_manifest_parser.add_argument("--model-revision", required=True)
+    model_manifest_parser.add_argument(
+        "--file",
+        action="append",
+        type=Path,
+        required=True,
+        help="Retained model file or archive; repeat for every file",
+    )
+    model_manifest_parser.add_argument("--output", type=Path, required=True)
     doctor_parser = commands.add_parser("doctor", help="Detect and select the local inference device")
     doctor_parser.add_argument(
         "--device",
@@ -1193,6 +1219,8 @@ def main() -> int:
         return websocket_gate(args)
     if args.command == "production-gate":
         return production_gate(args)
+    if args.command == "model-manifest":
+        return model_manifest(args)
     if args.command == "doctor":
         print(json.dumps(runtime_report(args.device), ensure_ascii=False, indent=2))
         return 0

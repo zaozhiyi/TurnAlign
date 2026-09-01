@@ -680,6 +680,42 @@ class CliIntegrationTests(unittest.TestCase):
                 "passed",
             )
 
+    def test_model_manifest_hashes_files_and_persists_provenance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "model.safetensors"
+            second = root / "tokenizer.json"
+            output = root / "evidence" / "model-manifest.json"
+            first.write_bytes(b"weights")
+            second.write_bytes(b"tokenizer")
+
+            with patch("sys.argv", [
+                "turnalign",
+                "model-manifest",
+                "--model-id",
+                "huggingface://organization/model",
+                "--model-revision",
+                "a" * 40,
+                "--file",
+                str(first),
+                "--file",
+                str(second),
+                "--output",
+                str(output),
+            ]), patch("builtins.print"):
+                self.assertEqual(cli.main(), 0)
+
+            payload = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(payload["model_revision"], "a" * 40)
+            self.assertEqual(
+                [item["name"] for item in payload["files"]],
+                ["model.safetensors", "tokenizer.json"],
+            )
+            self.assertEqual(
+                payload["files"][0]["sha256"],
+                cli._sha256_file(first),
+            )
+
     def test_replay_creates_parent_and_valid_end_event(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

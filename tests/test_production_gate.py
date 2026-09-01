@@ -174,9 +174,25 @@ class ProductionGateTests(unittest.TestCase):
                         "dependsOn": ["websockets==17.1"],
                     }],
                 })
+            elif kind == "model-manifest":
+                path.write_text("pending\n", encoding="utf-8")
             else:
                 path.write_bytes(f"immutable {kind}\n".encode())
             artifacts.append((kind, path))
+        model = next(path for kind, path in artifacts if kind == "model")
+        manifest = next(
+            path for kind, path in artifacts if kind == "model-manifest"
+        )
+        write_json_report(manifest, {
+            "schema_version": 1,
+            "model_id": "modelscope://damo/paraformer-zh-streaming",
+            "model_revision": "a" * 40,
+            "files": [{
+                "name": model.name,
+                "sha256": hashlib.sha256(model.read_bytes()).hexdigest(),
+                "bytes": model.stat().st_size,
+            }],
+        })
         return artifacts
 
     def test_passes_and_hash_binds_all_required_evidence(self):
@@ -369,6 +385,44 @@ class ProductionGateTests(unittest.TestCase):
                 )
 
                 with self.subTest(report=report_name, expected=expected):
+                    self.assertFalse(report.passed)
+                    self.assertIn(expected, "\n".join(report.failures))
+
+    def test_binds_model_manifest_revision_and_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, quality, websocket = self._reports(root)
+            for mutate, expected in (
+                (
+                    lambda payload: payload.update(model_revision="c" * 40),
+                    "revision does not match",
+                ),
+                (
+                    lambda payload: payload["files"][0].update(sha256="d" * 64),
+                    "does not match the retained model artifacts",
+                ),
+                (
+                    lambda payload: payload["files"][0].update(bytes=True),
+                    "invalid file identity",
+                ),
+            ):
+                artifacts = self._artifacts(root)
+                manifest = next(
+                    path for kind, path in artifacts if kind == "model-manifest"
+                )
+                payload = json.loads(manifest.read_text(encoding="utf-8"))
+                mutate(payload)
+                write_json_report(manifest, payload)
+
+                report = run_production_gate(
+                    release,
+                    quality,
+                    websocket,
+                    source_commit="b" * 40,
+                    artifacts=artifacts,
+                )
+
+                with self.subTest(expected=expected):
                     self.assertFalse(report.passed)
                     self.assertIn(expected, "\n".join(report.failures))
 

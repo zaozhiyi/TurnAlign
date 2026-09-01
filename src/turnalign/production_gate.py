@@ -21,6 +21,7 @@ _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _MAX_REPORT_BYTES = 2 * 1024 * 1024
 _MAX_SBOM_BYTES = 16 * 1024 * 1024
 _MAX_LOCK_BYTES = 4 * 1024 * 1024
+_MAX_MODEL_MANIFEST_BYTES = 2 * 1024 * 1024
 _LOCK_REQUIREMENT_PATTERN = re.compile(
     r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([A-Za-z0-9][A-Za-z0-9.!+_-]*)(?:\s|;|$)"
 )
@@ -32,6 +33,7 @@ REQUIRED_ARTIFACT_KINDS = frozenset({
     "dependency-lock",
     "host-profile",
     "model",
+    "model-manifest",
     "nginx-config",
     "quality-hypothesis",
     "quality-reference",
@@ -287,6 +289,49 @@ def _integer_at_least(value: object, floor: int) -> bool:
 
 def _nonnegative_integer(value: object) -> bool:
     return _integer_at_least(value, 0)
+
+
+def _valid_model_id(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and value.strip() == value
+        and len(value) <= 512
+        and not any(ord(character) < 32 or ord(character) == 127 for character in value)
+    )
+
+
+def create_model_manifest(
+    model_id: str,
+    model_revision: str,
+    files: list[Path],
+) -> dict[str, object]:
+    """Hash immutable model files into the schema consumed by production-gate."""
+
+    if not _valid_model_id(model_id):
+        raise ValueError("model_id must be a non-empty bounded identifier")
+    if _MODEL_REVISION_PATTERN.fullmatch(model_revision) is None:
+        raise ValueError("model_revision must be an immutable 40- or 64-character hash")
+    if not files:
+        raise ValueError("at least one model file is required")
+    entries = []
+    names = set()
+    for path in files:
+        if path.name in names:
+            raise ValueError(f"model files must have unique base names: {path.name}")
+        names.add(path.name)
+        snapshot = _snapshot_evidence(path)
+        entries.append({
+            "name": path.name,
+            "sha256": snapshot.sha256,
+            "bytes": snapshot.size,
+        })
+    return {
+        "schema_version": 1,
+        "model_id": model_id,
+        "model_revision": model_revision,
+        "files": sorted(entries, key=lambda item: cast(str, item["name"])),
+    }
 
 
 def _public_hostname(hostname: str | None) -> bool:
@@ -880,6 +925,73 @@ def _validate_dependency_lock(
     return requirements
 
 
+def _validate_model_manifest(
+    snapshot: _EvidenceSnapshot,
+    model_revision: object,
+    artifacts: list[ArtifactEvidence],
+    failures: list[str],
+) -> None:
+    if snapshot.content is None:
+        failures.append(f"model manifest exceeds {_MAX_MODEL_MANIFEST_BYTES} bytes")
+        return
+    try:
+        payload = strict_json_loads(snapshot.content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        failures.append(f"model manifest is not strict JSON: {error}")
+        return
+    if not isinstance(payload, dict) or set(payload) != {
+        "schema_version",
+        "model_id",
+        "model_revision",
+        "files",
+    }:
+        failures.append("model manifest has an invalid top-level schema")
+        return
+    if (
+        isinstance(payload.get("schema_version"), bool)
+        or payload.get("schema_version") != 1
+    ):
+        failures.append("model manifest has an unsupported schema version")
+    model_id = payload.get("model_id")
+    if not _valid_model_id(model_id):
+        failures.append("model manifest does not identify a valid model")
+    if payload.get("model_revision") != model_revision:
+        failures.append("model manifest revision does not match the gate reports")
+
+    files = payload.get("files")
+    if not isinstance(files, list) or not files:
+        failures.append("model manifest has no model files")
+        return
+    manifest_files: list[tuple[str, str, int]] = []
+    for item in files:
+        if not isinstance(item, dict) or set(item) != {"name", "sha256", "bytes"}:
+            failures.append("model manifest contains an invalid file entry")
+            return
+        name = item.get("name")
+        digest = item.get("sha256")
+        size = item.get("bytes")
+        if (
+            not isinstance(name, str)
+            or not name
+            or Path(name).name != name
+            or not isinstance(digest, str)
+            or _SHA256_PATTERN.fullmatch(digest) is None
+            or not _positive_integer(size)
+        ):
+            failures.append("model manifest contains an invalid file identity")
+            return
+        manifest_files.append((name, digest, cast(int, size)))
+    if len({name for name, _digest, _size in manifest_files}) != len(manifest_files):
+        failures.append("model manifest contains duplicate file names")
+        return
+
+    actual_files = [(item.name, item.sha256, item.bytes) for item in artifacts]
+    if len({name for name, _digest, _size in actual_files}) != len(actual_files):
+        failures.append("model artifacts contain duplicate file names")
+    elif sorted(manifest_files) != sorted(actual_files):
+        failures.append("model manifest does not match the retained model artifacts")
+
+
 def run_production_gate(
     release_path: Path,
     quality_path: Path,
@@ -900,6 +1012,7 @@ def run_production_gate(
     _validate_websocket(websocket, failures)
 
     artifact_evidence = []
+    evidence_by_kind: dict[str, list[ArtifactEvidence]] = {}
     kinds = set()
     artifact_paths: dict[str, list[Path]] = {}
     artifact_digests: dict[str, list[str]] = {}
@@ -909,12 +1022,13 @@ def run_production_gate(
             raise ValueError(f"unsupported artifact kind: {kind}")
         capture_limit = {
             "dependency-lock": _MAX_LOCK_BYTES,
+            "model-manifest": _MAX_MODEL_MANIFEST_BYTES,
             "sbom": _MAX_SBOM_BYTES,
         }.get(kind)
         snapshot = _snapshot_evidence(path, capture_limit=capture_limit)
-        artifact_evidence.append(
-            ArtifactEvidence(kind, path.name, snapshot.sha256, snapshot.size)
-        )
+        evidence = ArtifactEvidence(kind, path.name, snapshot.sha256, snapshot.size)
+        artifact_evidence.append(evidence)
+        evidence_by_kind.setdefault(kind, []).append(evidence)
         kinds.add(kind)
         artifact_paths.setdefault(kind, []).append(path)
         artifact_digests.setdefault(kind, []).append(snapshot.sha256)
@@ -942,6 +1056,15 @@ def run_production_gate(
             failures.append(
                 f"SBOM does not match locked runtime requirement: {name}=={version}"
             )
+
+    model_manifest_snapshots = artifact_snapshots.get("model-manifest", [])
+    if len(model_manifest_snapshots) == 1:
+        _validate_model_manifest(
+            model_manifest_snapshots[0],
+            release.get("model_revision"),
+            evidence_by_kind.get("model", []),
+            failures,
+        )
 
     for name, report in (
         ("release", release),
