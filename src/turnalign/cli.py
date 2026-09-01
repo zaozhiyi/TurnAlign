@@ -26,7 +26,7 @@ from .devices import runtime_report
 from .evaluation import TextNormalization, evaluate_events, evaluate_quality_gate
 from .exporters import render_srt, render_text
 from .hints import AsrHints
-from .jsonutil import strict_json_object
+from .jsonutil import strict_json_loads, strict_json_object
 from .models import TranscriptEvent
 from .offline import OfflineRefinementPipeline
 from .pipelines import TwoPassPipeline
@@ -425,8 +425,12 @@ def _extra_options(items: list[str]) -> dict[str, object]:
         if "=" not in item:
             raise ValueError(f"backend option must be key=value: {item}")
         key, raw = item.split("=", 1)
+        if not key or key != key.strip() or any(character.isspace() for character in key):
+            raise ValueError(f"backend option has an invalid key: {key!r}")
+        if key in result:
+            raise ValueError(f"duplicate backend option: {key}")
         try:
-            result[key] = json.loads(raw)
+            result[key] = strict_json_loads(raw)
         except json.JSONDecodeError:
             result[key] = raw
     return result

@@ -506,6 +506,34 @@ class CliIntegrationTests(unittest.TestCase):
             frozenset({"float16", "int8"}),
         )
 
+    def test_component_options_reject_ambiguous_or_nonstandard_values(self):
+        self.assertEqual(
+            cli._extra_options([
+                "threads=4",
+                "flash_attention=false",
+                "revision=COMMIT_SHA",
+                'settings={"batch":2}',
+            ]),
+            {
+                "threads": 4,
+                "flash_attention": False,
+                "revision": "COMMIT_SHA",
+                "settings": {"batch": 2},
+            },
+        )
+        for options, expected in (
+            (["temperature=NaN"], "non-standard JSON number"),
+            (["temperature=Infinity"], "non-standard JSON number"),
+            (["settings={\"batch\":1,\"batch\":2}"], "duplicate JSON key"),
+            (["threads=1", "threads=2"], "duplicate backend option"),
+            (["=1"], "invalid key"),
+            (["bad key=1"], "invalid key"),
+        ):
+            with self.subTest(options=options), self.assertRaisesRegex(
+                ValueError, expected
+            ):
+                cli._extra_options(options)
+
     def test_serve_handles_operator_interrupt_without_traceback(self):
         async def interrupted(*_args, **_options):
             raise KeyboardInterrupt
