@@ -4,6 +4,8 @@ import json
 import math
 import threading
 from dataclasses import dataclass, field
+from hmac import compare_digest
+from secrets import token_urlsafe
 from time import monotonic
 from uuid import uuid4
 
@@ -27,6 +29,7 @@ class RecoveryEventLimitError(RuntimeError):
 class RecoverySession:
     session_id: str
     config_key: str
+    resume_token: str = field(default_factory=lambda: token_urlsafe(32), repr=False)
     timeline: AudioTimeline = field(default_factory=AudioTimeline)
     next_audio_sequence: int = 0
     next_event_sequence: int = 0
@@ -88,6 +91,7 @@ class RecoveryStore:
         self,
         config_key: str,
         requested_session_id: str | None = None,
+        resume_token: str | None = None,
     ) -> tuple[RecoverySession, bool]:
         with self._lock:
             if self._closed:
@@ -95,7 +99,13 @@ class RecoveryStore:
             if requested_session_id is not None:
                 session = self._sessions.get(requested_session_id)
                 if session is None:
-                    raise LookupError("recovery session was not found")
+                    raise PermissionError("recovery authentication failed")
+                if (
+                    not isinstance(resume_token, str)
+                    or not resume_token
+                    or not compare_digest(resume_token, session.resume_token)
+                ):
+                    raise PermissionError("recovery authentication failed")
                 if session.config_key != config_key:
                     raise ValueError("recovery session configuration changed")
                 if session.completed:

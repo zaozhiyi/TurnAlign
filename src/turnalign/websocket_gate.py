@@ -452,6 +452,7 @@ async def _run_recovery_probe(
         flow_allowed.set()
         counters = {"events": 0, "commits": 0, "audio_acks": 0}
         session_id = ""
+        resume_token = ""
         last_acknowledged_sequence: int | None = None
         final_buffered_bytes: int | None = None
         highest_event_sequence = -1
@@ -476,6 +477,7 @@ async def _run_recovery_probe(
                     request[key] = value
             if resume_session_id is not None:
                 request["resume_session_id"] = resume_session_id
+                request["resume_token"] = resume_token
                 request["acknowledged_event_sequence"] = highest_event_sequence
             return request
 
@@ -492,7 +494,8 @@ async def _run_recovery_probe(
             payload: dict[str, object],
             *,
             expected_session_id: str | None = None,
-        ) -> tuple[str, int]:
+            expected_resume_token: str | None = None,
+        ) -> tuple[str, int, str]:
             if payload.get("type") == "error":
                 raise RuntimeError(
                     f"server rejected recovery probe: "
@@ -506,6 +509,14 @@ async def _run_recovery_probe(
                 raise ValueError("server ready response is missing a session_id")
             if expected_session_id is not None and ready_session_id != expected_session_id:
                 raise ValueError("recovered session_id changed")
+            ready_resume_token = payload.get("resume_token")
+            if not isinstance(ready_resume_token, str) or not ready_resume_token:
+                raise ValueError("server ready response is missing a resume_token")
+            if (
+                expected_resume_token is not None
+                and ready_resume_token != expected_resume_token
+            ):
+                raise ValueError("recovered resume_token changed")
             next_audio_sequence = payload.get("next_audio_sequence")
             if (
                 isinstance(next_audio_sequence, bool)
@@ -513,7 +524,7 @@ async def _run_recovery_probe(
                 or next_audio_sequence < 0
             ):
                 raise ValueError("ready response has invalid next_audio_sequence")
-            return ready_session_id, next_audio_sequence
+            return ready_session_id, next_audio_sequence, ready_resume_token
 
         async def consume_message(websocket) -> None:
             nonlocal final_buffered_bytes, highest_event_sequence
@@ -586,7 +597,7 @@ async def _run_recovery_probe(
         try:
             await first.send(json.dumps(start_request(), ensure_ascii=False))
             ready = await receive_json(first)
-            session_id, _ = validate_ready(ready)
+            session_id, _, resume_token = validate_ready(ready)
             while (
                 sent_samples < disconnect_target
                 or last_acknowledged_sequence is None
@@ -640,9 +651,14 @@ async def _run_recovery_probe(
                 await asyncio.sleep(0.05)
                 continue
             try:
-                recovered_session_id, resumed_next_audio_sequence = validate_ready(
+                (
+                    recovered_session_id,
+                    resumed_next_audio_sequence,
+                    _recovered_resume_token,
+                ) = validate_ready(
                     response,
                     expected_session_id=session_id,
+                    expected_resume_token=resume_token,
                 )
                 if recovered_session_id != session_id or response.get("resumed") is not True:
                     raise ValueError("server did not confirm recovery resume")

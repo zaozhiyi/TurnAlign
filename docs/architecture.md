@@ -151,9 +151,12 @@ chunks, waits for model initialization before `ready`, reuses loaded models
 through a serialized pool, and rejects client-controlled paths by default.
 Accepted audio is retained on disk while event replay metadata remains in a
 bounded in-memory recovery store with a per-session replay window; a reconnect
-resumes sequence/segment numbering and replays only retained events newer than
-the client's acknowledgement. Stale acknowledgements fail explicitly rather
-than producing a partial replay. The default bind remains loopback. See
+must present both the public session ID and its independent high-entropy secret,
+then resumes sequence/segment numbering and replays only retained events newer
+than the client's acknowledgement. Stale acknowledgements fail explicitly
+rather than producing a partial replay. Accepted chunks are persisted before
+the inference thread can observe them, so event acknowledgement metadata cannot
+race ahead of the recovery timeline. The default bind remains loopback. See
 `docs/websocket.md`.
 
 On cancellation, cooperative backends receive a cancel hook (the bundled

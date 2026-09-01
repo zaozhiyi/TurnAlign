@@ -137,7 +137,7 @@ turnalign transcribe audio.mp3 --backend glm-asr \
 - 说话人结果没有人工标注真值，暂时无法给出可靠的 DER。
 - 很短的应答、抢话和重叠语音仍可能分到相邻说话人。
 - 在线说话人会话接口已经存在，但仓库尚未内置经过人工 DER 验证的在线说话人模型；CAM++ 仍用于离线全局修正。
-- WebSocket v1 可在同一服务进程内按 `session_id` 断线续传，并在有界事件窗口内重放未确认事件；确认点过旧或跨进程恢复仍需客户端保留源音频。
+- WebSocket v1 可在同一服务进程内凭 `session_id` 与独立高熵 `resume_token` 断线续传，并在有界事件窗口内重放未确认事件；确认点过旧或跨进程恢复仍需客户端保留源音频。
 - 公共音频时间线和对齐切片已磁盘化并有界分批；当前 FSMN-VAD/CAM++ 上游离线 API 仍会为模型生成完整浮点输入，因此默认拒绝超过 3 小时的单次输入。可用 `--vad-option max_materialized_seconds=...` 或 `--diarizer-option max_materialized_seconds=...` 显式调整，但应先按部署内存容量测算。
 - whisper.cpp 官方 CLI 只接受命令行 `--prompt`；TurnAlign 因此默认拒绝向该后端传递私有热词或上下文。只有能接受同机用户通过进程列表读取提示词的部署，才应显式设置 `--backend-option allow_prompt_argv=true`。
 - GLM 正文按 30 秒窗口与 Paraformer 时间轴对齐，边界属于近似结果。
@@ -197,7 +197,7 @@ python examples/websocket_file_client.py sample.wav --backend glm-asr --language
 
 `release-gate` 必须调用真实后端，而不是 mock。它会验证事件状态机、原生流式声明、首个 partial、可选的首次 commit 延迟、最少 commit 数、初始化时间和 RTF，并在任一门槛失败时返回非零退出码。默认要求至少 10 秒音频；应将 `--output` 生成的 JSONL 与命令输出一并保存为发布证据。准确率发布门禁使用人工标注 JSONL 执行 `turnalign quality-gate`：至少配置一项 CER、WER、说话人错误或修订稳定性上限，并按目标场景设定最小标注规模；任一条件失败时返回非零退出码。中文参考没有人工分词时应以 CER 为主。说话人指标是单活跃说话人区间分数，不等同于支持重叠语音与 collar 的标准 DER。阈值必须由实际产品容忍度和代表性语料得出，仓库不提供虚构的通用阈值。`turnalign evaluate` 仍可用于只生成指标、不阻断发布的分析。
 
-`websocket-gate` 使用生成的静音并发检查已部署服务的协议、流控、确认、完成率和延迟，不保存识别文本。默认要求每会话至少一个 ACK 且不允许丢弃 partial，可用 `--min-audio-acks`、`--max-dropped-partials` 和 `--max-backpressure-pauses` 收紧目标环境门槛。它只证明传输与生命周期，不证明识别质量；突发测试不加 `--realtime`，长稳测试则加上该参数。生产 TLS 应由反向代理或服务网格终止，门槛直接访问外部 `wss://` 地址。非浏览器客户默认允许；浏览器 Origin 默认拒绝，必须用 `--allow-origin` 精确放行。`GET /healthz` 和 `GET /readyz` 可用作存活/就绪探针。进程收到 `SIGTERM` 后会停止接入、关闭现有连接并在 `--shutdown-grace-timeout` 后强制取消未退出的处理器。恢复音频默认限制为每会话 512 MiB、每进程 2 GiB，完成后立即释放临时文件；断线会话的默认恢复窗口为 300 秒，超时由后台任务自动清理。相关上限均可通过 `serve --help` 调整。服务进程默认最多接受 32 个会话，但同一模型默认只有一个实例；需要进程内并行时显式设置 `--backend-replicas N`（最多 8，模型内存也近似乘以 N），或部署多个单副本进程。生产服务应加 `--preload`，在监听端口前加载全部副本；配合 `--warmup-file` 可在启动阶段执行真实推理。首次消息、客户端空闲、模型初始化、结束收尾和工作线程退出时间均有界，可通过 `turnalign serve --help` 调整。命令行后端的可执行文件、模型路径和参数可由运维侧通过 `--executable`、`--model-path` 和 `--backend-option KEY=VALUE` 固定，无需开放客户端路径权限。内置后端的私密热词按租约注入并在归还时清空，不同热词会话可复用同一大模型实例。
+`websocket-gate` 使用生成的静音并发检查已部署服务的协议、流控、确认、完成率和延迟，不保存识别文本或恢复凭证。默认要求每会话至少一个 ACK 且不允许丢弃 partial，可用 `--min-audio-acks`、`--max-dropped-partials` 和 `--max-backpressure-pauses` 收紧目标环境门槛。它只证明传输与生命周期，不证明识别质量；突发测试不加 `--realtime`，长稳测试则加上该参数。生产 TLS 应由反向代理或服务网格终止，门槛直接访问外部 `wss://` 地址。非浏览器客户默认允许；浏览器 Origin 默认拒绝，必须用 `--allow-origin` 精确放行。`GET /healthz` 和 `GET /readyz` 可用作存活/就绪探针。进程收到 `SIGTERM` 后会停止接入、关闭现有连接并在 `--shutdown-grace-timeout` 后强制取消未退出的处理器。恢复音频默认限制为每会话 512 MiB、每进程 2 GiB，完成后立即释放临时文件；断线会话的默认恢复窗口为 300 秒，超时由后台任务自动清理。相关上限均可通过 `serve --help` 调整。服务进程默认最多接受 32 个会话，但同一模型默认只有一个实例；需要进程内并行时显式设置 `--backend-replicas N`（最多 8，模型内存也近似乘以 N），或部署多个单副本进程。生产服务应加 `--preload`，在监听端口前加载全部副本；配合 `--warmup-file` 可在启动阶段执行真实推理。首次消息、客户端空闲、模型初始化、结束收尾和工作线程退出时间均有界，可通过 `turnalign serve --help` 调整。命令行后端的可执行文件、模型路径和参数可由运维侧通过 `--executable`、`--model-path` 和 `--backend-option KEY=VALUE` 固定，无需开放客户端路径权限。内置后端的私密热词按租约注入并在归还时清空，不同热词会话可复用同一大模型实例。
 
 内置 GLM-ASR、Transformers Whisper 和 Paraformer 别名现在固定到不可变提交。正式发布的 `release-gate` 和 `serve` 都应启用 `--require-immutable-model-revision`；服务会在预加载或首次创建后端时拒绝浮动版本。自定义 Hugging Face 模型用 `--backend-option revision=COMMIT_SHA`，自定义 FunASR 模型用 `--backend-option model_revision=COMMIT_SHA`。不提供提交版本元数据的后端应改用经过校验的本地模型制品，并且不要启用该门禁。
 
@@ -366,7 +366,7 @@ See [docs/validation.md](docs/validation.md) for the full run log and metrics.
 - The speaker output has no human-labelled reference, so a reliable DER is not available.
 - Very short responses, interruptions, and overlapping speech may be assigned to a neighbouring speaker.
 - The online diarization session contract is implemented, but the repository does not yet ship an online speaker model validated against human-labelled DER; CAM++ remains an offline refinement component.
-- WebSocket v1 resumes by `session_id` and replays unacknowledged events within a bounded in-process window; clients retain source audio for stale-window or cross-process recovery.
+- WebSocket v1 resumes with both `session_id` and its high-entropy `resume_token`, then replays unacknowledged events within a bounded in-process window; clients retain source audio for stale-window or cross-process recovery.
 - The common timeline and alignment slices are disk-backed and bounded in batches. Current upstream FSMN-VAD/CAM++ offline APIs still materialize one full float input, so TurnAlign rejects inputs longer than three hours by default. Override with `--vad-option max_materialized_seconds=...` or `--diarizer-option max_materialized_seconds=...` only after sizing deployment memory.
 - The official whisper.cpp CLI accepts prompts only through `--prompt`, so TurnAlign rejects private hints for this backend by default. Set `--backend-option allow_prompt_argv=true` only on deployments that accept prompt visibility in the local process list.
 - GLM text is aligned to the Paraformer timeline inside 30-second source windows, so speaker boundaries are approximate.
@@ -486,7 +486,8 @@ sets.
 Add `--verify-recovery` to run one extra fault probe after the normal sessions.
 It disconnects only after audio is durably acknowledged on a zero-buffer
 boundary, retries transient `session_conflict` responses, resumes the same
-session, and requires continuous audio sequence numbers plus a terminal event.
+session with its per-session secret, and requires continuous audio sequence
+numbers plus a terminal event.
 The report contains only counters and sequence metadata, never transcript text.
 Run the probe through the public load balancer. Since recovery is process-local,
 multi-instance deployments require session affinity for the configured recovery

@@ -128,6 +128,8 @@ default. This prevents large metadata, hint, or unknown-field payloads from
 reaching JSON and model initialization while preserving the larger binary-frame
 limit required by high-rate multichannel PCM. Configure the control limit with
 `--max-control-message-bytes` (maximum 1 MiB).
+Duplicate object keys and non-standard `NaN`/`Infinity` values are rejected, and
+server responses never serialize non-finite JSON numbers.
 
 `ready` is sent only after the selected model and allowed components have loaded
 successfully:
@@ -137,6 +139,7 @@ successfully:
   "type": "ready",
   "protocol_version": 1,
   "session_id": "uuid",
+  "resume_token": "high-entropy-session-secret",
   "model_loaded": true,
   "backend": "glm-asr",
   "sample_rate": 16000,
@@ -149,6 +152,9 @@ successfully:
 If initialization fails, the server sends an error and never sends `ready`.
 Private hotword/context values are never copied into ready, event or error
 messages; only counts and usage flags are exposed.
+`resume_token` is the exception: it is a per-session credential returned only
+to the client and required for recovery. Keep it out of logs, URLs, analytics,
+and persisted transcripts.
 
 Segmentation controls are finite and bounded: `vad_threshold` is 0–1,
 `silence_seconds` is 0.1–10, `max_utterance_seconds` is 1–300, and
@@ -241,6 +247,7 @@ After an unexpected disconnect, reconnect with the same configuration:
   "type": "start",
   "backend": "glm-asr",
   "resume_session_id": "uuid",
+  "resume_token": "high-entropy-session-secret",
   "acknowledged_event_sequence": 8
 }
 ```
@@ -249,6 +256,9 @@ The server replays stored events after sequence 8, reprocesses accepted audio
 after the last committed boundary, continues audio/event/segment sequences, and
 preserves the same session ID. An open partial is recovery-committed before new
 segments begin, avoiding duplicate IDs or revision rollback.
+The opaque `session_id` is not sufficient authorization: a missing or incorrect
+`resume_token` returns `unauthorized`, including after the recovery entry has
+expired, so session existence isn't exposed to an unauthenticated resume probe.
 
 Recovery is scoped to the lifetime of the server process and a bounded
 32-session store. Each session retains the newest 2,048 events by default;

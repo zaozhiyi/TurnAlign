@@ -25,7 +25,9 @@ class RecoveryStoreTests(unittest.TestCase):
             self.assertEqual(payload["acknowledged_sequence"], 0)
             store.release(session)
 
-            recovered, resumed = store.open("config", session.session_id)
+            recovered, resumed = store.open(
+                "config", session.session_id, session.resume_token
+            )
             self.assertTrue(resumed)
             self.assertEqual(recovered.timeline.end, 0.1)
             self.assertEqual(recovered.next_segment_index, 1)
@@ -36,7 +38,7 @@ class RecoveryStoreTests(unittest.TestCase):
             self.assertTrue(replay[0]["metadata"]["recovery_committed"])
             store.release(recovered, completed=True)
             with self.assertRaisesRegex(ValueError, "completed"):
-                store.open("config", session.session_id)
+                store.open("config", session.session_id, session.resume_token)
         finally:
             store.close()
 
@@ -46,7 +48,27 @@ class RecoveryStoreTests(unittest.TestCase):
             session, _ = store.open("config-a")
             store.release(session)
             with self.assertRaisesRegex(ValueError, "configuration"):
-                store.open("config-b", session.session_id)
+                store.open("config-b", session.session_id, session.resume_token)
+        finally:
+            store.close()
+
+    def test_resume_requires_the_session_secret(self):
+        store = RecoveryStore()
+        try:
+            session, _ = store.open("config")
+            store.release(session)
+            self.assertGreaterEqual(len(session.resume_token), 32)
+            self.assertNotIn(session.resume_token, repr(session))
+            for token in (None, "", "wrong-token"):
+                with self.subTest(token=token), self.assertRaisesRegex(
+                    PermissionError, "authentication"
+                ):
+                    store.open("config", session.session_id, token)
+            recovered, resumed = store.open(
+                "config", session.session_id, session.resume_token
+            )
+            self.assertTrue(resumed)
+            store.release(recovered, completed=True)
         finally:
             store.close()
 
@@ -187,8 +209,8 @@ class RecoveryStoreTests(unittest.TestCase):
             self.assertTrue(expired.timeline._closed)
             self.assertFalse(active.timeline._closed)
             store.append_audio(active, AudioChunk(array("h", [3, 4]).tobytes(), 0))
-            with self.assertRaisesRegex(LookupError, "not found"):
-                store.open("expired", expired.session_id)
+            with self.assertRaisesRegex(PermissionError, "authentication"):
+                store.open("expired", expired.session_id, expired.resume_token)
         finally:
             store.close()
 

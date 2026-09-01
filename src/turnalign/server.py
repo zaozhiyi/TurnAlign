@@ -113,7 +113,27 @@ async def _async_queue_put(
 
 
 def _json(item: object) -> str:
-    return json.dumps(item, ensure_ascii=False)
+    return json.dumps(
+        item,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    )
+
+
+def _strict_json_object(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    payload: dict[str, object] = {}
+    for key, value in pairs:
+        if key in payload:
+            raise ValueError(f"duplicate JSON key: {key}")
+        payload[key] = value
+    return payload
+
+
+def _reject_json_constant(value: str) -> object:
+    raise ValueError(f"non-standard JSON number: {value}")
 
 
 def _control_message(
@@ -126,7 +146,11 @@ def _control_message(
         raise TypeError(f"{label} must be a JSON object")
     if len(message) > max_bytes or len(message.encode("utf-8")) > max_bytes:
         raise ValueError(f"{label} exceeds {max_bytes} bytes")
-    payload = json.loads(message)
+    payload = json.loads(
+        message,
+        object_pairs_hook=_strict_json_object,
+        parse_constant=_reject_json_constant,
+    )
     if not isinstance(payload, dict):
         raise TypeError(f"{label} must be a JSON object")
     return payload
@@ -214,6 +238,7 @@ def _recovery_config_key(
 ) -> str:
     excluded = {
         "auth",
+        "resume_token",
         "resume_session_id",
         "acknowledged_event_sequence",
         "type",
@@ -528,6 +553,17 @@ async def serve(
             requested_session_id = request.get("resume_session_id")
             if requested_session_id is not None and not isinstance(requested_session_id, str):
                 raise TypeError("resume_session_id must be a string")
+            raw_resume_token = request.get("resume_token")
+            if raw_resume_token is None:
+                resume_token: str | None = None
+            elif isinstance(raw_resume_token, str):
+                resume_token = raw_resume_token
+            else:
+                raise TypeError("resume_token must be a string")
+            if requested_session_id is not None and not resume_token:
+                raise PermissionError("recovery authentication failed")
+            if requested_session_id is None and resume_token is not None:
+                raise ValueError("resume_token requires resume_session_id")
             acknowledged_event_sequence = _bounded_request_int(
                 request,
                 "acknowledged_event_sequence",
@@ -544,6 +580,7 @@ async def serve(
                     internal_chunk_ms=internal_chunk_ms,
                 ),
                 requested_session_id,
+                resume_token,
             )
             replay_audio_start = recovery_session.transcribed_through
             replay_audio_end = recovery_session.timeline.end
@@ -789,6 +826,7 @@ async def serve(
                 "type": "ready",
                 "protocol_version": 1,
                 "session_id": session_id,
+                "resume_token": recovery_session.resume_token,
                 "resumed": resumed,
                 "model_loaded": True,
                 "backend": backend_name,
@@ -843,6 +881,9 @@ async def serve(
                         "action": "pause",
                         "queue_depth": incoming.qsize(),
                     }))
+                # Recovery storage is the acceptance boundary. Never expose a
+                # chunk to the inference thread before it can be replayed.
+                audio_sequence = recovery_store.append_audio(recovery_session, item)
                 try:
                     incoming.put_nowait(item)
                 except queue.Full:
@@ -857,7 +898,6 @@ async def serve(
                         raise RuntimeError(
                             "audio input queue remained full; client must honor flow control"
                         ) from error
-                audio_sequence = recovery_store.append_audio(recovery_session, item)
                 transport_stats["internal_chunks"] += 1
                 transport_stats["queue_peak"] = max(
                     transport_stats["queue_peak"], incoming.qsize()

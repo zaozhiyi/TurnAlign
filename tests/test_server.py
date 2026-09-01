@@ -14,7 +14,14 @@ from unittest.mock import patch
 from turnalign.models import Hypothesis
 from turnalign.plugins import BackendCapabilities
 from turnalign.policy import ServerPolicy
-from turnalign.server import _OutputBackpressureError, _queue_output, serve
+from turnalign.recovery import RecoveryStore
+from turnalign.server import (
+    _control_message,
+    _json,
+    _OutputBackpressureError,
+    _queue_output,
+    serve,
+)
 from turnalign.websocket_gate import run_websocket_gate
 
 try:
@@ -154,7 +161,51 @@ class OversizedEventBackend(FakeServerBackend):
             )
 
 
+class PersistenceOrderSession:
+    def __init__(self, backend):
+        self.backend = backend
+
+    def accept_audio(self, _chunk):
+        self.backend.saw_persisted.append(self.backend.persisted.is_set())
+        self.backend.consumed.set()
+        return ()
+
+    def finish(self):
+        return ()
+
+    def cancel(self):
+        return None
+
+    def close(self):
+        return None
+
+
+class PersistenceOrderBackend(FakeServerBackend):
+    capabilities = BackendCapabilities(streaming=True, external_vad=False)
+
+    def __init__(self, persisted, consumed):
+        self.persisted = persisted
+        self.consumed = consumed
+        self.saw_persisted = []
+
+    def start_session(self):
+        return PersistenceOrderSession(self)
+
+
 class OutputQueueTests(unittest.TestCase):
+    def test_control_json_is_strict_and_server_json_is_standard(self):
+        for message, detail in (
+            ('{"type":"start","type":"cancel"}', "duplicate JSON key"),
+            ('{"type":"start","value":NaN}', "non-standard JSON number"),
+            ('{"type":"start","value":Infinity}', "non-standard JSON number"),
+        ):
+            with self.subTest(message=message), self.assertRaisesRegex(
+                ValueError, detail
+            ):
+                _control_message(message, label="test", max_bytes=1_024)
+        with self.assertRaisesRegex(ValueError, "Out of range float"):
+            _json({"value": float("nan")})
+
     def test_partial_is_dropped_immediately_when_output_is_full(self):
         outgoing = queue.Queue(maxsize=1)
         outgoing.put_nowait({"kind": "commit"})
@@ -739,7 +790,9 @@ class WebSocketTests(unittest.IsolatedAsyncioTestCase):
                     recovery.first_last_acknowledged_sequence,
                 )
                 self.assertEqual(recovery.final_buffered_bytes, 0)
-                self.assertNotIn("local test", json.dumps(report.to_dict()))
+                serialized_report = json.dumps(report.to_dict())
+                self.assertNotIn("local test", serialized_report)
+                self.assertNotIn("resume_token", serialized_report)
             finally:
                 shutdown_event.set()
                 await asyncio.wait_for(server_task, timeout=2)
@@ -932,6 +985,49 @@ class WebSocketTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertFalse(report.passed)
         self.assertIn("invalid buffered_bytes", report.results[0].failure)
+
+    async def test_audio_is_persisted_before_inference_can_observe_it(self):
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        persisted = Event()
+        consumed = Event()
+        backend = PersistenceOrderBackend(persisted, consumed)
+        original_append = RecoveryStore.append_audio
+
+        def delayed_append(store, session, chunk):
+            # With the unsafe queue-first ordering, the worker consumes this
+            # chunk while persistence is deliberately paused here.
+            consumed.wait(timeout=0.2)
+            sequence = original_append(store, session, chunk)
+            persisted.set()
+            return sequence
+
+        with (
+            patch("turnalign.server.create_asr", return_value=backend),
+            patch.object(RecoveryStore, "append_audio", delayed_append),
+        ):
+            server_task = asyncio.create_task(serve(
+                "127.0.0.1", port, default_backend="fake"
+            ))
+            await asyncio.sleep(0.05)
+            try:
+                async with connect(f"ws://127.0.0.1:{port}") as websocket:
+                    await websocket.send(json.dumps({"type": "start", "backend": "fake"}))
+                    self.assertEqual(json.loads(await websocket.recv())["type"], "ready")
+                    await websocket.send(array("h", [1_000] * 1_600).tobytes())
+                    self.assertEqual(json.loads(await websocket.recv())["type"], "audio_ack")
+                    await websocket.send(json.dumps({"type": "end"}))
+                    async for message in websocket:
+                        if json.loads(message).get("kind") == "end":
+                            break
+                self.assertEqual(backend.saw_persisted, [True])
+            finally:
+                server_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await server_task
+
     async def test_raw_pcm_session_returns_commit_and_end(self):
         probe = socket.socket()
         probe.bind(("127.0.0.1", 0))
@@ -1263,6 +1359,7 @@ class WebSocketTests(unittest.IsolatedAsyncioTestCase):
                     await websocket.send(json.dumps({"type": "start", "backend": "fake"}))
                     ready = json.loads(await websocket.recv())
                     session_id = ready["session_id"]
+                    resume_token = ready["resume_token"]
                     await websocket.send(ten_seconds)
                     self.assertTrue(await asyncio.to_thread(backend.started.wait, 2))
                     await websocket.send(json.dumps({"type": "cancel"}))
@@ -1274,6 +1371,7 @@ class WebSocketTests(unittest.IsolatedAsyncioTestCase):
                         "type": "start",
                         "backend": "fake",
                         "resume_session_id": session_id,
+                        "resume_token": resume_token,
                     }))
                     response = json.loads(await websocket.recv())
                     self.assertEqual(response["type"], "error")
@@ -1414,6 +1512,7 @@ class WebSocketTests(unittest.IsolatedAsyncioTestCase):
                     await websocket.send(json.dumps({"type": "start", "backend": "fake"}))
                     ready = json.loads(await websocket.recv())
                     session_id = ready["session_id"]
+                    resume_token = ready["resume_token"]
                     await websocket.send(voice)
                     audio_ack = json.loads(await websocket.recv())
                     self.assertEqual(audio_ack["type"], "audio_ack")
@@ -1424,8 +1523,19 @@ class WebSocketTests(unittest.IsolatedAsyncioTestCase):
                     await websocket.send(json.dumps({
                         "type": "start",
                         "backend": "fake",
+                        "resume_session_id": session_id,
+                        "resume_token": "wrong-token",
+                    }))
+                    rejected = json.loads(await websocket.recv())
+                    self.assertEqual(rejected["code"], "unauthorized")
+
+                async with connect(f"ws://127.0.0.1:{port}") as websocket:
+                    await websocket.send(json.dumps({
+                        "type": "start",
+                        "backend": "fake",
                         "sample_rate": 8_000,
                         "resume_session_id": session_id,
+                        "resume_token": resume_token,
                     }))
                     rejected = json.loads(await websocket.recv())
                     self.assertEqual(rejected["code"], "invalid_request")
@@ -1435,6 +1545,7 @@ class WebSocketTests(unittest.IsolatedAsyncioTestCase):
                         "type": "start",
                         "backend": "fake",
                         "resume_session_id": session_id,
+                        "resume_token": resume_token,
                         "acknowledged_event_sequence": -1,
                     }))
                     ready = json.loads(await websocket.recv())
@@ -1476,7 +1587,9 @@ class WebSocketTests(unittest.IsolatedAsyncioTestCase):
             try:
                 async with connect(f"ws://127.0.0.1:{port}") as websocket:
                     await websocket.send(json.dumps({"type": "start", "backend": "fake"}))
-                    session_id = json.loads(await websocket.recv())["session_id"]
+                    ready = json.loads(await websocket.recv())
+                    session_id = ready["session_id"]
+                    resume_token = ready["resume_token"]
 
                 await asyncio.sleep(0.25)
                 async with connect(f"ws://127.0.0.1:{port}") as websocket:
@@ -1484,9 +1597,10 @@ class WebSocketTests(unittest.IsolatedAsyncioTestCase):
                         "type": "start",
                         "backend": "fake",
                         "resume_session_id": session_id,
+                        "resume_token": resume_token,
                     }))
                     response = json.loads(await websocket.recv())
-                    self.assertEqual(response["code"], "invalid_request")
+                    self.assertEqual(response["code"], "unauthorized")
             finally:
                 shutdown_event.set()
                 await asyncio.wait_for(server_task, timeout=2)

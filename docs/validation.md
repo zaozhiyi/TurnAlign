@@ -75,12 +75,19 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   The server sweeper removes expired replay state and closes its disk timeline;
   integration coverage disconnects a live client, waits past a short TTL, and
   verifies that resume is rejected while active sessions remain protected.
+- Recovery requires a per-session high-entropy secret in addition to the logged
+  session ID. Missing, incorrect, and expired credentials share the same public
+  authorization failure, and deployment-gate reports retain neither the secret
+  nor transcript text. Accepted audio reaches the recovery timeline before the
+  inference thread, closing an event-acknowledgement race.
 - Server lifecycle logging is enabled at configurable severity. Regression
   checks cover CLI configuration; emitted readiness/completion messages contain
   session and transport metadata without transcript or private-hint values.
 - Text control frames have an independent UTF-8 byte ceiling, preventing the
   larger PCM frame allowance from becoming an oversized JSON/model-configuration
-  path. A multibyte Unicode regression proves rejection before backend creation.
+  path. Duplicate keys and non-standard numeric constants are rejected, and
+  server output forbids non-finite JSON numbers. A multibyte Unicode regression
+  proves size rejection before backend creation.
 - Plugin cleanup isolates third-party `close()` failures across model-pool
   discard/eviction/shutdown, streaming sessions, post-processing components,
   two-pass refinement, and preload failures. Tests verify that all remaining
