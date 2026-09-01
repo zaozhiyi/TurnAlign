@@ -1295,6 +1295,10 @@ class ProductionGateTests(unittest.TestCase):
         with self.assertRaises(OSError):
             os.fstat(descriptor)
 
+    @unittest.skipUnless(
+        os.name == "posix",
+        "deployment lock validation is POSIX-only",
+    )
     def test_host_profile_deployment_lock_is_root_only_and_exclusive(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "deployment.lock"
@@ -1325,6 +1329,10 @@ class ProductionGateTests(unittest.TestCase):
                 second = production_gate_module._acquire_deployment_lock()
                 os.close(second)
 
+    @unittest.skipUnless(
+        os.name == "posix",
+        "active release link validation is POSIX-only",
+    )
     def test_host_profile_requires_a_canonical_active_candidate_link(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
