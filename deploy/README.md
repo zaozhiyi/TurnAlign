@@ -146,7 +146,9 @@ production-gate` with the source commit and all eleven required artifact kinds
 shown in the root README. Keep
 the resulting aggregate report beside the release artifact; it rejects local
 `ws://`, missing recovery/latency controls, mutable model revisions, undersized
-quality evidence, and incomplete artifact sets.
+quality evidence, incomplete artifact sets, and a retained systemd unit that
+weakens loopback binding, credential handling, resource limits, network
+isolation, graceful lifecycle behavior, or least-privilege controls.
 
 WebSocket recovery is process-local. Keep one process behind this reference
 upstream. A multi-process or multi-host topology must either provide sticky

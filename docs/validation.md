@@ -21,7 +21,7 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   materialization limit before constructing the float model input.
 - All source and test modules pass `compileall`.
 - Ruff is enforced in CI and passes over `src` and `tests`.
-- The built wheel passes all 275 tests from site-packages on Python 3.10 with
+- The built wheel passes all 276 tests from site-packages on Python 3.10 with
   `websockets` 14.0 and on Python 3.12 with `websockets` 17.1. The Python 3.12
   run also passes under `python -O`, so production invariants do not depend on
   removable `assert` statements.
@@ -75,6 +75,11 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   and binds the final source commit plus exact name, size and SHA-256 identity of
   every other retained artifact. The aggregate gate independently revalidates
   that complete set, so artifacts from another release cannot be mixed in.
+- The aggregate gate parses the retained systemd unit with continuation and
+  full-line comment semantics. It independently requires loopback-only serving,
+  credential-file authentication, preload, immutable model revisions, positive
+  and internally consistent capacity/lifecycle limits, network isolation,
+  non-root execution, graceful restart/shutdown and least-privilege settings.
 - The aggregate gate opens the retained wheel as a bounded ZIP, rejects unsafe,
   duplicate, encrypted or symlink entries, verifies one coherent TurnAlign
   `dist-info` directory and console entry point, and recomputes every `RECORD`

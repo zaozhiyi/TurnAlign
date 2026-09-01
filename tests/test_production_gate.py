@@ -18,6 +18,8 @@ from turnalign.production_gate import (
     write_json_report,
 )
 
+ROOT = Path(__file__).resolve().parents[1]
+
 
 class ProductionGateTests(unittest.TestCase):
     @staticmethod
@@ -225,6 +227,10 @@ class ProductionGateTests(unittest.TestCase):
                 path.write_text("pending\n", encoding="utf-8")
             elif kind == "wheel":
                 ProductionGateTests._write_test_wheel(path)
+            elif kind == "service-unit":
+                path.write_bytes(
+                    (ROOT / "deploy" / "systemd" / "turnalign.service").read_bytes()
+                )
             else:
                 path.write_bytes(f"immutable {kind}\n".encode())
             artifacts.append((kind, path))
@@ -547,6 +553,49 @@ class ProductionGateTests(unittest.TestCase):
                 payload = json.loads(profile.read_text(encoding="utf-8"))
                 mutate(payload)
                 write_json_report(profile, payload)
+                report = run_production_gate(
+                    release,
+                    quality,
+                    websocket,
+                    source_commit="b" * 40,
+                    artifacts=artifacts,
+                )
+
+                with self.subTest(expected=expected):
+                    self.assertFalse(report.passed)
+                    self.assertIn(expected, "\n".join(report.failures))
+
+    def test_rejects_weakened_or_comment_only_systemd_controls(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, quality, websocket = self._reports(root)
+            for replace, expected in (
+                (
+                    ("IPAddressDeny=any", "# IPAddressDeny=any"),
+                    "deny non-allowlisted network traffic",
+                ),
+                (
+                    ("--host 127.0.0.1", "--host 0.0.0.0"),
+                    "bind TurnAlign only to loopback",
+                ),
+                (
+                    (
+                        "--auth-token-file ${CREDENTIALS_DIRECTORY}/auth-token",
+                        "--auth-token-file /tmp/token",
+                    ),
+                    "credential directory",
+                ),
+                (
+                    ("ProtectSystem=strict", "ProtectSystem=full"),
+                    "ProtectSystem=strict",
+                ),
+            ):
+                artifacts = self._artifacts(root)
+                service = next(
+                    path for kind, path in artifacts if kind == "service-unit"
+                )
+                content = service.read_text(encoding="utf-8")
+                service.write_text(content.replace(*replace), encoding="utf-8")
                 report = run_production_gate(
                     release,
                     quality,

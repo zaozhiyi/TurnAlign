@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import cast
 from urllib.parse import unquote, urlsplit
 
+from .deployment_validation import validate_systemd_service
 from .jsonutil import strict_json_loads
 
 _COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
@@ -31,6 +32,7 @@ _MAX_SBOM_BYTES = 16 * 1024 * 1024
 _MAX_LOCK_BYTES = 4 * 1024 * 1024
 _MAX_MODEL_MANIFEST_BYTES = 2 * 1024 * 1024
 _MAX_HOST_PROFILE_BYTES = 2 * 1024 * 1024
+_MAX_DEPLOYMENT_CONFIG_BYTES = 2 * 1024 * 1024
 _MAX_WHEEL_BYTES = 64 * 1024 * 1024
 _MAX_WHEEL_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
 _MAX_WHEEL_ENTRIES = 4_096
@@ -1339,6 +1341,7 @@ def run_production_gate(
             "model-manifest": _MAX_MODEL_MANIFEST_BYTES,
             "sbom": _MAX_SBOM_BYTES,
             "wheel": _MAX_WHEEL_BYTES,
+            "service-unit": _MAX_DEPLOYMENT_CONFIG_BYTES,
         }.get(kind)
         snapshot = _snapshot_evidence(path, capture_limit=capture_limit)
         evidence = ArtifactEvidence(kind, path.name, snapshot.sha256, snapshot.size)
@@ -1392,6 +1395,15 @@ def run_production_gate(
             artifact_evidence,
             failures,
         )
+    service_snapshots = artifact_snapshots.get("service-unit", [])
+    if len(service_snapshots) == 1:
+        service_content = service_snapshots[0].content
+        if service_content is None:
+            failures.append(
+                f"systemd service unit exceeds {_MAX_DEPLOYMENT_CONFIG_BYTES} bytes"
+            )
+        else:
+            failures.extend(validate_systemd_service(service_content))
 
     for name, report in (
         ("release", release),
