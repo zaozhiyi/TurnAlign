@@ -723,8 +723,6 @@ class CliIntegrationTests(unittest.TestCase):
             arguments = [
                 "turnalign",
                 "host-profile",
-                "--source-commit",
-                "a" * 40,
             ]
             for kind in sorted(cli.REQUIRED_ARTIFACT_KINDS - {"host-profile"}):
                 path = root / f"{kind}.evidence"
@@ -742,6 +740,9 @@ class CliIntegrationTests(unittest.TestCase):
             with patch(
                 "turnalign.production_gate._installed_runtime_identity",
                 return_value=runtime,
+            ), patch(
+                "turnalign.production_gate.platform.system",
+                return_value="Linux",
             ), patch("sys.argv", arguments), patch("builtins.print"):
                 self.assertEqual(cli.main(), 0)
 

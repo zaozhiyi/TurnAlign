@@ -270,7 +270,7 @@ class ProductionGateTests(unittest.TestCase):
                 "turnalign_source_commit": "b" * 40,
                 "turnalign_version": "0.1.0",
             },
-        ):
+        ), patch.object(production_gate_module.platform, "system", return_value="Linux"):
             write_json_report(
                 host_profile,
                 create_host_profile("b" * 40, profile_artifacts),
@@ -578,6 +578,10 @@ class ProductionGateTests(unittest.TestCase):
                     "installed versioned Wheel runtime",
                 ),
                 (
+                    lambda payload: payload["platform"].update(system="Darwin"),
+                    "complete typed platform evidence",
+                ),
+                (
                     lambda payload: payload["artifacts"][0].update(bytes=1),
                     "does not match the retained deployment artifacts",
                 ),
@@ -629,14 +633,16 @@ class ProductionGateTests(unittest.TestCase):
             "files",
             return_value=SourceIdentity(f"{source_commit}\n"),
         ):
-            identity = production_gate_module._installed_runtime_identity(
-                source_commit
-            )
+            identity = production_gate_module._installed_runtime_identity()
         self.assertEqual(identity["turnalign_source_commit"], source_commit)
         self.assertEqual(identity["python_prefix"], prefix)
 
         with patch.object(
             production_gate_module.sys, "prefix", "/opt/turnalign/current/venv"
+        ), patch.object(
+            production_gate_module.importlib.resources,
+            "files",
+            return_value=SourceIdentity(f"{source_commit}\n"),
         ), self.assertRaisesRegex(ValueError, "versioned production"):
             production_gate_module._installed_runtime_identity(source_commit)
 
@@ -654,6 +660,31 @@ class ProductionGateTests(unittest.TestCase):
             return_value=SourceIdentity("unbound\n"),
         ), self.assertRaisesRegex(ValueError, "source identity"):
             production_gate_module._installed_runtime_identity(source_commit)
+
+        with patch.object(
+            production_gate_module.importlib.resources,
+            "files",
+            return_value=SourceIdentity(f"{'c' * 40}\n"),
+        ), self.assertRaisesRegex(ValueError, "does not match the candidate"):
+            production_gate_module._installed_runtime_identity(source_commit)
+
+    def test_host_profile_generation_requires_linux(self):
+        runtime_prefix = f"/opt/turnalign/releases/{'b' * 40}/venv"
+        with patch.object(
+            production_gate_module,
+            "_installed_runtime_identity",
+            return_value={
+                "python_executable": f"{runtime_prefix}/bin/python",
+                "python_prefix": runtime_prefix,
+                "turnalign_source_commit": "b" * 40,
+                "turnalign_version": "0.1.0",
+            },
+        ), patch.object(
+            production_gate_module.platform,
+            "system",
+            return_value="Darwin",
+        ), self.assertRaisesRegex(RuntimeError, "Linux production host"):
+            create_host_profile(None, [])
 
     def test_rejects_weakened_or_comment_only_systemd_controls(self):
         with tempfile.TemporaryDirectory() as directory:

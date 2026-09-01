@@ -362,13 +362,16 @@ def create_model_manifest(
 
 
 def create_host_profile(
-    source_commit: str,
+    source_commit: str | None,
     artifacts: list[tuple[str, Path]],
 ) -> dict[str, object]:
     """Capture host identity and bind every other retained production artifact."""
 
-    if _COMMIT_PATTERN.fullmatch(source_commit) is None:
-        raise ValueError("source_commit must be a lowercase 40-character Git commit")
+    system = platform.system()
+    if system != "Linux":
+        raise RuntimeError("host-profile must run on the Linux production host")
+    runtime = _installed_runtime_identity(source_commit)
+    bound_commit = runtime["turnalign_source_commit"]
     expected_kinds = REQUIRED_ARTIFACT_KINDS - {"host-profile"}
     evidence = []
     kinds = set()
@@ -404,10 +407,10 @@ def create_host_profile(
         raise RuntimeError("cannot determine the host logical CPU count")
     return {
         "schema_version": 2,
-        "source_commit": source_commit,
-        "runtime": _installed_runtime_identity(source_commit),
+        "source_commit": bound_commit,
+        "runtime": runtime,
         "platform": {
-            "system": platform.system(),
+            "system": system,
             "release": platform.release(),
             "machine": platform.machine(),
             "python_implementation": platform.python_implementation(),
@@ -421,8 +424,28 @@ def create_host_profile(
     }
 
 
-def _installed_runtime_identity(source_commit: str) -> dict[str, str]:
-    release_prefix = f"/opt/turnalign/releases/{source_commit}/venv"
+def _installed_runtime_identity(source_commit: str | None = None) -> dict[str, str]:
+    try:
+        embedded_identity = importlib.resources.files("turnalign").joinpath(
+            "_source_commit.txt"
+        ).read_text(encoding="ascii")
+    except (FileNotFoundError, UnicodeError, OSError) as error:
+        raise ValueError(
+            "host-profile requires a Wheel with a readable source identity"
+        ) from error
+    if (
+        not embedded_identity.endswith("\n")
+        or _COMMIT_PATTERN.fullmatch(embedded_identity[:-1]) is None
+    ):
+        raise ValueError(
+            "host-profile requires a Wheel with a valid bound source identity"
+        )
+    embedded_commit = embedded_identity[:-1]
+    if source_commit is not None and source_commit != embedded_commit:
+        raise ValueError(
+            "host-profile runtime source identity does not match the candidate"
+        )
+    release_prefix = f"/opt/turnalign/releases/{embedded_commit}/venv"
     python_executable = os.path.abspath(sys.executable)
     python_prefix = os.path.abspath(sys.prefix)
     if (
@@ -433,22 +456,10 @@ def _installed_runtime_identity(source_commit: str) -> dict[str, str]:
             "host-profile must run from the candidate's versioned production "
             "environment"
         )
-    try:
-        embedded_commit = importlib.resources.files("turnalign").joinpath(
-            "_source_commit.txt"
-        ).read_text(encoding="ascii")
-    except (FileNotFoundError, UnicodeError, OSError) as error:
-        raise ValueError(
-            "host-profile requires a Wheel with a readable source identity"
-        ) from error
-    if embedded_commit != f"{source_commit}\n":
-        raise ValueError(
-            "host-profile runtime source identity does not match the candidate"
-        )
     return {
         "python_executable": python_executable,
         "python_prefix": python_prefix,
-        "turnalign_source_commit": source_commit,
+        "turnalign_source_commit": embedded_commit,
         "turnalign_version": __version__,
     }
 
@@ -1334,6 +1345,7 @@ def _validate_host_profile(
     if not (
         isinstance(platform_data, dict)
         and set(platform_data) == {*text_fields, "logical_cpu_count"}
+        and platform_data.get("system") == "Linux"
         and all(
             isinstance(platform_data.get(name), str)
             and bool(platform_data[name])

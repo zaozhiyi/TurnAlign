@@ -21,7 +21,7 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   materialization limit before constructing the float model input.
 - All source and test modules pass `compileall`.
 - Ruff is enforced in CI and passes over `src` and `tests`.
-- The built wheel passes all 282 tests from site-packages on Python 3.10 with
+- The built wheel passes all 283 tests from site-packages on Python 3.10 with
   `websockets` 14.0 and on Python 3.12 with `websockets` 17.1. The Python 3.12
   run also passes under `python -O`, so production invariants do not depend on
   removable `assert` statements.
@@ -82,12 +82,13 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   strict model manifest must bind that revision to the exact retained model file
   names, sizes and SHA-256 digests.
 - `/opt/turnalign/current/venv/bin/turnalign host-profile` must run from the
-  active candidate on the target host. It records bounded platform inventory
-  and binds the installed Wheel version, embedded source identity, versioned
-  Python executable/prefix, final source commit, and exact name, size and
-  SHA-256 identity of every other retained artifact. The aggregate gate
-  independently revalidates that complete set, so another installation or
-  release cannot be mixed in.
+  active candidate on the Linux target host. It derives the source commit from
+  the installed Wheel instead of requiring a production Git checkout, records
+  bounded platform inventory, and binds the Wheel version, versioned Python
+  executable/prefix, final source commit, and exact name, size and SHA-256
+  identity of every other retained artifact. The aggregate gate independently
+  revalidates that complete set, so another installation or release cannot be
+  mixed in.
 - The aggregate gate parses the retained systemd unit with continuation and
   full-line comment semantics. It independently requires loopback-only serving,
   credential-file authentication, preload, immutable model revisions, positive

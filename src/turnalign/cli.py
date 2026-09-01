@@ -953,7 +953,9 @@ def main() -> int:
         ),
     )
     host_profile_parser.add_argument(
-        "--source-commit", type=_source_commit_argument, required=True
+        "--source-commit",
+        type=_source_commit_argument,
+        help="Expected commit; defaults to the identity embedded in the installed Wheel",
     )
     host_profile_parser.add_argument(
         "--artifact",
