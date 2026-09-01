@@ -36,10 +36,11 @@ sudo python3 -m venv --without-pip \
   /opt/turnalign/releases/<source-commit>/venv
 sudo /usr/local/bin/uv pip sync \
   --python /opt/turnalign/releases/<source-commit>/venv/bin/python \
+  --no-compile-bytecode \
   requirements.lock
 sudo /usr/local/bin/uv pip install \
   --python /opt/turnalign/releases/<source-commit>/venv/bin/python \
-  --no-deps dist/turnalign-0.1.0-py3-none-any.whl
+  --no-compile-bytecode --no-deps dist/turnalign-0.1.0-py3-none-any.whl
 sudo chown -R root:root /opt/turnalign/releases/<source-commit>
 ```
 
@@ -182,7 +183,8 @@ Before routing users, retain all of the following with the release artifact:
    symlink and systemd path:
 
    ```bash
-   sudo /opt/turnalign/current/venv/bin/turnalign deployment-rehearsal \
+   sudo PYTHONDONTWRITEBYTECODE=1 \
+     /opt/turnalign/current/venv/bin/turnalign deployment-rehearsal \
      wss://asr.example.com/ws \
      --previous-commit <preceding-source-commit> \
      --candidate-commit <candidate-source-commit> \
@@ -191,7 +193,10 @@ Before routing users, retain all of the following with the release artifact:
      --report rollback-rehearsal.json
    ```
 
-   The command refuses non-Linux/non-root execution, an unbound candidate
+   Keep bytecode generation disabled for this root-run command: the final gate
+   requires the installed package tree to equal the reviewed Wheel exactly and
+   therefore rejects added `__pycache__`/`.pyc` files. The command refuses
+   non-Linux/non-root execution, an unbound candidate
    runtime, mutable or non-root-owned release directories, a non-public probe,
    and any initial active release other than the candidate. A root-only
    non-blocking lock at `/run/lock/turnalign-deployment.lock` prevents a second
@@ -214,14 +219,18 @@ activating the candidate and finalizing the other eleven artifact classes. The
 command reads the commit embedded in the installed Wheel, so the production
 host does not need a Git checkout. It refuses non-Linux hosts, source checkouts,
 unbound Wheels, mismatched explicitly supplied commits, and non-versioned Python
-environments. Then run `turnalign
+environments. Its schema 4 evidence hashes the complete active `turnalign/`
+tree; the aggregate gate requires that tree to match the retained Wheel exactly.
+Then run `turnalign
 production-gate` with the source commit and all twelve required artifact kinds
 shown in the root README. Keep
 the resulting aggregate report beside the release artifact; it rejects local
 `ws://`, missing recovery/latency controls, mutable model revisions, undersized
 quality evidence, incomplete artifact sets, a rollback report with forged or
 out-of-order transitions, a different Linux boot or restored model identity,
-a retained Nginx file containing
+an active package loaded outside the versioned environment, installed files
+that are missing, modified, symlinked, writable or absent from the retained
+Wheel, a retained Nginx file containing
 unresolved includes or weakened TLS/WebSocket/upstream controls, and a retained
 systemd unit that
 weakens loopback binding, credential handling, resource limits, network

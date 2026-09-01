@@ -69,6 +69,31 @@ class ProductionGateTests(unittest.TestCase):
                 archive.writestr(name, content)
 
     @staticmethod
+    def _installed_distribution(wheel: Path, source_commit: str = "b" * 40):
+        with zipfile.ZipFile(wheel) as archive:
+            files = [
+                {
+                    "name": name,
+                    "sha256": hashlib.sha256(archive.read(name)).hexdigest(),
+                    "bytes": archive.getinfo(name).file_size,
+                }
+                for name in sorted(archive.namelist())
+                if name.startswith("turnalign/")
+            ]
+        version = ".".join(
+            production_gate_module.platform.python_version().split(".")[:2]
+        )
+        return {
+            "name": "turnalign",
+            "version": "0.1.0",
+            "root": (
+                f"/opt/turnalign/releases/{source_commit}/venv/lib/"
+                f"python{version}/site-packages"
+            ),
+            "files": files,
+        }
+
+    @staticmethod
     def _reports(root: Path) -> tuple[Path, Path, Path]:
         release = root / "release.json"
         quality = root / "quality.json"
@@ -377,6 +402,7 @@ class ProductionGateTests(unittest.TestCase):
             (kind, path) for kind, path in artifacts if kind != "host-profile"
         ]
         runtime_prefix = f"/opt/turnalign/releases/{'b' * 40}/venv"
+        wheel = next(path for kind, path in artifacts if kind == "wheel")
         with patch.object(
             production_gate_module,
             "_installed_runtime_identity",
@@ -386,6 +412,10 @@ class ProductionGateTests(unittest.TestCase):
                 "turnalign_source_commit": "b" * 40,
                 "turnalign_version": "0.1.0",
             },
+        ), patch.object(
+            production_gate_module,
+            "_installed_distribution_identity",
+            return_value=ProductionGateTests._installed_distribution(wheel),
         ), patch.object(
             production_gate_module.platform,
             "system",
@@ -736,6 +766,29 @@ class ProductionGateTests(unittest.TestCase):
                     lambda payload: payload["artifacts"][0].update(bytes=1),
                     "does not match the retained deployment artifacts",
                 ),
+                (
+                    lambda payload: payload["installed_distribution"]["files"][
+                        0
+                    ].update(sha256="0" * 64),
+                    "installed package files do not exactly match",
+                ),
+                (
+                    lambda payload: payload["installed_distribution"]["files"].append({
+                        "name": "turnalign/injected.py",
+                        "sha256": "0" * 64,
+                        "bytes": 1,
+                    }),
+                    "installed package files do not exactly match",
+                ),
+                (
+                    lambda payload: payload["installed_distribution"].update(
+                        root=(
+                            "/opt/turnalign/current/venv/lib/"
+                            "python3.12/site-packages"
+                        )
+                    ),
+                    "installed package files do not exactly match",
+                ),
             ):
                 artifacts = self._artifacts(root)
                 profile = next(
@@ -843,6 +896,13 @@ class ProductionGateTests(unittest.TestCase):
             def __init__(self, value: str):
                 self.value = value
 
+            def __str__(self) -> str:
+                version = production_gate_module.sys.version_info
+                return (
+                    f"{prefix}/lib/python{version.major}.{version.minor}/"
+                    "site-packages/turnalign"
+                )
+
             def joinpath(self, _name: str):
                 return self
 
@@ -897,6 +957,65 @@ class ProductionGateTests(unittest.TestCase):
             return_value=SourceIdentity(f"{'c' * 40}\n"),
         ), self.assertRaisesRegex(ValueError, "does not match the candidate"):
             production_gate_module._installed_runtime_identity(source_commit)
+
+    @unittest.skipUnless(
+        production_gate_module.os.name == "posix",
+        "installed production package validation is POSIX-only",
+    )
+    def test_installed_distribution_hashes_only_secure_active_package_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            prefix = Path(directory) / "venv"
+            version = production_gate_module.sys.version_info
+            root = (
+                prefix
+                / "lib"
+                / f"python{version.major}.{version.minor}"
+                / "site-packages"
+            )
+            package = root / "turnalign"
+            package.mkdir(parents=True)
+            (package / "__init__.py").write_text(
+                '__version__ = "0.1.0"\n', encoding="utf-8"
+            )
+            (package / "_source_commit.txt").write_text(
+                f"{'b' * 40}\n", encoding="ascii"
+            )
+
+            class Distribution:
+                version = "0.1.0"
+
+                @staticmethod
+                def locate_file(_path: str) -> Path:
+                    return root
+
+            runtime = {
+                "python_executable": f"{prefix}/bin/python",
+                "python_prefix": str(prefix),
+                "turnalign_source_commit": "b" * 40,
+                "turnalign_version": "0.1.0",
+            }
+            with patch.object(
+                production_gate_module.importlib.metadata,
+                "distribution",
+                return_value=Distribution(),
+            ), patch.object(
+                production_gate_module,
+                "_root_owned_immutable",
+                return_value=True,
+            ):
+                identity = production_gate_module._installed_distribution_identity(
+                    runtime
+                )
+                self.assertEqual(
+                    [item["name"] for item in identity["files"]],
+                    [
+                        "turnalign/__init__.py",
+                        "turnalign/_source_commit.txt",
+                    ],
+                )
+                (package / "injected.py").symlink_to(package / "__init__.py")
+                with self.assertRaisesRegex(ValueError, "unsafe or mutable"):
+                    production_gate_module._installed_distribution_identity(runtime)
 
     def test_host_profile_generation_requires_linux(self):
         runtime_prefix = f"/opt/turnalign/releases/{'b' * 40}/venv"

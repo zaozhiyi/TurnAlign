@@ -95,9 +95,14 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   the installed Wheel instead of requiring a production Git checkout, records
   bounded platform inventory plus the current Linux boot identity, and binds
   the Wheel version, versioned Python
-  executable/prefix, final source commit, and exact name, size and SHA-256
-  identity of every other retained artifact. The aggregate gate independently
-  revalidates that complete set and requires the host profile and rollback
+  executable/prefix, final source commit, the complete active `turnalign/`
+  package file set, and the exact name, size and SHA-256 identity of every other
+  retained artifact. Schema 4 rejects a source checkout shadowing the installed
+  package, non-root-owned or writable package files, symlinks, and any missing,
+  modified or extra file (including bytecode) relative to the retained Wheel.
+  Run root-only deployment rehearsals with `PYTHONDONTWRITEBYTECODE=1`. The
+  aggregate gate independently revalidates that complete set and requires the
+  host profile and rollback
   rehearsal to come from the same boot, so another installation, host run or
   release cannot be mixed in.
 - The aggregate gate parses the retained systemd unit with continuation and

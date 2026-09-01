@@ -4,6 +4,7 @@ import base64
 import configparser
 import csv
 import hashlib
+import importlib.metadata
 import importlib.resources
 import io
 import ipaddress
@@ -104,6 +105,12 @@ class _EvidenceSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class _WheelIdentity:
+    version: str
+    package_files: tuple[EvidenceFile, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class ProductionGateReport:
     schema_version: int
     status: str
@@ -165,6 +172,10 @@ def _metadata_signature(metadata: os.stat_result) -> tuple[int, int, int, int, i
         metadata.st_mtime_ns,
         metadata.st_ctime_ns,
     )
+
+
+def _root_owned_immutable(metadata: os.stat_result) -> bool:
+    return metadata.st_uid == 0 and not stat.S_IMODE(metadata.st_mode) & 0o022
 
 
 def _open_evidence(path: Path) -> tuple[int, os.stat_result]:
@@ -382,6 +393,7 @@ def create_host_profile(
         raise RuntimeError("host-profile must run on the Linux production host")
     runtime = _installed_runtime_identity(source_commit)
     bound_commit = runtime["turnalign_source_commit"]
+    installed_distribution = _installed_distribution_identity(runtime)
     expected_kinds = REQUIRED_ARTIFACT_KINDS - {"host-profile"}
     evidence = []
     kinds = set()
@@ -416,9 +428,10 @@ def create_host_profile(
     if logical_cpu_count is None or logical_cpu_count <= 0:
         raise RuntimeError("cannot determine the host logical CPU count")
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "source_commit": bound_commit,
         "runtime": runtime,
+        "installed_distribution": installed_distribution,
         "platform": {
             "system": system,
             "boot_id": _read_linux_boot_id(),
@@ -470,9 +483,10 @@ def _read_linux_boot_id() -> str:
 
 def _installed_runtime_identity(source_commit: str | None = None) -> dict[str, str]:
     try:
-        embedded_identity = importlib.resources.files("turnalign").joinpath(
-            "_source_commit.txt"
-        ).read_text(encoding="ascii")
+        package_resource = importlib.resources.files("turnalign")
+        embedded_identity = package_resource.joinpath("_source_commit.txt").read_text(
+            encoding="ascii"
+        )
     except (FileNotFoundError, UnicodeError, OSError) as error:
         raise ValueError(
             "host-profile requires a Wheel with a readable source identity"
@@ -492,9 +506,19 @@ def _installed_runtime_identity(source_commit: str | None = None) -> dict[str, s
     release_prefix = f"/opt/turnalign/releases/{embedded_commit}/venv"
     python_executable = os.path.abspath(sys.executable)
     python_prefix = os.path.abspath(sys.prefix)
+    expected_package_root = (
+        Path(release_prefix)
+        / "lib"
+        / f"python{sys.version_info.major}.{sys.version_info.minor}"
+        / "site-packages"
+        / "turnalign"
+    )
+    package_root = os.path.realpath(os.path.abspath(str(package_resource)))
+    expected_package = os.path.realpath(os.path.abspath(str(expected_package_root)))
     if (
         python_prefix != release_prefix
         or python_executable != f"{release_prefix}/bin/python"
+        or package_root != expected_package
     ):
         raise ValueError(
             "host-profile must run from the candidate's versioned production "
@@ -505,6 +529,133 @@ def _installed_runtime_identity(source_commit: str | None = None) -> dict[str, s
         "python_prefix": python_prefix,
         "turnalign_source_commit": embedded_commit,
         "turnalign_version": __version__,
+    }
+
+
+def _installed_distribution_identity(
+    runtime: dict[str, str],
+) -> dict[str, object]:
+    """Hash the complete installed package tree used by the active interpreter."""
+
+    try:
+        distribution = importlib.metadata.distribution("turnalign")
+    except importlib.metadata.PackageNotFoundError as error:
+        raise ValueError(
+            "host-profile cannot locate the installed TurnAlign Wheel"
+        ) from error
+    if distribution.version != runtime["turnalign_version"]:
+        raise ValueError("installed TurnAlign metadata version does not match the runtime")
+
+    prefix = Path(runtime["python_prefix"])
+    expected_root = (
+        prefix
+        / "lib"
+        / f"python{sys.version_info.major}.{sys.version_info.minor}"
+        / "site-packages"
+    )
+    try:
+        distribution_root = Path(str(distribution.locate_file(""))).resolve(
+            strict=True
+        )
+        expected_root = expected_root.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ValueError("host-profile cannot resolve the installed Wheel root") from error
+    if distribution_root != expected_root:
+        raise ValueError(
+            "installed TurnAlign is not in the candidate versioned site-packages"
+        )
+
+    package_root = distribution_root / "turnalign"
+    try:
+        root_metadata = package_root.lstat()
+    except OSError as error:
+        raise ValueError("installed TurnAlign package directory is missing") from error
+    if (
+        stat.S_ISLNK(root_metadata.st_mode)
+        or not stat.S_ISDIR(root_metadata.st_mode)
+        or not _root_owned_immutable(root_metadata)
+    ):
+        raise ValueError("installed TurnAlign package must be a non-symlink directory")
+
+    entries: list[dict[str, object]] = []
+    seen: set[str] = set()
+    total_size = 0
+    try:
+        for directory, directory_names, file_names in os.walk(
+            package_root,
+            topdown=True,
+            followlinks=False,
+        ):
+            directory_path = Path(directory)
+            for name in directory_names:
+                child = directory_path / name
+                metadata = child.lstat()
+                if (
+                    stat.S_ISLNK(metadata.st_mode)
+                    or not stat.S_ISDIR(metadata.st_mode)
+                    or not _root_owned_immutable(metadata)
+                ):
+                    raise ValueError(
+                        "installed TurnAlign contains an unsafe package directory"
+                    )
+            for name in file_names:
+                path = directory_path / name
+                relative = path.relative_to(distribution_root).as_posix()
+                if relative in seen:
+                    raise ValueError("installed TurnAlign contains duplicate package paths")
+                seen.add(relative)
+                metadata = path.lstat()
+                if (
+                    stat.S_ISLNK(metadata.st_mode)
+                    or not stat.S_ISREG(metadata.st_mode)
+                    or not _root_owned_immutable(metadata)
+                ):
+                    raise ValueError(
+                        "installed TurnAlign contains an unsafe or mutable package file"
+                    )
+                snapshot = _snapshot_evidence(path)
+                total_size += snapshot.size
+                if (
+                    len(entries) >= _MAX_WHEEL_ENTRIES
+                    or total_size > _MAX_WHEEL_UNCOMPRESSED_BYTES
+                ):
+                    raise ValueError("installed TurnAlign package exceeds evidence limits")
+                entries.append({
+                    "name": relative,
+                    "sha256": snapshot.sha256,
+                    "bytes": snapshot.size,
+                })
+    except OSError as error:
+        raise ValueError(
+            "cannot securely inspect the installed TurnAlign package"
+        ) from error
+    if not entries:
+        raise ValueError("installed TurnAlign package contains no files")
+
+    source_identity = next(
+        (
+            item
+            for item in entries
+            if item["name"] == "turnalign/_source_commit.txt"
+        ),
+        None,
+    )
+    expected_source_digest = hashlib.sha256(
+        f"{runtime['turnalign_source_commit']}\n".encode("ascii")
+    ).hexdigest()
+    if (
+        source_identity is None
+        or source_identity["sha256"] != expected_source_digest
+        or source_identity["bytes"] != 41
+    ):
+        raise ValueError(
+            "installed TurnAlign package source identity changed during capture"
+        )
+    return {
+        "name": "turnalign",
+        "version": distribution.version,
+        "root": str(distribution_root),
+        "files": sorted(entries, key=lambda item: cast(str, item["name"])),
     }
 
 
@@ -530,6 +681,17 @@ def _public_hostname(hostname: str | None) -> bool:
 
 def _package_name(value: str) -> str:
     return re.sub(r"[-_.]+", "-", value).casefold()
+
+
+def _safe_relative_archive_path(value: str) -> bool:
+    parts = value.split("/")
+    return (
+        bool(value)
+        and not value.startswith("/")
+        and "\\" not in value
+        and "\x00" not in value
+        and all(part not in {"", ".", ".."} for part in parts)
+    )
 
 
 def _pypi_purl_identity(value: str) -> tuple[str, str] | None:
@@ -1218,7 +1380,7 @@ def _validate_wheel(
     snapshot: _EvidenceSnapshot,
     source_commit: str,
     failures: list[str],
-) -> str | None:
+) -> _WheelIdentity | None:
     if snapshot.content is None:
         failures.append(f"wheel exceeds {_MAX_WHEEL_BYTES} bytes")
         return None
@@ -1363,13 +1525,27 @@ def _validate_wheel(
         if digest != f"sha256={expected_digest}" or size != str(len(content)):
             failures.append(f"wheel RECORD hash or size does not match: {name}")
             return None
-    return package_version
+    if package_version is None:
+        return None
+    package_files = tuple(
+        EvidenceFile(
+            name=name,
+            sha256=hashlib.sha256(content).hexdigest(),
+            bytes=len(content),
+        )
+        for name, content in sorted(contents.items())
+        if name.startswith("turnalign/")
+    )
+    if not package_files:
+        failures.append("wheel does not contain any TurnAlign package files")
+        return None
+    return _WheelIdentity(package_version, package_files)
 
 
 def _validate_host_profile(
     snapshot: _EvidenceSnapshot,
     source_commit: str,
-    wheel_version: str | None,
+    wheel_identity: _WheelIdentity | None,
     artifacts: list[ArtifactEvidence],
     failures: list[str],
 ) -> str | None:
@@ -1385,6 +1561,7 @@ def _validate_host_profile(
         "schema_version",
         "source_commit",
         "runtime",
+        "installed_distribution",
         "platform",
         "artifacts",
     }:
@@ -1392,7 +1569,7 @@ def _validate_host_profile(
         return None
     if (
         isinstance(payload.get("schema_version"), bool)
-        or payload.get("schema_version") != 3
+        or payload.get("schema_version") != 4
     ):
         failures.append("host profile has an unsupported schema version")
     if payload.get("source_commit") != source_commit:
@@ -1414,13 +1591,77 @@ def _validate_host_profile(
         and runtime.get("turnalign_source_commit") == source_commit
         and isinstance(runtime.get("turnalign_version"), str)
         and bool(runtime["turnalign_version"])
-        and runtime["turnalign_version"] == wheel_version
+        and wheel_identity is not None
+        and runtime["turnalign_version"] == wheel_identity.version
     ):
         failures.append(
             "host profile is not bound to the installed versioned Wheel runtime"
         )
 
     platform_data = payload.get("platform")
+    installed_distribution = payload.get("installed_distribution")
+    installed_file_payload = (
+        installed_distribution.get("files")
+        if isinstance(installed_distribution, dict)
+        else None
+    )
+    expected_distribution_root: str | None = None
+    if isinstance(platform_data, dict):
+        python_version = platform_data.get("python_version")
+        if isinstance(python_version, str):
+            version_parts = python_version.split(".")
+            if (
+                len(version_parts) == 3
+                and all(part.isdigit() for part in version_parts)
+            ):
+                expected_distribution_root = (
+                    f"{expected_prefix}/lib/python{version_parts[0]}."
+                    f"{version_parts[1]}/site-packages"
+                )
+    installed_files: list[EvidenceFile] = []
+    installed_schema_valid = (
+        isinstance(installed_distribution, dict)
+        and set(installed_distribution) == {"name", "version", "root", "files"}
+        and installed_distribution.get("name") == "turnalign"
+        and wheel_identity is not None
+        and installed_distribution.get("version") == wheel_identity.version
+        and expected_distribution_root is not None
+        and installed_distribution.get("root") == expected_distribution_root
+        and isinstance(installed_file_payload, list)
+        and bool(installed_file_payload)
+    )
+    if installed_schema_valid and isinstance(installed_file_payload, list):
+        for item in installed_file_payload:
+            if not (
+                isinstance(item, dict)
+                and set(item) == {"name", "sha256", "bytes"}
+                and isinstance(item.get("name"), str)
+                and item["name"].startswith("turnalign/")
+                and _safe_relative_archive_path(item["name"])
+                and isinstance(item.get("sha256"), str)
+                and _SHA256_PATTERN.fullmatch(item["sha256"]) is not None
+                and _nonnegative_integer(item.get("bytes"))
+            ):
+                installed_schema_valid = False
+                break
+            installed_files.append(
+                EvidenceFile(
+                    cast(str, item["name"]),
+                    cast(str, item["sha256"]),
+                    cast(int, item["bytes"]),
+                )
+            )
+    if (
+        not installed_schema_valid
+        or len({item.name for item in installed_files}) != len(installed_files)
+        or wheel_identity is None
+        or tuple(sorted(installed_files, key=lambda item: item.name))
+        != wheel_identity.package_files
+    ):
+        failures.append(
+            "host profile installed package files do not exactly match the retained Wheel"
+        )
+
     text_fields = (
         "system",
         "release",
@@ -1857,10 +2098,10 @@ def run_production_gate(
                 f"SBOM does not match locked runtime requirement: {name}=={locked[0]}"
             )
 
-    wheel_version: str | None = None
+    wheel_identity: _WheelIdentity | None = None
     wheel_snapshots = artifact_snapshots.get("wheel", [])
     if len(wheel_snapshots) == 1:
-        wheel_version = _validate_wheel(wheel_snapshots[0], source_commit, failures)
+        wheel_identity = _validate_wheel(wheel_snapshots[0], source_commit, failures)
 
     model_manifest_snapshots = artifact_snapshots.get("model-manifest", [])
     if len(model_manifest_snapshots) == 1:
@@ -1876,7 +2117,7 @@ def run_production_gate(
         host_boot_id = _validate_host_profile(
             host_profile_snapshots[0],
             source_commit,
-            wheel_version,
+            wheel_identity,
             artifact_evidence,
             failures,
         )

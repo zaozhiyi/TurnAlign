@@ -1,5 +1,7 @@
+import hashlib
 import json
 import os
+import platform
 import tempfile
 import unittest
 from pathlib import Path
@@ -790,10 +792,24 @@ class CliIntegrationTests(unittest.TestCase):
                 "turnalign_source_commit": "a" * 40,
                 "turnalign_version": "0.1.0",
             }
+            python_version = ".".join(platform.python_version().split(".")[:2])
+            installed_distribution = {
+                "name": "turnalign",
+                "version": "0.1.0",
+                "root": f"{runtime_prefix}/lib/python{python_version}/site-packages",
+                "files": [{
+                    "name": "turnalign/_source_commit.txt",
+                    "sha256": hashlib.sha256(f"{'a' * 40}\n".encode()).hexdigest(),
+                    "bytes": 41,
+                }],
+            }
 
             with patch(
                 "turnalign.production_gate._installed_runtime_identity",
                 return_value=runtime,
+            ), patch(
+                "turnalign.production_gate._installed_distribution_identity",
+                return_value=installed_distribution,
             ), patch(
                 "turnalign.production_gate.platform.system",
                 return_value="Linux",
@@ -804,9 +820,12 @@ class CliIntegrationTests(unittest.TestCase):
                 self.assertEqual(cli.main(), 0)
 
             payload = json.loads(output.read_text(encoding="utf-8"))
-            self.assertEqual(payload["schema_version"], 3)
+            self.assertEqual(payload["schema_version"], 4)
             self.assertEqual(payload["source_commit"], "a" * 40)
             self.assertEqual(payload["runtime"], runtime)
+            self.assertEqual(
+                payload["installed_distribution"], installed_distribution
+            )
             self.assertEqual(
                 payload["platform"]["boot_id"],
                 "12345678-1234-4234-8234-123456789abc",
