@@ -99,8 +99,9 @@ public `/metrics` path.
 
 ## 3. Terminate TLS at Nginx
 
-Copy `nginx/turnalign.conf.example` into the Nginx `http` context, replace the
-hostname and certificate paths, then validate and reload:
+Copy `nginx/turnalign.conf.example` to a dedicated self-contained HTTP-context
+file such as `/etc/nginx/conf.d/turnalign.conf`, replace the hostname and
+certificate paths, then validate and reload:
 
 ```bash
 sudo nginx -t
@@ -146,7 +147,9 @@ production-gate` with the source commit and all eleven required artifact kinds
 shown in the root README. Keep
 the resulting aggregate report beside the release artifact; it rejects local
 `ws://`, missing recovery/latency controls, mutable model revisions, undersized
-quality evidence, incomplete artifact sets, and a retained systemd unit that
+quality evidence, incomplete artifact sets, a retained Nginx file containing
+unresolved includes or weakened TLS/WebSocket/upstream controls, and a retained
+systemd unit that
 weakens loopback binding, credential handling, resource limits, network
 isolation, graceful lifecycle behavior, or least-privilege controls.
 

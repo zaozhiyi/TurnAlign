@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import cast
 from urllib.parse import unquote, urlsplit
 
-from .deployment_validation import validate_systemd_service
+from .deployment_validation import validate_nginx_config, validate_systemd_service
 from .jsonutil import strict_json_loads
 
 _COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
@@ -1339,6 +1339,7 @@ def run_production_gate(
             "dependency-lock": _MAX_LOCK_BYTES,
             "host-profile": _MAX_HOST_PROFILE_BYTES,
             "model-manifest": _MAX_MODEL_MANIFEST_BYTES,
+            "nginx-config": _MAX_DEPLOYMENT_CONFIG_BYTES,
             "sbom": _MAX_SBOM_BYTES,
             "wheel": _MAX_WHEEL_BYTES,
             "service-unit": _MAX_DEPLOYMENT_CONFIG_BYTES,
@@ -1395,6 +1396,7 @@ def run_production_gate(
             artifact_evidence,
             failures,
         )
+    service_content: bytes | None = None
     service_snapshots = artifact_snapshots.get("service-unit", [])
     if len(service_snapshots) == 1:
         service_content = service_snapshots[0].content
@@ -1404,6 +1406,26 @@ def run_production_gate(
             )
         else:
             failures.extend(validate_systemd_service(service_content))
+    nginx_snapshots = artifact_snapshots.get("nginx-config", [])
+    if len(nginx_snapshots) == 1:
+        nginx_content = nginx_snapshots[0].content
+        websocket_uri = websocket.get("uri")
+        if nginx_content is None:
+            failures.append(
+                f"Nginx configuration exceeds {_MAX_DEPLOYMENT_CONFIG_BYTES} bytes"
+            )
+        elif service_content is None:
+            failures.append("Nginx cannot be checked without bounded systemd evidence")
+        elif not isinstance(websocket_uri, str):
+            failures.append("Nginx cannot be checked without a WebSocket report URI")
+        else:
+            failures.extend(
+                validate_nginx_config(
+                    nginx_content,
+                    service_content,
+                    websocket_uri,
+                )
+            )
 
     for name, report in (
         ("release", release),

@@ -231,6 +231,10 @@ class ProductionGateTests(unittest.TestCase):
                 path.write_bytes(
                     (ROOT / "deploy" / "systemd" / "turnalign.service").read_bytes()
                 )
+            elif kind == "nginx-config":
+                path.write_bytes(
+                    (ROOT / "deploy" / "nginx" / "turnalign.conf.example").read_bytes()
+                )
             else:
                 path.write_bytes(f"immutable {kind}\n".encode())
             artifacts.append((kind, path))
@@ -596,6 +600,85 @@ class ProductionGateTests(unittest.TestCase):
                 )
                 content = service.read_text(encoding="utf-8")
                 service.write_text(content.replace(*replace), encoding="utf-8")
+                report = run_production_gate(
+                    release,
+                    quality,
+                    websocket,
+                    source_commit="b" * 40,
+                    artifacts=artifacts,
+                )
+
+                with self.subTest(expected=expected):
+                    self.assertFalse(report.passed)
+                    self.assertIn(expected, "\n".join(report.failures))
+
+    def test_rejects_weakened_or_mismatched_nginx_controls(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, quality, websocket = self._reports(root)
+            for replace, expected in (
+                (
+                    ("proxy_next_upstream off;", "# proxy_next_upstream off;"),
+                    "upstream retry disablement",
+                ),
+                (
+                    ("server 127.0.0.1:8765;", "server 10.0.0.2:8765;"),
+                    "only a loopback TCP server",
+                ),
+                (
+                    (
+                        "ssl_protocols TLSv1.2 TLSv1.3;",
+                        "ssl_protocols TLSv1 TLSv1.2;",
+                    ),
+                    "only TLSv1.2 and TLSv1.3",
+                ),
+                (
+                    ("return 404;", "proxy_pass http://turnalign_backend/metrics;"),
+                    "keep metrics private",
+                ),
+                (
+                    ("proxy_read_timeout 330s;", "proxy_read_timeout 30s;"),
+                    "read timeout",
+                ),
+                (
+                    ("server_name asr.example.com;", "server_name other.example.com;"),
+                    "one server for the probed host",
+                ),
+                (
+                    (
+                        "proxy_buffering off;",
+                        "proxy_buffering off;\n        include /tmp/unsafe.conf;",
+                    ),
+                    "self-contained without include directives",
+                ),
+                (
+                    (
+                        "proxy_set_header Upgrade $http_upgrade;",
+                        (
+                            "proxy_set_header Upgrade $http_upgrade;\n"
+                            "        proxy_set_header Upgrade close;"
+                        ),
+                    ),
+                    "Upgrade forwarding",
+                ),
+                (
+                    (
+                        (
+                            "limit_req_zone $binary_remote_addr "
+                            "zone=turnalign_handshake:10m rate=5r/s;"
+                        ),
+                        "# limit_req_zone removed",
+                    ),
+                    "handshake rate-limit zone",
+                ),
+            ):
+                artifacts = self._artifacts(root)
+                nginx = next(
+                    path for kind, path in artifacts if kind == "nginx-config"
+                )
+                content = nginx.read_text(encoding="utf-8")
+                self.assertIn(replace[0], content)
+                nginx.write_text(content.replace(*replace), encoding="utf-8")
                 report = run_production_gate(
                     release,
                     quality,
