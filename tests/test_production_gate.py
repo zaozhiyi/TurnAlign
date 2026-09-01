@@ -2,8 +2,11 @@ import hashlib
 import json
 import tempfile
 import unittest
+from os import fstat as real_fstat
 from pathlib import Path
+from unittest.mock import patch
 
+from turnalign import production_gate as production_gate_module
 from turnalign.production_gate import (
     REQUIRED_ARTIFACT_KINDS,
     run_production_gate,
@@ -366,6 +369,68 @@ class ProductionGateTests(unittest.TestCase):
                 "continuation contains a second requirement",
                 "\n".join(report.failures),
             )
+
+    def test_rejects_oversized_dependency_lock_without_parsing_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, quality, websocket = self._reports(root)
+            artifacts = self._artifacts(root)
+            lock = next(
+                path for kind, path in artifacts if kind == "dependency-lock"
+            )
+            lock.write_bytes(b"x" * (4 * 1024 * 1024 + 1))
+
+            report = run_production_gate(
+                release,
+                quality,
+                websocket,
+                source_commit="b" * 40,
+                artifacts=artifacts,
+            )
+
+            self.assertFalse(report.passed)
+            self.assertIn(
+                "dependency lock exceeds 4194304 bytes",
+                report.failures,
+            )
+
+    def test_rejects_oversized_gate_report_before_json_parsing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, quality, websocket = self._reports(root)
+            release.write_bytes(b"x" * (2 * 1024 * 1024 + 1))
+
+            with self.assertRaisesRegex(ValueError, "gate report exceeds 2097152 bytes"):
+                run_production_gate(
+                    release,
+                    quality,
+                    websocket,
+                    source_commit="b" * 40,
+                    artifacts=self._artifacts(root),
+                )
+
+    def test_snapshot_rejects_evidence_that_changes_during_read(self):
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = Path(directory) / "evidence.bin"
+            evidence.write_bytes(b"immutable")
+            calls = 0
+
+            def changing_fstat(descriptor):
+                nonlocal calls
+                calls += 1
+                metadata = real_fstat(descriptor)
+                if calls == 2:
+                    values = list(metadata)
+                    values[6] += 1
+                    return type(metadata)(values)
+                return metadata
+
+            with patch.object(
+                production_gate_module.os,
+                "fstat",
+                side_effect=changing_fstat,
+            ), self.assertRaisesRegex(ValueError, "changed while it was being read"):
+                production_gate_module._snapshot_evidence(evidence)
 
     def test_atomic_writer_creates_parent_and_valid_json(self):
         with tempfile.TemporaryDirectory() as directory:

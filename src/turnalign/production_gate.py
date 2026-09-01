@@ -6,6 +6,7 @@ import json
 import math
 import os
 import re
+import stat
 import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -51,6 +52,13 @@ class ArtifactEvidence:
     name: str
     sha256: str
     bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class _EvidenceSnapshot:
+    sha256: str
+    size: int
+    content: bytes | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,36 +122,119 @@ def _invalid_constant(value: str) -> object:
     raise ValueError(f"non-finite JSON number: {value}")
 
 
-def _regular_file(path: Path, *, report: bool = False) -> None:
-    if path.is_symlink() or not path.is_file():
-        raise ValueError(f"evidence must be a regular non-symlink file: {path}")
-    size = path.stat().st_size
-    if size <= 0:
+def _metadata_signature(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _open_evidence(path: Path) -> tuple[int, os.stat_result]:
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    try:
+        path_metadata = os.lstat(path)
+        if stat.S_ISLNK(path_metadata.st_mode) or not stat.S_ISREG(
+            path_metadata.st_mode
+        ):
+            raise ValueError(f"evidence must be a regular non-symlink file: {path}")
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow,
+        )
+    except ValueError:
+        raise
+    except OSError as error:
+        raise ValueError(
+            f"evidence must be a regular non-symlink file: {path}"
+        ) from error
+    try:
+        opened_metadata = os.fstat(descriptor)
+        try:
+            current_metadata = os.lstat(path)
+        except OSError as error:
+            raise ValueError(
+                f"evidence changed while it was being opened: {path}"
+            ) from error
+        if (
+            not stat.S_ISREG(opened_metadata.st_mode)
+            or (opened_metadata.st_dev, opened_metadata.st_ino)
+            != (current_metadata.st_dev, current_metadata.st_ino)
+        ):
+            raise ValueError(f"evidence changed while it was being opened: {path}")
+        return descriptor, opened_metadata
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _snapshot_evidence(
+    path: Path,
+    *,
+    capture_limit: int | None = None,
+    hard_limit: int | None = None,
+) -> _EvidenceSnapshot:
+    descriptor, initial_metadata = _open_evidence(path)
+    if initial_metadata.st_size <= 0:
+        os.close(descriptor)
         raise ValueError(f"evidence file is empty: {path}")
-    if report and size > _MAX_REPORT_BYTES:
-        raise ValueError(f"gate report exceeds {_MAX_REPORT_BYTES} bytes: {path}")
+    if hard_limit is not None and initial_metadata.st_size > hard_limit:
+        os.close(descriptor)
+        raise ValueError(f"gate report exceeds {hard_limit} bytes: {path}")
 
-
-def _digest(path: Path) -> tuple[str, int]:
     digest = hashlib.sha256()
     size = 0
-    with path.open("rb") as source:
-        for block in iter(lambda: source.read(1024 * 1024), b""):
-            size += len(block)
-            digest.update(block)
-    return digest.hexdigest(), size
+    captured = bytearray() if capture_limit is not None else None
+    try:
+        with os.fdopen(descriptor, "rb") as source:
+            descriptor = -1
+            for block in iter(lambda: source.read(1024 * 1024), b""):
+                size += len(block)
+                if hard_limit is not None and size > hard_limit:
+                    raise ValueError(f"gate report exceeds {hard_limit} bytes: {path}")
+                digest.update(block)
+                if captured is not None:
+                    if capture_limit is not None and size <= capture_limit:
+                        captured.extend(block)
+                    else:
+                        captured = None
+            final_metadata = os.fstat(source.fileno())
+        try:
+            current_metadata = os.lstat(path)
+        except OSError as error:
+            raise ValueError(
+                f"evidence changed while it was being read: {path}"
+            ) from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if (
+        size != initial_metadata.st_size
+        or _metadata_signature(final_metadata) != _metadata_signature(initial_metadata)
+        or (final_metadata.st_dev, final_metadata.st_ino)
+        != (current_metadata.st_dev, current_metadata.st_ino)
+    ):
+        raise ValueError(f"evidence changed while it was being read: {path}")
+    return _EvidenceSnapshot(
+        sha256=digest.hexdigest(),
+        size=size,
+        content=bytes(captured) if captured is not None else None,
+    )
 
 
-def _evidence(path: Path) -> EvidenceFile:
-    digest, size = _digest(path)
-    return EvidenceFile(path.name, digest, size)
-
-
-def _load_report(path: Path) -> dict[str, object]:
-    _regular_file(path, report=True)
+def _load_report(path: Path) -> tuple[dict[str, object], EvidenceFile]:
+    snapshot = _snapshot_evidence(
+        path,
+        capture_limit=_MAX_REPORT_BYTES,
+        hard_limit=_MAX_REPORT_BYTES,
+    )
+    if snapshot.content is None:  # hard_limit makes this unreachable.
+        raise ValueError(f"gate report exceeds {_MAX_REPORT_BYTES} bytes: {path}")
     try:
         payload = json.loads(
-            path.read_text(encoding="utf-8"),
+            snapshot.content.decode("utf-8"),
             object_pairs_hook=_unique_object,
             parse_constant=_invalid_constant,
         )
@@ -151,7 +242,7 @@ def _load_report(path: Path) -> dict[str, object]:
         raise ValueError(f"invalid gate report {path}: {error}") from error
     if not isinstance(payload, dict):
         raise TypeError(f"gate report must contain one JSON object: {path}")
-    return payload
+    return payload, EvidenceFile(path.name, snapshot.sha256, snapshot.size)
 
 
 def _positive_number(value: object) -> bool:
@@ -396,13 +487,16 @@ def _validate_websocket(report: dict[str, object], failures: list[str]) -> None:
         failures.append("websocket report lacks passing per-session evidence")
 
 
-def _validate_sbom(path: Path, failures: list[str]) -> dict[str, str]:
-    if path.stat().st_size > _MAX_SBOM_BYTES:
+def _validate_sbom(
+    snapshot: _EvidenceSnapshot,
+    failures: list[str],
+) -> dict[str, str]:
+    if snapshot.content is None:
         failures.append(f"SBOM exceeds {_MAX_SBOM_BYTES} bytes")
         return {}
     try:
         payload = json.loads(
-            path.read_text(encoding="utf-8"),
+            snapshot.content.decode("utf-8"),
             object_pairs_hook=_unique_object,
             parse_constant=_invalid_constant,
         )
@@ -486,14 +580,14 @@ def _validate_sbom(path: Path, failures: list[str]) -> dict[str, str]:
 
 
 def _validate_dependency_lock(
-    path: Path,
+    snapshot: _EvidenceSnapshot,
     failures: list[str],
 ) -> dict[str, tuple[str, bool]]:
-    if path.stat().st_size > _MAX_LOCK_BYTES:
+    if snapshot.content is None:
         failures.append(f"dependency lock exceeds {_MAX_LOCK_BYTES} bytes")
         return {}
     try:
-        text = path.read_text(encoding="utf-8")
+        text = snapshot.content.decode("utf-8")
     except UnicodeDecodeError as error:
         failures.append(f"dependency lock is not UTF-8: {error}")
         return {}
@@ -576,9 +670,9 @@ def run_production_gate(
     if _COMMIT_PATTERN.fullmatch(source_commit) is None:
         raise ValueError("source_commit must be a lowercase 40-character Git commit")
 
-    release = _load_report(release_path)
-    quality = _load_report(quality_path)
-    websocket = _load_report(websocket_path)
+    release, release_evidence = _load_report(release_path)
+    quality, quality_evidence = _load_report(quality_path)
+    websocket, websocket_evidence = _load_report(websocket_path)
     failures: list[str] = []
     _validate_release(release, failures)
     _validate_quality(quality, failures)
@@ -588,29 +682,36 @@ def run_production_gate(
     kinds = set()
     artifact_paths: dict[str, list[Path]] = {}
     artifact_digests: dict[str, list[str]] = {}
+    artifact_snapshots: dict[str, list[_EvidenceSnapshot]] = {}
     for kind, path in artifacts:
         if kind not in REQUIRED_ARTIFACT_KINDS:
             raise ValueError(f"unsupported artifact kind: {kind}")
-        _regular_file(path)
-        digest, size = _digest(path)
-        artifact_evidence.append(ArtifactEvidence(kind, path.name, digest, size))
+        capture_limit = {
+            "dependency-lock": _MAX_LOCK_BYTES,
+            "sbom": _MAX_SBOM_BYTES,
+        }.get(kind)
+        snapshot = _snapshot_evidence(path, capture_limit=capture_limit)
+        artifact_evidence.append(
+            ArtifactEvidence(kind, path.name, snapshot.sha256, snapshot.size)
+        )
         kinds.add(kind)
         artifact_paths.setdefault(kind, []).append(path)
-        artifact_digests.setdefault(kind, []).append(digest)
+        artifact_digests.setdefault(kind, []).append(snapshot.sha256)
+        artifact_snapshots.setdefault(kind, []).append(snapshot)
     for missing in sorted(REQUIRED_ARTIFACT_KINDS - kinds):
         failures.append(f"missing required artifact kind: {missing}")
     for kind in sorted(REQUIRED_ARTIFACT_KINDS - {"model"}):
         if len(artifact_paths.get(kind, [])) > 1:
             failures.append(f"artifact kind must appear exactly once: {kind}")
 
-    sbom_paths = artifact_paths.get("sbom", [])
-    lock_paths = artifact_paths.get("dependency-lock", [])
-    if len(sbom_paths) == 1:
-        sbom_components = _validate_sbom(sbom_paths[0], failures)
+    sbom_snapshots = artifact_snapshots.get("sbom", [])
+    lock_snapshots = artifact_snapshots.get("dependency-lock", [])
+    if len(sbom_snapshots) == 1:
+        sbom_components = _validate_sbom(sbom_snapshots[0], failures)
     else:
         sbom_components = {}
-    if len(lock_paths) == 1:
-        locked_requirements = _validate_dependency_lock(lock_paths[0], failures)
+    if len(lock_snapshots) == 1:
+        locked_requirements = _validate_dependency_lock(lock_snapshots[0], failures)
     else:
         locked_requirements = {}
     for name, (version, conditional) in locked_requirements.items():
@@ -649,9 +750,9 @@ def run_production_gate(
         schema_version=1,
         status="failed" if failures else "passed",
         source_commit=source_commit,
-        release_report=_evidence(release_path),
-        quality_report=_evidence(quality_path),
-        websocket_report=_evidence(websocket_path),
+        release_report=release_evidence,
+        quality_report=quality_evidence,
+        websocket_report=websocket_evidence,
         artifacts=tuple(sorted(
             artifact_evidence,
             key=lambda item: (item.kind, item.name, item.sha256),
