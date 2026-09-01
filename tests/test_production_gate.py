@@ -82,16 +82,50 @@ class ProductionGateTests(unittest.TestCase):
             "failed_sessions": 0,
             "realtime_pacing": True,
             "recovery_probe_required": True,
-            "recovery_probe": {"passed": True},
+            "recovery_probe": {
+                "passed": True,
+                "disconnected_audio_seconds": 30.0,
+                "first_last_acknowledged_sequence": 299,
+                "resumed_next_audio_sequence": 300,
+                "final_acknowledged_sequence": 599,
+                "final_buffered_bytes": 0,
+                "events": 2,
+                "commits": 1,
+                "audio_acks": 600,
+                "failure": None,
+            },
             "max_ready_seconds": 10.0,
             "max_total_seconds": 75.0,
+            "min_commits_per_session": 1,
             "min_audio_acks_per_session": 600,
             "max_dropped_partials_per_session": 0,
             "max_backpressure_pauses_per_session": 0,
             "audio_seconds_per_session": 60.0,
             "ready_seconds_p95": 2.0,
             "total_seconds_p95": 62.0,
-            "results": [{"passed": True} for _ in range(8)],
+            "events": 16,
+            "commits": 8,
+            "audio_acks": 4_800,
+            "backpressure_pauses": 0,
+            "dropped_partials": 0,
+            "results": [
+                {
+                    "session": session,
+                    "passed": True,
+                    "ready_seconds": 2.0,
+                    "total_seconds": 62.0,
+                    "events": 2,
+                    "partials": 0,
+                    "commits": 1,
+                    "audio_acks": 600,
+                    "last_acknowledged_sequence": 599,
+                    "final_buffered_bytes": 0,
+                    "backpressure_pauses": 0,
+                    "dropped_partials": 0,
+                    "failure": None,
+                }
+                for session in range(1, 9)
+            ],
         })
         return release, quality, websocket
 
@@ -218,6 +252,56 @@ class ProductionGateTests(unittest.TestCase):
                 with self.subTest(uri=uri):
                     self.assertFalse(report.passed)
                     self.assertIn(expected, "\n".join(report.failures))
+
+    def test_rejects_forged_or_type_ambiguous_websocket_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, quality, websocket = self._reports(root)
+            artifacts = self._artifacts(root)
+            for mutate, expected in (
+                (
+                    lambda payload: payload.update(recovery_probe={"passed": True}),
+                    "recovery probe lacks complete typed evidence",
+                ),
+                (
+                    lambda payload: payload.update(failed_sessions=False),
+                    "contains failed sessions",
+                ),
+                (
+                    lambda payload: payload.update(
+                        max_dropped_partials_per_session=False
+                    ),
+                    "did not forbid dropped partials",
+                ),
+                (
+                    lambda payload: payload["recovery_probe"].update(
+                        resumed_next_audio_sequence=301
+                    ),
+                    "inconsistent sequence or buffer evidence",
+                ),
+                (
+                    lambda payload: payload["results"][0].update(audio_acks=True),
+                    "lacks complete typed per-session evidence",
+                ),
+                (
+                    lambda payload: payload.update(ready_seconds_p95=1.0),
+                    "latency p95 does not match per-session evidence",
+                ),
+            ):
+                payload = json.loads(websocket.read_text(encoding="utf-8"))
+                mutate(payload)
+                write_json_report(websocket, payload)
+                report = run_production_gate(
+                    release,
+                    quality,
+                    websocket,
+                    source_commit="b" * 40,
+                    artifacts=artifacts,
+                )
+                with self.subTest(expected=expected):
+                    self.assertFalse(report.passed)
+                    self.assertIn(expected, "\n".join(report.failures))
+                _, _, websocket = self._reports(root)
 
     def test_rejects_ambiguous_or_mutable_evidence(self):
         with tempfile.TemporaryDirectory() as directory:

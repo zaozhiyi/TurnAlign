@@ -10,6 +10,7 @@ import stat
 import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import cast
 from urllib.parse import unquote, urlsplit
 
 from .jsonutil import strict_json_loads
@@ -457,40 +458,156 @@ def _validate_websocket(report: dict[str, object], failures: list[str]) -> None:
     recovery = report.get("recovery_probe")
     if not isinstance(recovery, dict) or recovery.get("passed") is not True:
         failures.append("websocket recovery probe did not pass")
+    elif (
+        not _positive_number(recovery.get("disconnected_audio_seconds"))
+        or not _integer_at_least(
+            recovery.get("first_last_acknowledged_sequence"), 0
+        )
+        or not _integer_at_least(recovery.get("resumed_next_audio_sequence"), 0)
+        or not _integer_at_least(recovery.get("final_acknowledged_sequence"), 0)
+        or not _integer_at_least(recovery.get("final_buffered_bytes"), 0)
+        or not _positive_integer(recovery.get("events"))
+        or not _integer_at_least(recovery.get("commits"), 0)
+        or not _positive_integer(recovery.get("audio_acks"))
+        or recovery.get("failure") is not None
+    ):
+        failures.append("websocket recovery probe lacks complete typed evidence")
+    else:
+        first_acknowledged = cast(
+            int, recovery["first_last_acknowledged_sequence"]
+        )
+        resumed_sequence = cast(int, recovery["resumed_next_audio_sequence"])
+        final_acknowledged = cast(int, recovery["final_acknowledged_sequence"])
+        if (
+            resumed_sequence != first_acknowledged + 1
+            or final_acknowledged <= first_acknowledged
+            or recovery["final_buffered_bytes"] != 0
+        ):
+            failures.append(
+                "websocket recovery probe has inconsistent sequence or buffer evidence"
+            )
     if report.get("realtime_pacing") is not True:
         failures.append("websocket report did not use real-time pacing")
     sessions = report.get("sessions")
     if not _integer_at_least(sessions, 2):
         failures.append("websocket report did not exercise concurrent sessions")
-    if report.get("failed_sessions") != 0:
+    if not _integer_at_least(report.get("failed_sessions"), 0) or report.get(
+        "failed_sessions"
+    ) != 0:
         failures.append("websocket report contains failed sessions")
-    if report.get("passed_sessions") != report.get("sessions"):
+    if not _integer_at_least(report.get("passed_sessions"), 0) or report.get(
+        "passed_sessions"
+    ) != sessions:
         failures.append("websocket report did not pass every session")
-    if not _positive_number(report.get("max_ready_seconds")):
+    max_ready_seconds = report.get("max_ready_seconds")
+    max_total_seconds = report.get("max_total_seconds")
+    min_commits = report.get("min_commits_per_session")
+    min_audio_acks = report.get("min_audio_acks_per_session")
+    if not _positive_number(max_ready_seconds):
         failures.append("websocket report has no ready-time ceiling")
-    if not _positive_number(report.get("max_total_seconds")):
+    if not _positive_number(max_total_seconds):
         failures.append("websocket report has no total-time ceiling")
-    if not _positive_integer(report.get("min_audio_acks_per_session")):
+    if not _integer_at_least(min_commits, 0):
+        failures.append("websocket report has no valid commit minimum")
+    if not _positive_integer(min_audio_acks):
         failures.append("websocket report has no positive acknowledgement minimum")
-    if report.get("max_dropped_partials_per_session") != 0:
+    if (
+        not _integer_at_least(report.get("max_dropped_partials_per_session"), 0)
+        or report.get("max_dropped_partials_per_session") != 0
+    ):
         failures.append("websocket report did not forbid dropped partials")
     pauses = report.get("max_backpressure_pauses_per_session")
     if isinstance(pauses, bool) or not isinstance(pauses, int) or pauses < 0:
         failures.append("websocket report has no explicit backpressure-pause ceiling")
     if not _positive_number(report.get("audio_seconds_per_session")):
         failures.append("websocket report has no positive per-session audio duration")
-    if not _at_most(report.get("ready_seconds_p95"), report.get("max_ready_seconds")):
+    if not _at_most(report.get("ready_seconds_p95"), max_ready_seconds):
         failures.append("websocket ready-time p95 exceeds or lacks its ceiling")
-    if not _at_most(report.get("total_seconds_p95"), report.get("max_total_seconds")):
+    if not _at_most(report.get("total_seconds_p95"), max_total_seconds):
         failures.append("websocket total-time p95 exceeds or lacks its ceiling")
     results = report.get("results")
-    if (
-        not isinstance(results, list)
-        or not isinstance(sessions, int)
-        or len(results) != sessions
-        or any(not isinstance(result, dict) or result.get("passed") is not True for result in results)
-    ):
+    if not isinstance(results, list) or not _integer_at_least(sessions, 2) or len(
+        results
+    ) != sessions:
         failures.append("websocket report lacks passing per-session evidence")
+        return
+    typed_sessions = cast(int, sessions)
+
+    valid_results = all(
+        isinstance(result, dict)
+        and result.get("passed") is True
+        and _integer_at_least(result.get("session"), 1)
+        and _positive_number(result.get("ready_seconds"))
+        and _positive_number(result.get("total_seconds"))
+        and _positive_integer(result.get("events"))
+        and _integer_at_least(result.get("partials"), 0)
+        and _integer_at_least(result.get("commits"), 0)
+        and _positive_integer(result.get("audio_acks"))
+        and _integer_at_least(result.get("last_acknowledged_sequence"), 0)
+        and _integer_at_least(result.get("final_buffered_bytes"), 0)
+        and _integer_at_least(result.get("backpressure_pauses"), 0)
+        and _integer_at_least(result.get("dropped_partials"), 0)
+        and result.get("failure") is None
+        for result in results
+    )
+    if not valid_results:
+        failures.append("websocket report lacks complete typed per-session evidence")
+        return
+
+    typed_results = [result for result in results if isinstance(result, dict)]
+    if {result["session"] for result in typed_results} != set(
+        range(1, typed_sessions + 1)
+    ):
+        failures.append("websocket report has duplicate or missing session identities")
+    thresholds_are_typed = (
+        _positive_number(max_ready_seconds)
+        and _positive_number(max_total_seconds)
+        and _integer_at_least(min_commits, 0)
+        and _positive_integer(min_audio_acks)
+        and _integer_at_least(pauses, 0)
+    )
+    if thresholds_are_typed:
+        for result in typed_results:
+            if (
+                not _at_most(result["ready_seconds"], max_ready_seconds)
+                or not _at_most(result["total_seconds"], max_total_seconds)
+                or not _at_most(result["ready_seconds"], result["total_seconds"])
+                or not _integer_at_least(result["commits"], cast(int, min_commits))
+                or not _integer_at_least(
+                    result["audio_acks"], cast(int, min_audio_acks)
+                )
+                or result["final_buffered_bytes"] != 0
+                or not _at_most(result["backpressure_pauses"], pauses)
+                or result["dropped_partials"] != 0
+            ):
+                failures.append("websocket per-session evidence violates its thresholds")
+                break
+
+    percentile_index = max(0, math.ceil(len(typed_results) * 0.95) - 1)
+    expected_ready_p95 = sorted(result["ready_seconds"] for result in typed_results)[
+        percentile_index
+    ]
+    expected_total_p95 = sorted(result["total_seconds"] for result in typed_results)[
+        percentile_index
+    ]
+    if (
+        report.get("ready_seconds_p95") != expected_ready_p95
+        or report.get("total_seconds_p95") != expected_total_p95
+    ):
+        failures.append("websocket latency p95 does not match per-session evidence")
+
+    for aggregate, field in (
+        ("events", "events"),
+        ("commits", "commits"),
+        ("audio_acks", "audio_acks"),
+        ("backpressure_pauses", "backpressure_pauses"),
+        ("dropped_partials", "dropped_partials"),
+    ):
+        value = report.get(aggregate)
+        if not _integer_at_least(value, 0) or value != sum(
+            result[field] for result in typed_results
+        ):
+            failures.append(f"websocket aggregate {aggregate} does not match sessions")
 
 
 def _validate_sbom(
