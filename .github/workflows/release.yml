@@ -66,7 +66,7 @@ jobs:
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main
       - name: Install pinned release tooling
         run: >-
-          python -m pip install --upgrade pip build==1.4.4 twine==6.2.0
+          python -m pip install --upgrade pip==26.0.1 build==1.4.4 twine==6.2.0
           cyclonedx-bom==7.3.1 ruff==0.16.5 bandit==1.8.6 mypy==1.18.2
       - name: Run static release checks
         run: |
@@ -87,7 +87,8 @@ jobs:
       - name: Generate reproducible server SBOM
         run: |
           python -m venv sbom-env
-          sbom-env/bin/python -m pip install --upgrade pip
+          sbom-env/bin/python -m pip install --upgrade \
+            pip==26.0.1 setuptools==80.9.0
           sbom-env/bin/python -m pip install dist-a/*.whl "websockets==17.1"
           cyclonedx-py environment sbom-env/bin/python \
             --pyproject pyproject.toml --mc-type application --sv 1.6 \

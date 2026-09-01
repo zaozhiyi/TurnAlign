@@ -110,7 +110,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: >-
-          python -m pip install --upgrade pip build==1.4.4 twine==6.2.0
+          python -m pip install --upgrade pip==26.0.1 build==1.4.4 twine==6.2.0
           cyclonedx-bom==7.3.1
       - name: Bind reproducible build inputs to the checked-out commit
         run: |
@@ -123,7 +123,8 @@ jobs:
       - name: Generate reproducible server SBOM
         run: |
           python -m venv sbom-env
-          sbom-env/bin/python -m pip install --upgrade pip
+          sbom-env/bin/python -m pip install --upgrade \
+            pip==26.0.1 setuptools==80.9.0
           sbom-env/bin/python -m pip install dist-a/*.whl "websockets==17.1"
           cyclonedx-py environment sbom-env/bin/python \
             --pyproject pyproject.toml --mc-type application --sv 1.6 \

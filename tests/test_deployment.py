@@ -7,6 +7,7 @@ SERVICE = ROOT / "deploy" / "systemd" / "turnalign.service"
 NGINX = ROOT / "deploy" / "nginx" / "turnalign.conf.example"
 LEGACY_ENVIRONMENT = ROOT / "deploy" / "systemd" / "turnalign.env.example"
 RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
+CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 
 
 def option_number(content: str, option: str) -> float:
@@ -109,12 +110,23 @@ class DeploymentArtifactTests(unittest.TestCase):
             "attestations: write",
             "id-token: write",
             "persist-credentials: false",
+            "pip==26.0.1",
+            "setuptools==80.9.0",
             'git merge-base --is-ancestor "$GITHUB_SHA" origin/main',
             "actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6",
             "sbom-path: dist-a/sbom.cdx.json",
             'gh attestation verify "$artifact"',
             "retention-days: 90",
         ):
+            self.assertIn(requirement, content)
+
+    def test_distribution_sbom_environment_is_version_bound(self):
+        requirement = (
+            "sbom-env/bin/python -m pip install --upgrade \\\n"
+            "            pip==26.0.1 setuptools==80.9.0"
+        )
+        for workflow in (CI_WORKFLOW, RELEASE_WORKFLOW):
+            content = workflow.read_text(encoding="utf-8")
             self.assertIn(requirement, content)
 
 

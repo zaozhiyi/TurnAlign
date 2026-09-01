@@ -595,7 +595,8 @@ creating GitHub/Sigstore provenance for the Wheel, sdist, SBOM and checksums.
 Fork pull requests run only the read-only workflow validation and cannot attest
 artifacts. Verify a downloaded file with
 `gh attestation verify FILE --repo GuanZhengPM/TurnAlign`. The workflow retains
-artifacts for 90 days; it does not
+artifacts for 90 days and fixes the pip/setuptools versions recorded in the
+distribution SBOM; it does not
 publish to PyPI or create a GitHub Release.
 
 A scoped [Linux CPU systemd and Nginx reference deployment](deploy/README.md)
