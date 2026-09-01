@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import threading
@@ -59,7 +60,16 @@ class BackendPool:
 
     @staticmethod
     def key(name: str, config: AsrConfig) -> str:
-        return f"{name}:{json.dumps(asdict(config), sort_keys=True, default=str)}"
+        if not isinstance(name, str) or not name or name != name.strip():
+            raise ValueError("backend name must be a non-empty trimmed string")
+        encoded = json.dumps(
+            asdict(config),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        return f"{name}:{hashlib.sha256(encoded).hexdigest()}"
 
     def acquire(
         self,

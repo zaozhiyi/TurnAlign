@@ -21,7 +21,7 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   materialization limit before constructing the float model input.
 - All source and test modules pass `compileall`.
 - Ruff is enforced in CI and passes over `src` and `tests`.
-- The built wheel passes all 267 tests from site-packages on Python 3.10 with
+- The built wheel passes all 268 tests from site-packages on Python 3.10 with
   `websockets` 14.0 and on Python 3.12 with `websockets` 17.1. The Python 3.12
   run also passes under `python -O`, so production invariants do not depend on
   removable `assert` statements.
@@ -87,6 +87,9 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   switches require real booleans and session duration rejects booleans. Client
   backend, model, language, compute and component identities remain strings
   instead of being coerced into allowlisted names.
+- Model-pool reuse keys are canonical SHA-256 fingerprints of strict finite JSON
+  configuration. Non-serializable options are rejected instead of stringified,
+  and raw paths, component settings or private hints are not retained in keys.
 - Repeated component options reject empty, whitespace or duplicate keys. Their
   JSON values use the same strict parser, so duplicate object members and
   `NaN`/`Infinity` cannot enter ASR, VAD, alignment or diarization configuration.

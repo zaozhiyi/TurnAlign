@@ -1,5 +1,6 @@
 import unittest
 
+from turnalign.hints import AsrHints
 from turnalign.model_pool import BackendPool, BackendPoolCapacityError
 from turnalign.plugins import AsrConfig
 
@@ -26,6 +27,40 @@ class BackendPoolTests(unittest.TestCase):
                     ValueError, name
                 ):
                     BackendPool(**{name: value})
+
+    def test_pool_keys_are_strict_canonical_private_fingerprints(self):
+        first = AsrConfig(
+            model="model",
+            extra={"nested": {"b": 2, "a": 1}},
+            hints=AsrHints(context="PRIVATE_CONTEXT"),
+        )
+        reordered = AsrConfig(
+            model="model",
+            extra={"nested": {"a": 1, "b": 2}},
+            hints=AsrHints(context="PRIVATE_CONTEXT"),
+        )
+        key = BackendPool.key("fake", first)
+        self.assertRegex(key, r"^fake:[0-9a-f]{64}$")
+        self.assertNotIn("PRIVATE_CONTEXT", key)
+        self.assertEqual(key, BackendPool.key("fake", reordered))
+        self.assertNotEqual(
+            key,
+            BackendPool.key("fake", AsrConfig(model="another")),
+        )
+
+        for config, expected in (
+            (AsrConfig(extra={"value": float("nan")}), "Out of range"),
+            (AsrConfig(extra={"value": object()}), "JSON serializable"),
+        ):
+            with self.subTest(expected=expected), self.assertRaisesRegex(
+                (TypeError, ValueError), expected
+            ):
+                BackendPool.key("fake", config)
+        for name in ("", " fake ", 1):
+            with self.subTest(name=name), self.assertRaisesRegex(
+                ValueError, "backend name"
+            ):
+                BackendPool.key(name, AsrConfig())
 
     def test_per_config_replicas_allow_parallel_leases_then_reuse(self):
         pool = BackendPool(max_entries=2, max_entries_per_key=2)
