@@ -342,11 +342,20 @@ def _validate_symlink_target(path: Path, release: Path) -> None:
         resolved_release = release.resolve(strict=True)
     except (OSError, RuntimeError) as error:
         raise ValueError(f"release contains an unresolved symbolic link: {path}") from error
-    if resolved.is_dir() and not resolved.is_relative_to(resolved_release):
+    internal_target = resolved.is_relative_to(resolved_release)
+    if resolved.is_dir() and not internal_target:
         raise ValueError(
             f"release symbolic link points to an external directory: {path}"
         )
-    candidates = [resolved, *resolved.parents]
+    target_parents: list[Path] = []
+    if internal_target and resolved != resolved_release:
+        for parent in resolved.parents:
+            target_parents.append(parent)
+            if parent == resolved_release:
+                break
+    elif not internal_target:
+        target_parents.extend(resolved.parents)
+    candidates = [resolved, *target_parents]
     for candidate in reversed(candidates):
         try:
             metadata = os.lstat(candidate)
