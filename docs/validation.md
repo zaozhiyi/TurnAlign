@@ -21,7 +21,7 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   materialization limit before constructing the float model input.
 - All source and test modules pass `compileall`.
 - Ruff is enforced in CI and passes over `src` and `tests`.
-- The built wheel passes all 255 tests from site-packages on Python 3.10 with
+- The built wheel passes all 256 tests from site-packages on Python 3.10 with
   `websockets` 14.0 and on Python 3.12 with `websockets` 17.1. The Python 3.12
   run also passes under `python -O`, so production invariants do not depend on
   removable `assert` statements.
@@ -112,6 +112,10 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   two-pass refinement, and preload failures. Tests verify that all remaining
   resources are still closed and that a hinted WebSocket session still delivers
   its terminal event and releases cleanly when backend close raises.
+- Backend cancellation hooks run outside the WebSocket event loop and outside
+  the backend lease lock. A blocking hook cannot freeze unrelated sessions,
+  is dispatched only once, and keeps its bounded pool slot quarantined until
+  cancellation finishes so the same instance cannot be reused concurrently.
 - Recovery events are bounded by serialized UTF-8 bytes as well as count. Tests
   verify atomic rejection without sequence corruption, byte-window eviction,
   stale replay detection, and a redacted WebSocket `session_error` for an

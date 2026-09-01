@@ -124,6 +124,20 @@ class CancellableServerBackend(FakeServerBackend):
         self.released.set()
 
 
+class BlockingCancelServerBackend(CancellableServerBackend):
+    def __init__(self):
+        super().__init__()
+        self.cancel_started = Event()
+        self.cancel_release = Event()
+        self.cancel_calls = 0
+
+    def cancel(self):
+        self.cancel_calls += 1
+        self.cancel_started.set()
+        self.cancel_release.wait(timeout=2)
+        super().cancel()
+
+
 class UncancellableServerBackend(FakeServerBackend):
     def __init__(self):
         self.started = Event()
@@ -1440,6 +1454,63 @@ class WebSocketTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(await asyncio.to_thread(backend.cancelled.wait, 1))
             finally:
                 backend.released.set()
+                server_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await server_task
+
+    async def test_blocking_cancel_hook_does_not_freeze_server_or_reuse_backend(self):
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        blocking = BlockingCancelServerBackend()
+        replacement = FakeServerBackend()
+        ten_seconds = array("h", [1500] * 160_000).tobytes()
+        with patch(
+            "turnalign.server.create_asr",
+            side_effect=(blocking, replacement),
+        ) as create:
+            server_task = asyncio.create_task(serve(
+                "127.0.0.1",
+                port,
+                default_backend="fake",
+                backend_replicas=2,
+                max_concurrent_sessions=2,
+                worker_shutdown_timeout=0.05,
+            ))
+            await asyncio.sleep(0.05)
+            try:
+                async with connect(f"ws://127.0.0.1:{port}") as first:
+                    await first.send(json.dumps({"type": "start", "backend": "fake"}))
+                    self.assertEqual(json.loads(await first.recv())["type"], "ready")
+                    await first.send(ten_seconds)
+                    self.assertTrue(await asyncio.to_thread(blocking.started.wait, 2))
+                    await first.send(json.dumps({"type": "cancel"}))
+                    self.assertTrue(
+                        await asyncio.wait_for(
+                            asyncio.to_thread(blocking.cancel_started.wait, 1),
+                            timeout=0.5,
+                        )
+                    )
+
+                    async with connect(f"ws://127.0.0.1:{port}") as second:
+                        await second.send(json.dumps({
+                            "type": "start",
+                            "backend": "fake",
+                        }))
+                        ready = json.loads(
+                            await asyncio.wait_for(second.recv(), timeout=0.5)
+                        )
+                        self.assertEqual(ready["type"], "ready")
+                        await second.send(json.dumps({"type": "end"}))
+                        async for message in second:
+                            if json.loads(message).get("kind") == "end":
+                                break
+                self.assertEqual(create.call_count, 2)
+                self.assertEqual(blocking.cancel_calls, 1)
+            finally:
+                blocking.cancel_release.set()
+                blocking.released.set()
                 server_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await server_task

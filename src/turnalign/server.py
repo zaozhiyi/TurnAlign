@@ -511,17 +511,38 @@ async def serve(
         session_completed = False
         backend_in_use: object | None = None
         backend_lease_lock = threading.Lock()
+        backend_cancel_started = False
+        backend_cancel_done = threading.Event()
 
         def cancel_worker() -> None:
+            nonlocal backend_cancel_started
             cancel_event.set()
             with backend_lease_lock:
                 backend = backend_in_use
-                cancel = getattr(backend, "cancel", None)
-                if callable(cancel):
-                    try:
+                if backend is None or backend_cancel_started:
+                    return
+                backend_cancel_started = True
+
+            def invoke_backend_cancel() -> None:
+                try:
+                    cancel = getattr(backend, "cancel", None)
+                    if callable(cancel):
                         cancel()
-                    except Exception:
-                        LOGGER.warning("backend cancellation failed", exc_info=True)
+                except Exception:
+                    LOGGER.warning("backend cancellation failed", exc_info=True)
+                finally:
+                    backend_cancel_done.set()
+
+            cancel_thread = threading.Thread(
+                target=invoke_backend_cancel,
+                name="turnalign-backend-cancel",
+                daemon=True,
+            )
+            try:
+                cancel_thread.start()
+            except RuntimeError:
+                backend_cancel_done.set()
+                LOGGER.warning("unable to start backend cancellation thread", exc_info=True)
 
         def stop_input() -> None:
             if incoming is None:
@@ -734,6 +755,8 @@ async def serve(
                     )
                     with backend_lease_lock:
                         backend_in_use = backend
+                    if cancel_event.is_set():
+                        cancel_worker()
                     validate_asr_hints(backend_name, config.hints, backend)
                     if session_hints:
                         set_hints = getattr(backend, "set_hints", None)
@@ -837,6 +860,14 @@ async def serve(
                     else:
                         initialized.put(error)
                 finally:
+                    # A backend must not return to the reusable pool while its
+                    # cancellation hook is still mutating or stopping it. A
+                    # permanently blocked hook therefore quarantines only this
+                    # already-bounded pool slot and worker thread.
+                    with backend_lease_lock:
+                        wait_for_backend_cancel = backend_cancel_started
+                    if wait_for_backend_cancel:
+                        backend_cancel_done.wait()
                     with backend_lease_lock:
                         leased_backend = backend_in_use
                         if session_hints and leased_backend is not None:
