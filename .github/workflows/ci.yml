@@ -36,6 +36,30 @@ jobs:
           sudo install -m 0600 /dev/null /etc/turnalign/auth-token
           sudo touch /var/lib/turnalign/warmup.wav
           systemd-analyze verify deploy/systemd/turnalign.service
+      - name: Exercise systemd network isolation
+        run: |
+          sudo systemd-run --quiet --collect --wait --pipe \
+            --property=IPAddressDeny=any \
+            --property=IPAddressAllow=localhost \
+            /usr/bin/python3 -c '
+          import errno
+          import socket
+
+          loopback = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+          loopback.bind(("127.0.0.1", 0))
+          loopback.close()
+
+          blocked = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+          try:
+              blocked.connect(("192.0.2.1", 9))
+          except OSError as error:
+              if error.errno not in {errno.EACCES, errno.EPERM}:
+                  raise
+          else:
+              raise SystemExit("non-loopback egress was not blocked")
+          finally:
+              blocked.close()
+          '
       - name: Verify Nginx deployment configuration
         run: |
           sudo apt-get update
