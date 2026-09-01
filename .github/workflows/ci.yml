@@ -83,13 +83,27 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
-      - run: python -m pip install --upgrade pip build==1.4.4 twine==6.2.0
+      - run: >-
+          python -m pip install --upgrade pip build==1.4.4 twine==6.2.0
+          cyclonedx-bom==7.3.1
       - run: echo "SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)" >> "$GITHUB_ENV"
       - run: python -m build --outdir dist-a
       - run: python -m build --outdir dist-b
       - run: cmp dist-a/*.whl dist-b/*.whl && cmp dist-a/*.tar.gz dist-b/*.tar.gz
       - run: python -m twine check dist-a/*
-      - run: cd dist-a && sha256sum *.whl *.tar.gz > SHA256SUMS
+      - name: Generate reproducible server SBOM
+        run: |
+          python -m venv sbom-env
+          sbom-env/bin/python -m pip install --upgrade pip
+          sbom-env/bin/python -m pip install dist-a/*.whl "websockets==17.1"
+          cyclonedx-py environment sbom-env/bin/python \
+            --pyproject pyproject.toml --mc-type application --sv 1.6 \
+            --output-reproducible --of JSON -o dist-a/sbom.cdx.json
+          cyclonedx-py environment sbom-env/bin/python \
+            --pyproject pyproject.toml --mc-type application --sv 1.6 \
+            --output-reproducible --of JSON -o /tmp/turnalign-sbom.cdx.json
+          cmp dist-a/sbom.cdx.json /tmp/turnalign-sbom.cdx.json
+      - run: cd dist-a && sha256sum *.whl *.tar.gz sbom.cdx.json > SHA256SUMS
       - run: python -m pip install --force-reinstall dist-a/*.whl "websockets==17.1"
       - run: >-
           python -c "import pathlib, turnalign;
@@ -141,5 +155,6 @@ jobs:
       - run: >-
           python -m pip install --upgrade pip pip-audit==2.9.0
           build==1.4.4 twine==6.2.0 hatchling==1.27.0
+          cyclonedx-bom==7.3.1
       - run: python -m pip install "." "websockets==${{ matrix.websockets }}"
       - run: python -m pip_audit

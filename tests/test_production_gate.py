@@ -83,7 +83,35 @@ class ProductionGateTests(unittest.TestCase):
         artifacts = []
         for kind in REQUIRED_ARTIFACT_KINDS:
             path = root / f"{kind}.evidence"
-            path.write_text(f"immutable {kind}\n", encoding="utf-8")
+            if kind == "dependency-lock":
+                path.write_text(
+                    "websockets==17.1 \\\n"
+                    f"    --hash=sha256:{'c' * 64}\n",
+                    encoding="utf-8",
+                )
+            elif kind == "sbom":
+                write_json_report(path, {
+                    "bomFormat": "CycloneDX",
+                    "specVersion": "1.6",
+                    "metadata": {"component": {
+                        "bom-ref": "root-component",
+                        "name": "turnalign",
+                        "version": "0.1.0",
+                        "purl": "pkg:pypi/turnalign@0.1.0",
+                    }},
+                    "components": [{
+                        "bom-ref": "websockets==17.1",
+                        "name": "websockets",
+                        "version": "17.1",
+                        "purl": "pkg:pypi/websockets@17.1",
+                    }],
+                    "dependencies": [{
+                        "ref": "root-component",
+                        "dependsOn": ["websockets==17.1"],
+                    }],
+                })
+            else:
+                path.write_text(f"immutable {kind}\n", encoding="utf-8")
             artifacts.append((kind, path))
         return artifacts
 
@@ -183,6 +211,103 @@ class ProductionGateTests(unittest.TestCase):
                     source_commit="B" * 40,
                     artifacts=self._artifacts(root),
                 )
+
+    def test_rejects_malformed_or_incomplete_sbom(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, quality, websocket = self._reports(root)
+            artifacts = self._artifacts(root)
+            sbom = next(path for kind, path in artifacts if kind == "sbom")
+            write_json_report(sbom, {
+                "bomFormat": "CycloneDX",
+                "specVersion": "1.6",
+                "metadata": {"component": {"name": "another-package"}},
+                "components": [],
+            })
+            report = run_production_gate(
+                release,
+                quality,
+                websocket,
+                source_commit="b" * 40,
+                artifacts=artifacts,
+            )
+
+            self.assertFalse(report.passed)
+            failures = "\n".join(report.failures)
+            self.assertIn("TurnAlign root component", failures)
+            self.assertIn("no runtime components", failures)
+
+    def test_rejects_unhashed_or_sbom_mismatched_dependency_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, quality, websocket = self._reports(root)
+            artifacts = self._artifacts(root)
+            lock = next(
+                path for kind, path in artifacts if kind == "dependency-lock"
+            )
+            lock.write_text("websockets==16.0\n", encoding="utf-8")
+            report = run_production_gate(
+                release,
+                quality,
+                websocket,
+                source_commit="b" * 40,
+                artifacts=artifacts,
+            )
+
+            self.assertFalse(report.passed)
+            failures = "\n".join(report.failures)
+            self.assertIn("lacks a SHA-256 hash", failures)
+            self.assertIn("SBOM does not match locked runtime requirement", failures)
+
+    def test_rejects_sbom_with_inconsistent_package_url(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, quality, websocket = self._reports(root)
+            artifacts = self._artifacts(root)
+            sbom = next(path for kind, path in artifacts if kind == "sbom")
+            payload = json.loads(sbom.read_text(encoding="utf-8"))
+            payload["components"][0]["purl"] = "pkg:pypi/another-package@17.1"
+            write_json_report(sbom, payload)
+            report = run_production_gate(
+                release,
+                quality,
+                websocket,
+                source_commit="b" * 40,
+                artifacts=artifacts,
+            )
+
+            self.assertFalse(report.passed)
+            self.assertIn(
+                "unversioned or unidentifiable component",
+                "\n".join(report.failures),
+            )
+
+    def test_rejects_requirement_smuggled_through_hash_continuation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, quality, websocket = self._reports(root)
+            artifacts = self._artifacts(root)
+            lock = next(
+                path for kind, path in artifacts if kind == "dependency-lock"
+            )
+            lock.write_text(
+                "websockets==17.1 \\\n"
+                f"torch==2.0.0 --hash=sha256:{'d' * 64}\n",
+                encoding="utf-8",
+            )
+            report = run_production_gate(
+                release,
+                quality,
+                websocket,
+                source_commit="b" * 40,
+                artifacts=artifacts,
+            )
+
+            self.assertFalse(report.passed)
+            self.assertIn(
+                "continuation contains a second requirement",
+                "\n".join(report.failures),
+            )
 
     def test_atomic_writer_creates_parent_and_valid_json(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -9,17 +9,27 @@ import re
 import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 _COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
 _MODEL_REVISION_PATTERN = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})")
 _MAX_REPORT_BYTES = 2 * 1024 * 1024
+_MAX_SBOM_BYTES = 16 * 1024 * 1024
+_MAX_LOCK_BYTES = 4 * 1024 * 1024
+_LOCK_REQUIREMENT_PATTERN = re.compile(
+    r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([A-Za-z0-9][A-Za-z0-9.!+_-]*)(?:\s|;|$)"
+)
+_EMBEDDED_REQUIREMENT_PATTERN = re.compile(
+    r"\s[A-Za-z0-9][A-Za-z0-9._-]*==[A-Za-z0-9]"
+)
+_SHA256_OPTION_PATTERN = re.compile(r"--hash=sha256:([0-9a-fA-F]{64})(?:\s|$)")
 REQUIRED_ARTIFACT_KINDS = frozenset({
     "dependency-lock",
     "host-profile",
     "model",
     "nginx-config",
     "service-unit",
+    "sbom",
     "wheel",
 })
 
@@ -203,6 +213,20 @@ def _public_hostname(hostname: str | None) -> bool:
     return address.is_global
 
 
+def _package_name(value: str) -> str:
+    return re.sub(r"[-_.]+", "-", value).casefold()
+
+
+def _pypi_purl_identity(value: str) -> tuple[str, str] | None:
+    if not value.startswith("pkg:pypi/"):
+        return None
+    identity = value.removeprefix("pkg:pypi/").split("?", 1)[0].split("#", 1)[0]
+    name, separator, version = identity.rpartition("@")
+    if not separator or not name or not version:
+        return None
+    return _package_name(unquote(name)), unquote(version)
+
+
 def _passed_report(name: str, report: dict[str, object], failures: list[str]) -> None:
     if report.get("status") != "passed":
         failures.append(f"{name} report did not pass")
@@ -355,6 +379,175 @@ def _validate_websocket(report: dict[str, object], failures: list[str]) -> None:
         failures.append("websocket report lacks passing per-session evidence")
 
 
+def _validate_sbom(path: Path, failures: list[str]) -> dict[str, str]:
+    if path.stat().st_size > _MAX_SBOM_BYTES:
+        failures.append(f"SBOM exceeds {_MAX_SBOM_BYTES} bytes")
+        return {}
+    try:
+        payload = json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=_unique_object,
+            parse_constant=_invalid_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        failures.append(f"SBOM is not strict JSON: {error}")
+        return {}
+    if not isinstance(payload, dict):
+        failures.append("SBOM must contain one JSON object")
+        return {}
+    if payload.get("bomFormat") != "CycloneDX":
+        failures.append("SBOM is not in CycloneDX format")
+    if payload.get("specVersion") not in {"1.4", "1.5", "1.6", "1.7"}:
+        failures.append("SBOM uses an unsupported CycloneDX specification version")
+    metadata = payload.get("metadata")
+    root = metadata.get("component") if isinstance(metadata, dict) else None
+    root_ref = root.get("bom-ref") if isinstance(root, dict) else None
+    if (
+        not isinstance(root, dict)
+        or root.get("name") != "turnalign"
+        or not isinstance(root.get("version"), str)
+        or not root.get("version")
+        or not isinstance(root_ref, str)
+        or not root_ref
+    ):
+        failures.append("SBOM does not identify the versioned TurnAlign root component")
+    components = payload.get("components")
+    if not isinstance(components, list) or not components:
+        failures.append("SBOM has no runtime components")
+        return {}
+    component_versions: dict[str, str] = {}
+    websocket_refs = set()
+    component_refs = set()
+    for component in components:
+        if not isinstance(component, dict):
+            failures.append("SBOM contains a non-object component")
+            continue
+        name = component.get("name")
+        version = component.get("version")
+        purl = component.get("purl")
+        component_ref = component.get("bom-ref")
+        if (
+            not isinstance(name, str)
+            or not name
+            or not isinstance(version, str)
+            or not version
+            or not isinstance(purl, str)
+            or _pypi_purl_identity(purl) != (_package_name(name), version)
+            or not isinstance(component_ref, str)
+            or not component_ref
+        ):
+            failures.append("SBOM contains an unversioned or unidentifiable component")
+            continue
+        if component_ref in component_refs:
+            failures.append(f"SBOM contains a duplicate component reference: {component_ref}")
+        component_refs.add(component_ref)
+        normalized_name = _package_name(name)
+        previous_version = component_versions.get(normalized_name)
+        if previous_version is not None and previous_version != version:
+            failures.append(f"SBOM contains conflicting versions for {normalized_name}")
+        component_versions[normalized_name] = version
+        if normalized_name == "websockets":
+            websocket_refs.add(component_ref)
+    if "websockets" not in component_versions:
+        failures.append("SBOM does not include the WebSocket server runtime dependency")
+    dependencies = payload.get("dependencies")
+    if not isinstance(dependencies, list):
+        failures.append("SBOM has no dependency graph")
+    elif (
+        not isinstance(root_ref, str)
+        or not websocket_refs
+        or not any(
+            isinstance(item, dict)
+            and item.get("ref") == root_ref
+            and isinstance(item.get("dependsOn"), list)
+            and bool(websocket_refs.intersection(item["dependsOn"]))
+            for item in dependencies
+        )
+    ):
+        failures.append("SBOM dependency graph does not link TurnAlign to websockets")
+    return component_versions
+
+
+def _validate_dependency_lock(
+    path: Path,
+    failures: list[str],
+) -> dict[str, tuple[str, bool]]:
+    if path.stat().st_size > _MAX_LOCK_BYTES:
+        failures.append(f"dependency lock exceeds {_MAX_LOCK_BYTES} bytes")
+        return {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as error:
+        failures.append(f"dependency lock is not UTF-8: {error}")
+        return {}
+
+    logical_lines: list[str] = []
+    pending = ""
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            if pending and line.startswith("#"):
+                failures.append("dependency lock continuation is interrupted by a comment")
+            continue
+        if pending:
+            if not line.startswith("--hash=sha256:"):
+                failures.append("dependency lock continuation contains a second requirement")
+            pending += " " + line
+        else:
+            pending = line
+        if pending.endswith("\\"):
+            pending = pending[:-1].rstrip()
+            continue
+        logical_lines.append(pending)
+        pending = ""
+    if pending:
+        failures.append("dependency lock ends with an incomplete continuation")
+        logical_lines.append(pending)
+
+    requirements: dict[str, tuple[str, bool]] = {}
+    allowed_directives = (
+        "--extra-index-url ",
+        "--find-links ",
+        "--index-url ",
+        "--no-binary ",
+        "--only-binary ",
+    )
+    for line in logical_lines:
+        if line.startswith("--trusted-host"):
+            failures.append("dependency lock disables TLS verification with --trusted-host")
+            continue
+        if line.startswith(allowed_directives):
+            continue
+        if line.startswith(("-e ", "--editable ")) or any(
+            token in line for token in (" @ ", "file:", "git+", "../")
+        ):
+            failures.append("dependency lock contains a mutable or local requirement")
+            continue
+        match = _LOCK_REQUIREMENT_PATTERN.match(line)
+        if match is None:
+            failures.append("dependency lock contains a requirement without an exact version")
+            continue
+        if _EMBEDDED_REQUIREMENT_PATTERN.search(line):
+            failures.append("dependency lock combines multiple requirements in one entry")
+            continue
+        hashes = _SHA256_OPTION_PATTERN.findall(line)
+        if not hashes:
+            failures.append(f"dependency lock entry lacks a SHA-256 hash: {match.group(1)}")
+        name = _package_name(match.group(1))
+        version = match.group(2)
+        conditional = ";" in line.split("--hash=", 1)[0]
+        previous = requirements.get(name)
+        if previous is not None and previous[0] != version:
+            failures.append(f"dependency lock contains conflicting versions for {name}")
+        requirements[name] = (version, conditional)
+
+    if not requirements:
+        failures.append("dependency lock has no pinned runtime requirements")
+    if "websockets" not in requirements or requirements["websockets"][1]:
+        failures.append("dependency lock does not unconditionally pin websockets")
+    return requirements
+
+
 def run_production_gate(
     release_path: Path,
     quality_path: Path,
@@ -376,6 +569,7 @@ def run_production_gate(
 
     artifact_evidence = []
     kinds = set()
+    artifact_paths: dict[str, list[Path]] = {}
     for kind, path in artifacts:
         if kind not in REQUIRED_ARTIFACT_KINDS:
             raise ValueError(f"unsupported artifact kind: {kind}")
@@ -383,8 +577,30 @@ def run_production_gate(
         digest, size = _digest(path)
         artifact_evidence.append(ArtifactEvidence(kind, path.name, digest, size))
         kinds.add(kind)
+        artifact_paths.setdefault(kind, []).append(path)
     for missing in sorted(REQUIRED_ARTIFACT_KINDS - kinds):
         failures.append(f"missing required artifact kind: {missing}")
+    for kind in sorted(REQUIRED_ARTIFACT_KINDS - {"model"}):
+        if len(artifact_paths.get(kind, [])) > 1:
+            failures.append(f"artifact kind must appear exactly once: {kind}")
+
+    sbom_paths = artifact_paths.get("sbom", [])
+    lock_paths = artifact_paths.get("dependency-lock", [])
+    if len(sbom_paths) == 1:
+        sbom_components = _validate_sbom(sbom_paths[0], failures)
+    else:
+        sbom_components = {}
+    if len(lock_paths) == 1:
+        locked_requirements = _validate_dependency_lock(lock_paths[0], failures)
+    else:
+        locked_requirements = {}
+    for name, (version, conditional) in locked_requirements.items():
+        if conditional:
+            continue
+        if sbom_components.get(name) != version:
+            failures.append(
+                f"SBOM does not match locked runtime requirement: {name}=={version}"
+            )
 
     return ProductionGateReport(
         schema_version=1,

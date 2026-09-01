@@ -14,9 +14,34 @@ macOS because Linux containers and services cannot expose Metal/MPS.
 
 ## 1. Prepare an immutable installation
 
-Build the wheel in CI, retain its `SHA256SUMS`, and install the exact reviewed
-artifact with a deployment-owned dependency lock. Do not install the current
-Git branch or download an unreviewed wheel during service startup.
+Build the wheel in CI, retain its `SHA256SUMS` and generated CycloneDX SBOM, and
+install the exact reviewed artifact with a deployment-owned dependency lock.
+Regenerate the SBOM from the final model-specific environment before the
+production gate. Do not install the current Git branch or download an
+unreviewed wheel during service startup.
+
+For the reference CPU profile, create a target-specific, hash-locked dependency
+set and install it before the wheel:
+
+```bash
+uv pip compile pyproject.toml --extra server --extra funasr \
+  --generate-hashes --output-file requirements.lock
+uv pip sync requirements.lock
+uv pip install --no-deps dist/turnalign-0.1.0-py3-none-any.whl
+```
+
+Run the SBOM generator from a separately installed, pinned `cyclonedx-bom`
+tool, not from inside the production environment:
+
+```bash
+cyclonedx-py environment /opt/turnalign/venv/bin/python \
+  --pyproject pyproject.toml --mc-type application --sv 1.6 \
+  --output-reproducible --of JSON -o sbom.cdx.json
+```
+
+The production gate requires exact `==` pins with SHA-256 hashes and verifies
+that every unconditional lock entry has the same version in the SBOM; editable,
+VCS, local-path and unhashed requirements fail.
 
 The example paths assume:
 
@@ -90,13 +115,14 @@ Before routing users, retain all of the following with the release artifact:
    including the fault-resume option and intended concurrency/soak duration.
 3. `turnalign quality-gate` passes on the versioned, human-labelled production
    corpus using project-owned thresholds.
-4. The exact wheel hash, dependency lock, model commit, model-file checksums,
-   Nginx configuration, service unit, host profile, and gate reports are saved.
+4. The exact wheel hash, dependency lock, validated CycloneDX SBOM, model
+   commit, model-file checksums, Nginx configuration, service unit, host
+   profile, and gate reports are saved.
 5. Rollback is tested by restoring the preceding immutable artifact and model
    bundle, not by mutating the running environment.
 
 Persist each gate with `--report`, then run `turnalign production-gate` with the
-source commit and all six required artifact kinds shown in the root README. Keep
+source commit and all seven required artifact kinds shown in the root README. Keep
 the resulting aggregate report beside the release artifact; it rejects local
 `ws://`, missing recovery/latency controls, mutable model revisions, undersized
 quality evidence, and incomplete artifact sets.
