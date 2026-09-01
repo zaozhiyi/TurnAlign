@@ -93,10 +93,10 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   links may not escape their release tree.
   After successful activation, rehearsal switches to the preceding release,
   repeats those checks, then restores and reprobes the candidate even after a
-  failed rollback probe.
+  failed rollback probe. Capture a fresh `deployment-status` snapshot on the target host; `production-gate` is an offline aggregator and requires that live state snapshot before go-live.
   `turnalign production-gate` independently rechecks the critical
   thresholds, requires a public `wss://` concurrent recovery/soak result, and
-  binds the source commit plus thirteen required artifact classes and all reports
+  binds the source commit plus fifteen required artifact classes and all reports
   by SHA-256 into one final pass/fail record. Each component gate must name the same
   source commit; release-audio and labelled-quality input digests are checked
   against retained artifacts; every normal and recovery WebSocket session must
@@ -113,8 +113,8 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   bounded platform inventory plus the current Linux boot identity, and binds
   the Wheel version, versioned Python
   executable/prefix, final source commit, the complete active `turnalign/`
-  package file set, and the exact name, size and SHA-256 identity of the other
-  twelve retained artifacts. Schema 5 also binds the root-owned canonical
+  package file set, deterministic installed-dependency tree digests, and the exact name, size and SHA-256 identity of the other
+  twelve retained artifacts. Schema 6 also binds the root-owned canonical
   `current` link to the candidate and rejects a source checkout shadowing the
   installed package, non-root-owned or writable package files, symlinks, and any missing,
   modified or extra file (including bytecode) relative to the retained Wheel.
@@ -217,10 +217,13 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   two-pass refinement, and preload failures. Tests verify that all remaining
   resources are still closed and that a hinted WebSocket session still delivers
   its terminal event and releases cleanly when backend close raises.
+  Shutdown and sensitive-session discard also avoid waiting indefinitely for an
+  untrusted close hook; active instances are never closed concurrently.
 - Backend cancellation hooks run outside the WebSocket event loop and outside
   the backend lease lock. A blocking hook cannot freeze unrelated sessions,
-  is dispatched only once, and keeps its bounded pool slot quarantined until
-  cancellation finishes so the same instance cannot be reused concurrently.
+  is dispatched only once, and is bounded by `--backend-cancel-timeout`. After
+  that deadline the instance is detached from the pool without concurrent
+  cleanup; best-effort close runs only if and when its cancel hook returns.
 - Recovery events are bounded by serialized UTF-8 bytes as well as count. Tests
   verify atomic rejection without sequence corruption, byte-window eviction,
   stale replay detection, and a redacted WebSocket `session_error` for an

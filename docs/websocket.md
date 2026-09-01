@@ -214,6 +214,8 @@ grace period if necessary. Backends without cooperative
 cancellation cannot be force-stopped inside a Python thread; the server still
 closes the transport after its shutdown timeout and keeps the recovery session
 locked until the old worker actually exits, preventing concurrent resume writes.
+A cancel hook that itself exceeds `--backend-cancel-timeout` is detached from
+the reusable pool. Cleanup never races that hook and runs only after it returns.
 
 `ping` receives `pong`.
 
@@ -311,7 +313,7 @@ redacted by default; trusted server logs retain unexpected exception details.
 ## Deployment gate
 
 `websocket-gate` opens concurrent sessions against an already running endpoint,
-sends generated silence as PCM16, honors pause/resume flow control, validates
+sends non-silent probe audio as PCM16, honors pause/resume flow control, validates
 every event stream, and reports ready/total p95 latency, failures, audio
 acknowledgements, backpressure, and dropped partials. It never retains transcript
 text. Use `--realtime` for soak tests; omit it for burst tests. Authentication is
@@ -327,12 +329,13 @@ than failing inside the comparison routine.
 turnalign websocket-gate wss://asr.example/ws --sessions 8 \
   --audio-seconds 60 --realtime --max-ready-seconds 10 \
   --max-total-seconds 75 --min-audio-acks 600 \
+  --min-commits 1 --probe-audio probe-60s.wav \
   --max-dropped-partials 0 --verify-recovery \
   --auth-token-file /path/to/restricted/auth-token \
   --source-commit "$(git rev-parse HEAD)"
 ```
 
-The gate requires at least one audio acknowledgement per session and permits no
+The gate requires at least one commit and one audio acknowledgement per session and permits no
 dropped partials by default. Tighten `--min-audio-acks` to the expected frame or
 internal-chunk count for a specific deployment. Burst tests may legitimately
 exercise flow control; use `--max-backpressure-pauses` when pauses themselves

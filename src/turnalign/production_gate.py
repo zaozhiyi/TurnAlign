@@ -18,7 +18,7 @@ import sys
 import tempfile
 import zipfile
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.parser import BytesParser
 from email.policy import default as email_policy
 from pathlib import Path
@@ -51,12 +51,20 @@ _MAX_DEPLOYMENT_CONFIG_BYTES = 2 * 1024 * 1024
 _MAX_WHEEL_BYTES = 64 * 1024 * 1024
 _MAX_WHEEL_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
 _MAX_WHEEL_ENTRIES = 4_096
+_MAX_DEPENDENCY_FILES = 250_000
+_MAX_DEPENDENCY_BYTES = 128 * 1024 * 1024 * 1024
+_MAX_REPORT_VALIDITY_SECONDS = 86_400.0
+_MAX_DEPLOYMENT_STATE_VALIDITY_SECONDS = 300.0
+_MAX_CLOCK_SKEW_SECONDS = 300.0
 _DEPLOYMENT_TRANSACTION_PATH = Path(
     "/var/lib/turnalign-deployment/pending-activation.json"
 )
 _DEPLOYMENT_LOCK_PATH = Path("/run/lock/turnalign-deployment.lock")
 _RELEASE_ROOT = Path("/opt/turnalign/releases")
 _CURRENT_RELEASE_LINK = Path("/opt/turnalign/current")
+_MODEL_EVIDENCE_ROOT = Path("/var/lib/turnalign/models")
+_SERVICE_UNIT_PATH = Path("/etc/systemd/system/turnalign.service")
+_NGINX_CONFIG_PATH = Path("/etc/nginx/conf.d/turnalign.conf")
 _LOCK_REQUIREMENT_PATTERN = re.compile(
     r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([A-Za-z0-9][A-Za-z0-9.!+_-]*)(?:\s|;|$)"
 )
@@ -76,6 +84,7 @@ _BUILD_ONLY_SBOM_COMPONENTS = frozenset({
 })
 REQUIRED_ARTIFACT_KINDS = frozenset({
     "deployment-activation",
+    "deployment-state",
     "dependency-lock",
     "host-profile",
     "model",
@@ -87,6 +96,7 @@ REQUIRED_ARTIFACT_KINDS = frozenset({
     "rollback-rehearsal",
     "service-unit",
     "sbom",
+    "websocket-probe-audio",
     "wheel",
 })
 
@@ -123,6 +133,19 @@ class _WheelIdentity:
 class _DeploymentIdentity:
     boot_id: str
     previous_commit: str
+
+
+@dataclass(frozen=True, slots=True)
+class _HostProfileIdentity:
+    boot_id: str
+    installed_dependencies: dict[str, str]
+
+
+@dataclass(frozen=True, slots=True)
+class _DeploymentStateIdentity:
+    boot_id: str
+    active_commit: str
+    pending_transaction: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -414,6 +437,60 @@ def create_host_profile(
         os.close(lock_descriptor)
 
 
+def create_deployment_state(validity_seconds: float = 300.0) -> dict[str, object]:
+    """Capture the current live release and pending transaction on the target host."""
+
+    system = platform.system()
+    if system != "Linux":
+        raise RuntimeError("deployment-state must run on the Linux production host")
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        raise PermissionError("deployment-state must run as root")
+    if (
+        isinstance(validity_seconds, bool)
+        or not isinstance(validity_seconds, (int, float))
+        or not math.isfinite(validity_seconds)
+        or validity_seconds <= 0
+        or validity_seconds > _MAX_DEPLOYMENT_STATE_VALIDITY_SECONDS
+    ):
+        raise ValueError(
+            "validity_seconds must be finite, positive, and no greater than 300"
+        )
+    lock_descriptor = _acquire_deployment_lock()
+    try:
+        active_commit = _active_release_commit()
+        boot_id = _read_linux_boot_id()
+        pending_transaction_id: str | None = None
+        try:
+            os.lstat(_DEPLOYMENT_TRANSACTION_PATH)
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            raise RuntimeError("cannot inspect pending deployment state") from error
+        else:
+            pending_payload = _load_report(_DEPLOYMENT_TRANSACTION_PATH)[0]
+            raw_transaction_id = pending_payload.get("transaction_id")
+            if (
+                not isinstance(raw_transaction_id, str)
+                or _TRANSACTION_ID_PATTERN.fullmatch(raw_transaction_id) is None
+            ):
+                raise RuntimeError("pending deployment transaction is invalid")
+            pending_transaction_id = raw_transaction_id
+        return {
+            "schema_version": 1,
+            "active_commit": active_commit,
+            "pending_transaction_id": pending_transaction_id,
+            "boot_id": boot_id,
+            "created_at": (
+                datetime.now(timezone.utc)
+                .isoformat(timespec="milliseconds")
+                .replace("+00:00", "Z")
+            ),
+            "validity_seconds": round(validity_seconds, 3),
+        }
+    finally:
+        os.close(lock_descriptor)
+
+
 def _acquire_deployment_lock() -> int:
     import fcntl
 
@@ -476,6 +553,13 @@ def _create_host_profile_locked(
             "host-profile runtime is not the active production release"
         )
     installed_distribution = _installed_distribution_identity(runtime)
+    dependency_lock_path = next(
+        path for kind, path in artifacts if kind == "dependency-lock"
+    )
+    installed_dependencies = _installed_dependency_identity(
+        dependency_lock_path,
+        runtime,
+    )
     expected_kinds = REQUIRED_ARTIFACT_KINDS - {"host-profile"}
     evidence = []
     kinds = set()
@@ -483,6 +567,14 @@ def _create_host_profile_locked(
     for kind, path in artifacts:
         if kind not in expected_kinds:
             raise ValueError(f"unsupported host-profile artifact kind: {kind}")
+        if kind == "service-unit" and Path(os.path.abspath(str(path))) != _SERVICE_UNIT_PATH:
+            raise ValueError(
+                "host-profile service-unit must use the active canonical systemd unit"
+            )
+        if kind == "nginx-config" and Path(os.path.abspath(str(path))) != _NGINX_CONFIG_PATH:
+            raise ValueError(
+                "host-profile nginx-config must use the active canonical Nginx config"
+            )
         snapshot = _snapshot_evidence(path)
         identity = (kind, path.name)
         if identity in identities:
@@ -510,11 +602,12 @@ def _create_host_profile_locked(
     if logical_cpu_count is None or logical_cpu_count <= 0:
         raise RuntimeError("cannot determine the host logical CPU count")
     return {
-        "schema_version": 5,
+        "schema_version": 6,
         "source_commit": bound_commit,
         "active_commit": active_commit,
         "runtime": runtime,
         "installed_distribution": installed_distribution,
+        "installed_dependencies": installed_dependencies,
         "platform": {
             "system": system,
             "boot_id": _read_linux_boot_id(),
@@ -787,6 +880,105 @@ def _installed_distribution_identity(
     }
 
 
+def _installed_dependency_identity(
+    lock_path: Path,
+    runtime: dict[str, str],
+) -> dict[str, dict[str, object]]:
+    """Hash installed runtime distributions for every pinned runtime requirement."""
+
+    lock_snapshot = _snapshot_evidence(
+        lock_path,
+        capture_limit=_MAX_LOCK_BYTES,
+        hard_limit=_MAX_LOCK_BYTES,
+    )
+    requirements = _dependency_lock_entries(lock_snapshot)
+    prefix = Path(runtime["python_prefix"])
+    site_packages = (
+        prefix
+        / "lib"
+        / f"python{sys.version_info.major}.{sys.version_info.minor}"
+        / "site-packages"
+    )
+    result: dict[str, dict[str, object]] = {}
+    for name, (version, conditional) in sorted(requirements.items()):
+        if conditional:
+            continue
+        try:
+            distribution = importlib.metadata.distribution(name)
+        except importlib.metadata.PackageNotFoundError as error:
+            raise ValueError(f"installed dependency is missing: {name}") from error
+        if distribution.version != version:
+            raise ValueError(
+                f"installed dependency version does not match the lock: "
+                f"{name}=={distribution.version} != {version}"
+            )
+        try:
+            root = Path(str(distribution.locate_file(""))).resolve(strict=True)
+        except (OSError, RuntimeError) as error:
+            raise ValueError(f"installed dependency root is unavailable: {name}") from error
+        if root != site_packages:
+            raise ValueError(
+                f"installed dependency is not in the candidate site-packages: {name}"
+            )
+        tree_digest = hashlib.sha256()
+        file_count = 0
+        total_size = 0
+        seen: set[str] = set()
+        for file_info in sorted(
+            distribution.files or (), key=lambda item: item.as_posix()
+        ):
+            relative = file_info.as_posix()
+            if not relative or relative.startswith(("..", "/")):
+                continue
+            if relative in seen:
+                raise ValueError(
+                    f"installed dependency contains duplicate files: {name}/{relative}"
+                )
+            seen.add(relative)
+            path = site_packages / relative
+            try:
+                metadata = path.lstat()
+            except OSError as error:
+                raise ValueError(
+                    f"installed dependency file is unavailable: {name}/{relative}"
+                ) from error
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISREG(metadata.st_mode)
+                or not _root_owned_immutable(metadata)
+            ):
+                raise ValueError(
+                    f"installed dependency contains an unsafe file: {name}/{relative}"
+                )
+            snapshot = _snapshot_evidence(path)
+            file_count += 1
+            total_size += snapshot.size
+            if (
+                file_count > _MAX_DEPENDENCY_FILES
+                or total_size > _MAX_DEPENDENCY_BYTES
+            ):
+                raise ValueError(
+                    f"installed dependency exceeds evidence limits: {name}"
+                )
+            tree_digest.update(json.dumps(
+                [relative, snapshot.sha256, snapshot.size],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8"))
+            tree_digest.update(b"\n")
+        if file_count == 0:
+            raise ValueError(f"installed dependency has no content evidence: {name}")
+        result[name] = {
+            "name": name,
+            "version": distribution.version,
+            "root": str(site_packages),
+            "file_count": file_count,
+            "bytes": total_size,
+            "sha256": tree_digest.hexdigest(),
+        }
+    return result
+
+
 def _public_hostname(hostname: str | None) -> bool:
     if hostname is None:
         return False
@@ -839,6 +1031,38 @@ def _passed_report(name: str, report: dict[str, object], failures: list[str]) ->
         failures.append(f"{name} report contains failures")
 
 
+def _validate_report_freshness(
+    name: str,
+    report: dict[str, object],
+    failures: list[str],
+    *,
+    now: datetime | None = None,
+    max_validity_seconds: float = _MAX_REPORT_VALIDITY_SECONDS,
+) -> None:
+    created = _utc_timestamp(report.get("created_at"))
+    validity = report.get("validity_seconds")
+    if created is None:
+        failures.append(f"{name} report has no UTC creation timestamp")
+    if (
+        isinstance(validity, bool)
+        or not isinstance(validity, (int, float))
+        or not math.isfinite(validity)
+        or validity <= 0
+        or validity > max_validity_seconds
+    ):
+        failures.append(
+            f"{name} report validity must be positive and no greater than "
+            f"{max_validity_seconds:g} seconds"
+        )
+        return
+    current = now or datetime.now(timezone.utc)
+    if created is not None:
+        if created - current > timedelta(seconds=_MAX_CLOCK_SKEW_SECONDS):
+            failures.append(f"{name} report creation timestamp is in the future")
+        elif current - created > timedelta(seconds=cast(float, validity)):
+            failures.append(f"{name} report is stale and cannot be replayed as current")
+
+
 def _validate_report_source(
     name: str,
     report: dict[str, object],
@@ -851,6 +1075,7 @@ def _validate_report_source(
 
 def _validate_release(report: dict[str, object], failures: list[str]) -> None:
     _passed_report("release", report, failures)
+    _validate_report_freshness("release", report, failures)
     backend = report.get("backend")
     if not isinstance(backend, str) or not backend or backend.strip() != backend:
         failures.append("release report does not identify a valid backend")
@@ -862,6 +1087,23 @@ def _validate_release(report: dict[str, object], failures: list[str]) -> None:
         failures.append("release report did not require partial results")
     if report.get("require_immutable_model_revision") is not True:
         failures.append("release report did not require an immutable model revision")
+    if report.get("require_local_model") is not True:
+        failures.append("release report did not require local model loading")
+    model = report.get("model")
+    if not _valid_model_id(model):
+        failures.append("release report does not identify a valid model")
+    loaded_models = report.get("loaded_models")
+    if not isinstance(loaded_models, list) or not loaded_models or any(
+        not isinstance(item, dict)
+        or set(item) != {"path", "sha256", "bytes"}
+        or not isinstance(item.get("path"), str)
+        or not item["path"].startswith("/var/lib/turnalign/models/")
+        or not isinstance(item.get("sha256"), str)
+        or _SHA256_PATTERN.fullmatch(item["sha256"]) is None
+        or not _positive_integer(item.get("bytes"))
+        for item in loaded_models
+    ):
+        failures.append("release report has no bound loaded model evidence")
     revision = report.get("model_revision")
     if not isinstance(revision, str) or _MODEL_REVISION_PATTERN.fullmatch(revision) is None:
         failures.append("release report does not identify an immutable model revision")
@@ -950,6 +1192,7 @@ def _validate_release(report: dict[str, object], failures: list[str]) -> None:
 
 def _validate_quality(report: dict[str, object], failures: list[str]) -> None:
     _passed_report("quality", report, failures)
+    _validate_report_freshness("quality", report, failures)
     maxima = (
         report.get("max_character_error_rate"),
         report.get("max_word_error_rate"),
@@ -969,6 +1212,8 @@ def _validate_quality(report: dict[str, object], failures: list[str]) -> None:
     revision = report.get("model_revision")
     if not isinstance(revision, str) or _MODEL_REVISION_PATTERN.fullmatch(revision) is None:
         failures.append("quality report does not identify an immutable model revision")
+    if not _valid_model_id(report.get("model")):
+        failures.append("quality report does not identify a valid model")
     evaluation = report.get("evaluation")
     if not isinstance(evaluation, dict):
         failures.append("quality report has no evaluation evidence")
@@ -1050,6 +1295,7 @@ def _validate_quality(report: dict[str, object], failures: list[str]) -> None:
 
 def _validate_websocket(report: dict[str, object], failures: list[str]) -> None:
     _passed_report("websocket", report, failures)
+    _validate_report_freshness("websocket", report, failures)
     if report.get("identity_consistent") is not True:
         failures.append("websocket report did not observe one consistent deployment identity")
     backend = report.get("backend")
@@ -1069,6 +1315,27 @@ def _validate_websocket(report: dict[str, object], failures: list[str]) -> None:
         failures.append("websocket report has no immutable observed model revision")
     if not _valid_model_id(device):
         failures.append("websocket report has no valid observed device identity")
+    loaded_models = report.get("loaded_models")
+    if not isinstance(loaded_models, list) or not loaded_models or any(
+        not isinstance(item, dict)
+        or set(item) != {"path", "sha256", "bytes"}
+        or not isinstance(item.get("path"), str)
+        or not item["path"].startswith("/var/lib/turnalign/models/")
+        or not isinstance(item.get("sha256"), str)
+        or _SHA256_PATTERN.fullmatch(item["sha256"]) is None
+        or not _positive_integer(item.get("bytes"))
+        for item in loaded_models
+    ):
+        failures.append("websocket report has no bound loaded model evidence")
+    probe_sha256 = report.get("probe_audio_sha256")
+    if not isinstance(probe_sha256, str) or _SHA256_PATTERN.fullmatch(probe_sha256) is None:
+        failures.append("websocket report has no retained probe-audio digest")
+    if (
+        not _positive_integer(report.get("probe_audio_bytes"))
+        or not _positive_number(report.get("probe_audio_rms"))
+        or not _at_least(report.get("probe_audio_rms"), 1.0)
+    ):
+        failures.append("websocket probe audio is not non-silent and content-bound")
     for field in ("language", "compute_type"):
         value = report.get(field)
         if value is not None and not _valid_model_id(value):
@@ -1105,6 +1372,7 @@ def _validate_websocket(report: dict[str, object], failures: list[str]) -> None:
         or recovery.get("device") != device
         or recovery.get("language") != report.get("language")
         or recovery.get("compute_type") != report.get("compute_type")
+        or recovery.get("loaded_models") != report.get("loaded_models")
         or not _positive_number(recovery.get("disconnected_audio_seconds"))
         or not _integer_at_least(
             recovery.get("first_last_acknowledged_sequence"), 0
@@ -1153,8 +1421,8 @@ def _validate_websocket(report: dict[str, object], failures: list[str]) -> None:
         failures.append("websocket report has no ready-time ceiling")
     if not _positive_number(max_total_seconds):
         failures.append("websocket report has no total-time ceiling")
-    if not _integer_at_least(min_commits, 0):
-        failures.append("websocket report has no valid commit minimum")
+    if not _integer_at_least(min_commits, 1):
+        failures.append("websocket report must require at least one commit per session")
     if not _positive_integer(min_audio_acks):
         failures.append("websocket report has no positive acknowledgement minimum")
     if (
@@ -1357,6 +1625,62 @@ def _validate_sbom(
     return component_versions
 
 
+def _dependency_lock_entries(
+    snapshot: _EvidenceSnapshot,
+) -> dict[str, tuple[str, bool]]:
+    """Parse pinned requirements without appending production failures."""
+
+    if snapshot.content is None:
+        raise ValueError("dependency lock exceeds its capture limit")
+    text = snapshot.content.decode("utf-8")
+    logical_lines: list[str] = []
+    pending = ""
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if pending:
+            if not line.startswith("--hash=sha256:"):
+                raise ValueError("dependency lock continuation is invalid")
+            pending += " " + line
+        else:
+            pending = line
+        if pending.endswith("\\"):
+            pending = pending[:-1].rstrip()
+            continue
+        logical_lines.append(pending)
+        pending = ""
+    if pending:
+        raise ValueError("dependency lock ends with an incomplete continuation")
+
+    requirements: dict[str, tuple[str, bool]] = {}
+    for line in logical_lines:
+        if line.startswith(
+            ("--extra-index-url ", "--find-links ", "--index-url ", "--no-binary ", "--only-binary ")
+        ):
+            continue
+        if line.startswith(("-e ", "--editable ")) or any(
+            token in line for token in (" @ ", "file:", "git+", "../")
+        ):
+            raise ValueError("dependency lock contains a mutable or local requirement")
+        match = _LOCK_REQUIREMENT_PATTERN.match(line)
+        if match is None:
+            raise ValueError("dependency lock contains a requirement without an exact version")
+        name = _package_name(match.group(1))
+        version = match.group(2)
+        conditional = ";" in line.split("--hash=", 1)[0]
+        if conditional:
+            raise ValueError(
+                "dependency lock must be resolved for the production target "
+                "and contain no environment markers"
+            )
+        previous = requirements.get(name)
+        if previous is not None and previous[0] != version:
+            raise ValueError(f"dependency lock contains conflicting versions for {name}")
+        requirements[name] = (version, conditional)
+    return requirements
+
+
 def _validate_dependency_lock(
     snapshot: _EvidenceSnapshot,
     failures: list[str],
@@ -1394,18 +1718,35 @@ def _validate_dependency_lock(
         logical_lines.append(pending)
 
     requirements: dict[str, tuple[str, bool]] = {}
-    allowed_directives = (
-        "--extra-index-url ",
-        "--find-links ",
-        "--index-url ",
-        "--no-binary ",
-        "--only-binary ",
-    )
     for line in logical_lines:
         if line.startswith("--trusted-host"):
             failures.append("dependency lock disables TLS verification with --trusted-host")
             continue
-        if line.startswith(allowed_directives):
+        if line.startswith(("--no-binary ", "--only-binary ")):
+            continue
+        index_directive = False
+        for directive in ("--index-url ", "--extra-index-url "):
+            if line.startswith(directive):
+                raw_url = line.removeprefix(directive).strip()
+                if urlsplit(raw_url).scheme != "https":
+                    failures.append(
+                        f"dependency lock {directive.strip()} must use HTTPS"
+                    )
+                index_directive = True
+                break
+        if index_directive:
+            continue
+        if line.startswith("--find-links "):
+            raw_url = line.removeprefix("--find-links ").strip()
+            if urlsplit(raw_url).scheme not in {"https", "file"}:
+                failures.append(
+                    "dependency lock --find-links must use HTTPS or a retained "
+                    "immutable file directory"
+                )
+            elif urlsplit(raw_url).scheme == "file":
+                failures.append(
+                    "dependency lock must not use mutable local --find-links"
+                )
             continue
         if line.startswith(("-e ", "--editable ")) or any(
             token in line for token in (" @ ", "file:", "git+", "../")
@@ -1425,6 +1766,11 @@ def _validate_dependency_lock(
         name = _package_name(match.group(1))
         version = match.group(2)
         conditional = ";" in line.split("--hash=", 1)[0]
+        if conditional:
+            failures.append(
+                "dependency lock must be resolved for the production target "
+                "and contain no environment markers"
+            )
         previous = requirements.get(name)
         if previous is not None and previous[0] != version:
             failures.append(f"dependency lock contains conflicting versions for {name}")
@@ -1440,6 +1786,8 @@ def _validate_dependency_lock(
 def _validate_model_manifest(
     snapshot: _EvidenceSnapshot,
     model_revision: object,
+    expected_model_id: object,
+    expected_loaded_models: object,
     artifacts: list[ArtifactEvidence],
     failures: list[str],
 ) -> None:
@@ -1467,6 +1815,16 @@ def _validate_model_manifest(
     model_id = payload.get("model_id")
     if not _valid_model_id(model_id):
         failures.append("model manifest does not identify a valid model")
+    model_relative = Path(cast(str, model_id)) if isinstance(model_id, str) else None
+    if (
+        model_relative is None
+        or model_relative.is_absolute()
+        or any(part in {"", ".", ".."} for part in model_relative.parts)
+    ):
+        failures.append("model manifest model_id is not a safe retained path identity")
+        model_relative = None
+    if model_id != expected_model_id:
+        failures.append("model manifest model_id does not match the deployed model identity")
     if payload.get("model_revision") != model_revision:
         failures.append("model manifest revision does not match the gate reports")
 
@@ -1502,6 +1860,49 @@ def _validate_model_manifest(
         failures.append("model artifacts contain duplicate file names")
     elif sorted(manifest_files) != sorted(actual_files):
         failures.append("model manifest does not match the retained model artifacts")
+    if not isinstance(expected_loaded_models, list) or not expected_loaded_models:
+        failures.append("model manifest is not bound to loaded runtime model evidence")
+        return
+    expected_model_root = (
+        _MODEL_EVIDENCE_ROOT / model_relative
+        if model_relative is not None
+        else None
+    )
+    loaded_files: list[tuple[str, object, object]] = []
+    loaded_paths_valid = expected_model_root is not None
+    for item in expected_loaded_models:
+        if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+            loaded_paths_valid = False
+            continue
+        loaded_path = Path(cast(str, item["path"]))
+        if (
+            not loaded_path.is_absolute()
+            or expected_model_root is None
+            or loaded_path == expected_model_root
+            or not loaded_path.is_relative_to(expected_model_root)
+        ):
+            loaded_paths_valid = False
+        loaded_files.append(
+            (loaded_path.name, item.get("sha256"), item.get("bytes"))
+        )
+    if (
+        not loaded_paths_valid
+        or len(loaded_files) != len(expected_loaded_models)
+        or any(
+            not isinstance(item, dict)
+            or set(item) != {"path", "sha256", "bytes"}
+            or not isinstance(item.get("path"), str)
+            or not item["path"].startswith("/var/lib/turnalign/models/")
+            or not isinstance(item.get("sha256"), str)
+            or _SHA256_PATTERN.fullmatch(item["sha256"]) is None
+            or not _positive_integer(item.get("bytes"))
+            for item in expected_loaded_models
+        )
+        or sorted(loaded_files) != sorted(manifest_files)
+    ):
+        failures.append(
+            "loaded runtime model evidence does not exactly match the retained model manifest"
+        )
 
 
 def _validate_wheel(
@@ -1676,7 +2077,7 @@ def _validate_host_profile(
     wheel_identity: _WheelIdentity | None,
     artifacts: list[ArtifactEvidence],
     failures: list[str],
-) -> str | None:
+) -> _HostProfileIdentity | None:
     if snapshot.content is None:
         failures.append(f"host profile exceeds {_MAX_HOST_PROFILE_BYTES} bytes")
         return None
@@ -1691,6 +2092,7 @@ def _validate_host_profile(
         "active_commit",
         "runtime",
         "installed_distribution",
+        "installed_dependencies",
         "platform",
         "artifacts",
     }:
@@ -1698,7 +2100,7 @@ def _validate_host_profile(
         return None
     if (
         isinstance(payload.get("schema_version"), bool)
-        or payload.get("schema_version") != 5
+        or payload.get("schema_version") != 6
     ):
         failures.append("host profile has an unsupported schema version")
     if payload.get("source_commit") != source_commit:
@@ -1793,6 +2195,35 @@ def _validate_host_profile(
             "host profile installed package files do not exactly match the retained Wheel"
         )
 
+    installed_dependencies = payload.get("installed_dependencies")
+    installed_dependency_versions: dict[str, str] = {}
+    if not isinstance(installed_dependencies, dict) or not installed_dependencies:
+        failures.append("host profile has no installed runtime dependency evidence")
+    else:
+        for name, item in installed_dependencies.items():
+            if (
+                not isinstance(name, str)
+                or not name
+                or not isinstance(item, dict)
+                or set(item)
+                != {"name", "version", "root", "file_count", "bytes", "sha256"}
+                or item.get("name") != name
+                or not isinstance(item.get("version"), str)
+                or not item.get("version")
+                or expected_distribution_root is None
+                or item.get("root") != expected_distribution_root
+                or not _positive_integer(item.get("file_count"))
+                or not _positive_integer(item.get("bytes"))
+                or not isinstance(item.get("sha256"), str)
+                or _SHA256_PATTERN.fullmatch(item["sha256"]) is None
+            ):
+                failures.append("host profile has invalid installed dependency evidence")
+                installed_dependency_versions = {}
+                break
+            installed_dependency_versions[_package_name(name)] = cast(
+                str, item["version"]
+            )
+
     text_fields = (
         "system",
         "release",
@@ -1851,6 +2282,12 @@ def _validate_host_profile(
         ):
             failures.append("host profile contains an invalid artifact identity")
             return None
+        if kind == "service-unit" and name != "turnalign.service":
+            failures.append("host profile service-unit is not the canonical unit")
+            return None
+        if kind == "nginx-config" and name != "turnalign.conf":
+            failures.append("host profile nginx-config is not the canonical config")
+            return None
         reported.append((kind, name, digest, cast(int, size)))
     if len({(kind, name) for kind, name, _digest, _size in reported}) != len(
         reported
@@ -1869,7 +2306,10 @@ def _validate_host_profile(
         and isinstance(platform_data.get("boot_id"), str)
         and _BOOT_ID_PATTERN.fullmatch(platform_data["boot_id"]) is not None
     ):
-        return cast(str, platform_data["boot_id"])
+        return _HostProfileIdentity(
+            boot_id=cast(str, platform_data["boot_id"]),
+            installed_dependencies=installed_dependency_versions,
+        )
     return None
 
 
@@ -1922,6 +2362,7 @@ def _validate_rehearsal_readiness(
         "attempts",
         "seconds",
         "failure",
+        "loaded_models",
     }:
         failures.append(f"{label} has invalid readiness evidence")
         return
@@ -1938,6 +2379,22 @@ def _validate_rehearsal_readiness(
         failures.append(
             f"{label} did not prove preloaded readiness"
         )
+    loaded_models = payload.get("loaded_models")
+    if (
+        not isinstance(loaded_models, list)
+        or not loaded_models
+        or any(
+            not isinstance(item, dict)
+            or set(item) != {"path", "sha256", "bytes"}
+            or not isinstance(item.get("path"), str)
+            or not item["path"].startswith("/var/lib/turnalign/models/")
+            or not isinstance(item.get("sha256"), str)
+            or _SHA256_PATTERN.fullmatch(item["sha256"]) is None
+            or not _positive_integer(item.get("bytes"))
+            for item in loaded_models
+        )
+    ):
+        failures.append(f"{label} did not retain loaded model evidence")
 
 
 def _validate_rehearsal_phase(
@@ -2011,6 +2468,59 @@ def _validate_rehearsal_phase(
             for failure in phase_failures
         )
     return started, completed, websocket
+
+
+def _validate_deployment_state(
+    snapshot: _EvidenceSnapshot,
+    source_commit: str,
+    failures: list[str],
+) -> _DeploymentStateIdentity | None:
+    if snapshot.content is None:
+        failures.append("deployment state exceeds its capture limit")
+        return None
+    try:
+        payload = strict_json_loads(snapshot.content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        failures.append(f"deployment state is not strict JSON: {error}")
+        return None
+    expected_fields = {
+        "schema_version",
+        "active_commit",
+        "pending_transaction_id",
+        "boot_id",
+        "created_at",
+        "validity_seconds",
+    }
+    if not isinstance(payload, dict) or set(payload) != expected_fields:
+        failures.append("deployment state has an invalid top-level schema")
+        return None
+    if (
+        isinstance(payload.get("schema_version"), bool)
+        or payload.get("schema_version") != 1
+    ):
+        failures.append("deployment state has an unsupported schema version")
+    active_commit = payload.get("active_commit")
+    if active_commit != source_commit:
+        failures.append(
+            "live deployment state does not identify the candidate as active"
+        )
+    if payload.get("pending_transaction_id") is not None:
+        failures.append(
+            "live deployment state still records a pending activation transaction"
+        )
+    boot_id = payload.get("boot_id")
+    if not isinstance(boot_id, str) or _BOOT_ID_PATTERN.fullmatch(boot_id) is None:
+        failures.append("deployment state has no valid Linux boot identity")
+        boot_id = None
+    _validate_report_freshness(
+        "deployment state",
+        payload,
+        failures,
+        max_validity_seconds=_MAX_DEPLOYMENT_STATE_VALIDITY_SECONDS,
+    )
+    if isinstance(boot_id, str):
+        return _DeploymentStateIdentity(boot_id, str(active_commit), None)
+    return None
 
 
 def _validate_deployment_activation(
@@ -2334,6 +2844,7 @@ def run_production_gate(
             raise ValueError(f"unsupported artifact kind: {kind}")
         capture_limit = {
             "deployment-activation": _MAX_DEPLOYMENT_ACTIVATION_BYTES,
+            "deployment-state": _MAX_DEPLOYMENT_CONFIG_BYTES,
             "dependency-lock": _MAX_LOCK_BYTES,
             "host-profile": _MAX_HOST_PROFILE_BYTES,
             "model-manifest": _MAX_MODEL_MANIFEST_BYTES,
@@ -2342,6 +2853,7 @@ def run_production_gate(
             "sbom": _MAX_SBOM_BYTES,
             "wheel": _MAX_WHEEL_BYTES,
             "service-unit": _MAX_DEPLOYMENT_CONFIG_BYTES,
+            "websocket-probe-audio": 16 * 1024 * 1024,
         }.get(kind)
         snapshot = _snapshot_evidence(path, capture_limit=capture_limit)
         evidence = ArtifactEvidence(kind, path.name, snapshot.sha256, snapshot.size)
@@ -2393,17 +2905,37 @@ def run_production_gate(
         _validate_model_manifest(
             model_manifest_snapshots[0],
             release.get("model_revision"),
+            release.get("model"),
+            release.get("loaded_models"),
             evidence_by_kind.get("model", []),
             failures,
         )
-    host_boot_id: str | None = None
+    host_identity: _HostProfileIdentity | None = None
     host_profile_snapshots = artifact_snapshots.get("host-profile", [])
     if len(host_profile_snapshots) == 1:
-        host_boot_id = _validate_host_profile(
+        host_identity = _validate_host_profile(
             host_profile_snapshots[0],
             source_commit,
             wheel_identity,
             artifact_evidence,
+            failures,
+        )
+    for name, (version, conditional) in locked_requirements.items():
+        if conditional:
+            continue
+        if (
+            host_identity is None
+            or host_identity.installed_dependencies.get(name) != version
+        ):
+            failures.append(
+                f"installed runtime dependency does not match the lock: {name}=={version}"
+            )
+    deployment_state_identity: _DeploymentStateIdentity | None = None
+    deployment_state_snapshots = artifact_snapshots.get("deployment-state", [])
+    if len(deployment_state_snapshots) == 1:
+        deployment_state_identity = _validate_deployment_state(
+            deployment_state_snapshots[0],
+            source_commit,
             failures,
         )
     activation_identity: _DeploymentIdentity | None = None
@@ -2425,17 +2957,17 @@ def run_production_gate(
             failures,
         )
     if (
-        host_boot_id is not None
+        host_identity is not None
         and activation_identity is not None
-        and host_boot_id != activation_identity.boot_id
+        and host_identity.boot_id != activation_identity.boot_id
     ):
         failures.append(
             "host profile and deployment activation identify different Linux boots"
         )
     if (
-        host_boot_id is not None
+        host_identity is not None
         and rehearsal_identity is not None
-        and host_boot_id != rehearsal_identity.boot_id
+        and host_identity.boot_id != rehearsal_identity.boot_id
     ):
         failures.append(
             "host profile and rollback rehearsal identify different Linux boots"
@@ -2449,6 +2981,16 @@ def run_production_gate(
             "deployment activation and rollback rehearsal identify different "
             "release pairs or Linux boots"
         )
+    for identity in (host_identity, activation_identity, rehearsal_identity):
+        if (
+            identity is not None
+            and deployment_state_identity is not None
+            and identity.boot_id != deployment_state_identity.boot_id
+        ):
+            failures.append(
+                "live deployment state identifies a different Linux boot"
+            )
+            break
     service_content: bytes | None = None
     service_snapshots = artifact_snapshots.get("service-unit", [])
     if len(service_snapshots) == 1:
@@ -2488,10 +3030,21 @@ def run_production_gate(
         _validate_report_source(name, report, source_commit, failures)
     if release.get("model_revision") != quality.get("model_revision"):
         failures.append("quality and release reports identify different model revisions")
+    for label, report in (
+        ("release", release),
+        ("quality", quality),
+        ("websocket", websocket),
+    ):
+        if report.get("model") != release.get("model"):
+            failures.append(f"{label} report identifies a different model")
     if websocket.get("backend_implementation") != release.get("backend"):
         failures.append("websocket and release reports identify different backends")
     if websocket.get("model_revision") != release.get("model_revision"):
         failures.append("websocket and release reports identify different model revisions")
+    if release.get("loaded_models") != websocket.get("loaded_models"):
+        failures.append(
+            "release and websocket evidence identify different loaded model files"
+        )
     for report, field, kind, label in (
         (release, "input_audio_sha256", "release-audio", "release audio"),
         (quality, "reference_sha256", "quality-reference", "quality reference"),
@@ -2507,6 +3060,21 @@ def run_production_gate(
             artifact_digests[kind][0] != reported_digest
         ):
             failures.append(f"{label} report digest does not match its artifact")
+    websocket_probe_digest = websocket.get("probe_audio_sha256")
+    websocket_probe_evidence = evidence_by_kind.get("websocket-probe-audio", [])
+    if (
+        not isinstance(websocket_probe_digest, str)
+        or _SHA256_PATTERN.fullmatch(websocket_probe_digest) is None
+    ):
+        failures.append("websocket probe audio digest is missing or invalid")
+    elif len(websocket_probe_evidence) == 1 and (
+        websocket_probe_evidence[0].sha256 != websocket_probe_digest
+    ):
+        failures.append("websocket probe audio does not match its retained artifact")
+    if len(websocket_probe_evidence) == 1 and (
+        websocket.get("probe_audio_bytes") != websocket_probe_evidence[0].bytes
+    ):
+        failures.append("websocket probe audio size does not match its retained artifact")
 
     return ProductionGateReport(
         schema_version=1,

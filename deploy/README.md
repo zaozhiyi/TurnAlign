@@ -73,8 +73,8 @@ cyclonedx-py environment /opt/turnalign/releases/<source-commit>/venv/bin/python
   --output-reproducible --of JSON -o sbom.cdx.json
 ```
 
-The production gate requires exact `==` pins with SHA-256 hashes and verifies
-both directions: every unconditional lock entry is present at that version,
+The production gate requires target-resolved exact `==` pins with SHA-256 hashes
+and no environment markers, and verifies both directions: every lock entry is present at that version,
 and every installed SBOM runtime component has a matching lock entry. Editable,
 VCS, local-path, unhashed, unlocked and build-only components fail.
 
@@ -82,16 +82,33 @@ The example paths assume:
 
 - executable: `/opt/turnalign/current/venv/bin/python -I -B -u -m turnalign.cli`
 - service account: `turnalign`
-- state/model cache: `/var/lib/turnalign`
+- writable process state: `/var/lib/turnalign-state`
+- immutable model and warm-up evidence: `/var/lib/turnalign`
 - root-only authentication credential: `/etc/turnalign/auth-token`
 - normalized warm-up audio: `/var/lib/turnalign/warmup.wav`
 
 Install the `server` and `funasr` extras in the image or virtual environment.
 Pin the complete transitive dependency set for the target CPU architecture.
-Model weights must be downloaded ahead of deployment under the `turnalign`
-account. The unit starts with `--preload`, a real warm-up inference, and
-`--require-immutable-model-revision`; missing dependencies, weights, or an
-unreadable warm-up file therefore fail before the socket is ready.
+Download model weights to a staging directory, verify their retained manifest,
+then install them under a root-controlled ancestor that the service account
+cannot rename or modify:
+
+```bash
+sudo install -d -m 0755 -o root -g root \
+  /var/lib/turnalign/models/paraformer-zh-streaming
+sudo cp -a /path/to/verified-model/. \
+  /var/lib/turnalign/models/paraformer-zh-streaming/
+sudo install -m 0644 -o root -g root /path/to/warmup.wav \
+  /var/lib/turnalign/warmup.wav
+sudo chown -R root:root /var/lib/turnalign
+sudo chmod -R go-w /var/lib/turnalign
+```
+
+Do not make `/var/lib/turnalign` a `StateDirectory`; the supplied unit uses the
+separate `/var/lib/turnalign-state` path for writable runtime state. The unit
+starts with `--preload`, `--require-local-model`, a real warm-up inference, and
+`--require-immutable-model-revision`; missing dependencies, weights, unsafe
+ancestors, or an unreadable warm-up file therefore fail before the socket is ready.
 The reference unit also applies `IPAddressDeny=any` with
 `IPAddressAllow=localhost`: the model process can accept Nginx and host-local
 monitoring traffic but cannot fetch weights, call third-party APIs, or otherwise
@@ -142,6 +159,10 @@ Keep `TimeoutStopSec` greater than TurnAlign's `--shutdown-grace-timeout`.
 Capacity values in the unit are conservative starting points, not measured
 production targets. Size model memory, temporary disk, concurrency, and
 session duration on the deployment host.
+
+Gate reports are accepted for at most 24 hours, tolerate at most five minutes
+of forward clock skew, and the live deployment-state snapshot is capped at five
+minutes. Keep target-host time synchronized and regenerate expired evidence.
 
 `/metrics` exposes label-free Prometheus counters for active/admitted/rejected
 sessions, incomplete or failed work, recovery, audio volume, flow control and
@@ -204,6 +225,7 @@ Before routing users, retain all of the following with the release artifact:
      --previous-commit <preceding-source-commit> \
      --candidate-commit <candidate-source-commit> \
      --backend funasr-streaming --model paraformer-zh-streaming \
+     --probe-audio /var/lib/turnalign/probe/probe-60s.wav \
      --auth-token-file /etc/turnalign/auth-token \
      --report deployment-activation.json
    ```
@@ -227,6 +249,7 @@ Before routing users, retain all of the following with the release artifact:
    sudo /opt/turnalign/releases/<candidate-source-commit>/venv/bin/python \
      -I -B -u -m turnalign.cli deployment-recover \
      --backend funasr-streaming --model paraformer-zh-streaming \
+     --probe-audio /var/lib/turnalign/probe/probe-60s.wav \
      --auth-token-file /etc/turnalign/auth-token \
      --report deployment-recovery.json
    ```
@@ -234,7 +257,7 @@ Before routing users, retain all of the following with the release artifact:
    It accepts only the immutable release pair recorded before activation,
    restores the preceding release, restarts it, and repeats readiness plus the
    public recovery probe. A successful recovery report is operational evidence,
-   not one of the thirteen final artifacts; rerun activation to produce a new
+   not one of the fifteen final artifacts; rerun activation to produce a new
    final report. A pending marker blocks another activation, rehearsal, and
    `host-profile`.
 7. With the candidate now active, exercise the rollback and restore path:
@@ -246,8 +269,17 @@ Before routing users, retain all of the following with the release artifact:
      --previous-commit <preceding-source-commit> \
      --candidate-commit <candidate-source-commit> \
      --backend funasr-streaming --model paraformer-zh-streaming \
+     --probe-audio /var/lib/turnalign/probe/probe-60s.wav \
      --auth-token-file /etc/turnalign/auth-token \
      --report rollback-rehearsal.json
+   ```
+
+   After both live phases pass, capture a fresh target-host state snapshot that
+   `production-gate` uses as the live deployment check:
+
+   ```bash
+   sudo /opt/turnalign/current/venv/bin/python -I -B -u -m turnalign.cli \
+     deployment-status --validity-seconds 300 --output deployment-state.json
    ```
 
    Keep the exact `-I -B -u -m turnalign.cli` prefix for all deployment commands:
@@ -275,23 +307,25 @@ Before routing users, retain all of the following with the release artifact:
 8. For tagged upstream distributions,
    `gh attestation verify FILE --repo GuanZhengPM/TurnAlign` verifies the signed
    GitHub/Sigstore build provenance.
-   This supplements rather than replaces the final thirteen-artifact deployment
+   This supplements rather than replaces the final fifteen-artifact deployment
    gate, whose model, host and production-corpus evidence is environment-specific.
 
 Persist each gate with `--report`, generate retained-model provenance with
 `turnalign model-manifest`, and run
 `sudo /opt/turnalign/current/venv/bin/python -I -B -u -m turnalign.cli host-profile` on the
 target host after
-activating the candidate and finalizing the other twelve artifact classes. The
+activating the candidate and finalizing the other fourteen artifact classes. The
 command holds the root-only deployment lock for the complete capture and reads
 the commit embedded in the installed Wheel, so the production
 host does not need a Git checkout. It refuses non-Linux hosts, source checkouts,
 unbound Wheels, mismatched explicitly supplied commits, and non-versioned Python
-environments. Its schema 5 evidence also proves that the root-owned canonical
+environments. Its schema 6 evidence also proves that the root-owned canonical
 `current` link selects the candidate and hashes the complete active `turnalign/`
 tree; the aggregate gate requires that tree to match the retained Wheel exactly.
+Installed dependency content is hashed file by file into bounded deterministic
+tree digests, so large runtimes such as Torch do not overflow the profile JSON.
 Then run `turnalign
-production-gate` with the source commit and all thirteen required artifact kinds
+production-gate` with the source commit and all fifteen required artifact kinds
 shown in the root README. Keep
 the resulting aggregate report beside the release artifact; it rejects local
 `ws://`, missing recovery/latency controls, mutable model revisions, undersized

@@ -1,13 +1,17 @@
 import asyncio
+import hashlib
 import json
 import os
 import queue
 import signal
 import socket
 import sys
+import tempfile
 import unittest
+import wave
 from array import array
 from contextlib import suppress
+from pathlib import Path
 from threading import Event
 from unittest.mock import patch
 
@@ -21,9 +25,15 @@ from turnalign.server import (
     _json,
     _OutputBackpressureError,
     _queue_output,
+    _reject_unknown_fields,
     serve,
 )
-from turnalign.websocket_gate import WebSocketSessionResult, run_websocket_gate
+from turnalign.websocket_gate import (
+    WebSocketSessionResult,
+    _loaded_models,
+    _probe_audio_material,
+    run_websocket_gate,
+)
 
 try:
     from websockets.asyncio.client import connect
@@ -55,6 +65,58 @@ class MetricsAccessTests(unittest.TestCase):
         self.assertFalse(_is_loopback_peer(("203.0.113.10", 1234)))
         self.assertFalse(_is_loopback_peer(("localhost", 1234)))
         self.assertFalse(_is_loopback_peer(None))
+
+    def test_control_and_start_messages_reject_unknown_fields(self):
+        with self.assertRaisesRegex(ValueError, "unsupported field"):
+            _reject_unknown_fields(
+                {"type": "start", "unexpected": 1},
+                allowed=frozenset({"type"}),
+                label="start message",
+            )
+
+    def test_websocket_gate_accepts_only_bound_loaded_model_evidence(self):
+        valid = _loaded_models([{
+            "path": "/var/lib/turnalign/models/model.bin",
+            "sha256": "a" * 64,
+            "bytes": 12,
+        }])
+        self.assertEqual(len(valid), 1)
+        with self.assertRaises(ValueError):
+            _loaded_models([{
+                "path": "/tmp/model.bin",
+                "sha256": "a" * 64,
+                "bytes": 12,
+            }])
+
+    def test_probe_audio_is_non_silent_and_length_bound(self):
+        audio = _probe_audio_material(
+            audio_seconds=0.1,
+            sample_rate=16_000,
+            channels=1,
+            probe_audio_path=None,
+        )
+        self.assertEqual(len(audio.pcm), 1_600 * 2)
+        self.assertGreater(sum(audio.pcm), 0)
+        self.assertIsNone(audio.artifact_sha256)
+
+    def test_probe_audio_binds_the_retained_wav_not_only_decoded_pcm(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "probe.wav"
+            with wave.open(str(path), "wb") as destination:
+                destination.setnchannels(1)
+                destination.setsampwidth(2)
+                destination.setframerate(16_000)
+                destination.writeframes(b"\x01\x00" * 1_600)
+            artifact = path.read_bytes()
+            audio = _probe_audio_material(
+                audio_seconds=0.1,
+                sample_rate=16_000,
+                channels=1,
+                probe_audio_path=path,
+            )
+            self.assertEqual(audio.artifact_sha256, hashlib.sha256(artifact).hexdigest())
+            self.assertEqual(audio.artifact_bytes, len(artifact))
+            self.assertNotEqual(audio.artifact_sha256, hashlib.sha256(audio.pcm).hexdigest())
 
 
 class RecordingServerBackend(FakeServerBackend):
@@ -136,6 +198,27 @@ class BlockingCancelServerBackend(CancellableServerBackend):
         self.cancel_started.set()
         self.cancel_release.wait(timeout=2)
         super().cancel()
+
+
+class PermanentlyBlockingCancelServerBackend(CancellableServerBackend):
+    def __init__(self):
+        super().__init__()
+        self.cancel_started = Event()
+        self.cancel_release = Event()
+        self.closed = Event()
+
+    def transcribe(self, chunks):
+        self.started.set()
+        list(chunks)
+        return ()
+
+    def cancel(self):
+        self.cancel_started.set()
+        self.cancel_release.wait()
+        super().cancel()
+
+    def close(self):
+        self.closed.set()
 
 
 class UncancellableServerBackend(FakeServerBackend):
@@ -924,8 +1007,8 @@ class WebSocketTests(unittest.IsolatedAsyncioTestCase):
                     result.model_revision == "a" * 40
                     for result in report.results
                 ))
-                self.assertEqual(report.commits, 0)
-                self.assertEqual(report.events, 3)
+                self.assertEqual(report.commits, 3)
+                self.assertEqual(report.events, 6)
                 self.assertGreaterEqual(
                     sum(result.audio_acks for result in report.results),
                     3,
@@ -1154,7 +1237,8 @@ class WebSocketTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(report.passed)
                 self.assertEqual(report.failed_sessions, 1)
                 self.assertIsNotNone(report.results[0].ready_seconds)
-                self.assertEqual(report.results[0].events, 1)
+                self.assertEqual(report.results[0].events, 2)
+                self.assertEqual(report.results[0].commits, 1)
                 self.assertNotIn("local test", json.dumps(report.to_dict()))
             finally:
                 server_task.cancel()
@@ -1655,6 +1739,59 @@ class WebSocketTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 blocking.cancel_release.set()
                 blocking.released.set()
+                server_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await server_task
+
+    async def test_permanent_cancel_hook_is_detached_after_its_deadline(self):
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        blocking = PermanentlyBlockingCancelServerBackend()
+        replacement = FakeServerBackend()
+        ten_seconds = array("h", [1500] * 160_000).tobytes()
+        with patch(
+            "turnalign.server.create_asr",
+            side_effect=(blocking, replacement),
+        ) as create:
+            server_task = asyncio.create_task(serve(
+                "127.0.0.1",
+                port,
+                default_backend="fake",
+                backend_replicas=1,
+                max_concurrent_sessions=1,
+                worker_shutdown_timeout=0.2,
+                backend_cancel_timeout=0.05,
+            ))
+            await asyncio.sleep(0.05)
+            try:
+                async with connect(f"ws://127.0.0.1:{port}") as first:
+                    await first.send(json.dumps({"type": "start", "backend": "fake"}))
+                    self.assertEqual(json.loads(await first.recv())["type"], "ready")
+                    await first.send(ten_seconds)
+                    self.assertTrue(await asyncio.to_thread(blocking.started.wait, 2))
+                    await first.send(json.dumps({"type": "cancel"}))
+                    self.assertTrue(
+                        await asyncio.to_thread(blocking.cancel_started.wait, 1)
+                    )
+                await asyncio.sleep(0.15)
+
+                async with connect(f"ws://127.0.0.1:{port}") as second:
+                    await second.send(json.dumps({"type": "start", "backend": "fake"}))
+                    ready = json.loads(
+                        await asyncio.wait_for(second.recv(), timeout=0.5)
+                    )
+                    self.assertEqual(ready["type"], "ready")
+                    await second.send(json.dumps({"type": "end"}))
+                    async for message in second:
+                        if json.loads(message).get("kind") == "end":
+                            break
+                self.assertEqual(create.call_count, 2)
+                self.assertFalse(blocking.closed.is_set())
+            finally:
+                blocking.cancel_release.set()
+                self.assertTrue(await asyncio.to_thread(blocking.closed.wait, 1))
                 server_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await server_task

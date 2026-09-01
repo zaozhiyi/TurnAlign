@@ -153,6 +153,8 @@ class DeploymentRehearsalTests(unittest.IsolatedAsyncioTestCase):
                     probe=RehearsalProbeConfig(
                         backend="fake",
                         model="model-a",
+                        probe_audio=Path("/tmp/turnalign-probe.wav"),
+                        min_commits=1,
                     ),
                 )
 
@@ -197,6 +199,8 @@ class DeploymentRehearsalTests(unittest.IsolatedAsyncioTestCase):
                     probe=RehearsalProbeConfig(
                         backend="fake",
                         model="model-a",
+                        probe_audio=Path("/tmp/turnalign-probe.wav"),
+                        min_commits=1,
                     ),
                 )
 
@@ -239,6 +243,8 @@ class DeploymentRehearsalTests(unittest.IsolatedAsyncioTestCase):
                     probe=RehearsalProbeConfig(
                         backend="fake",
                         model="model-a",
+                        probe_audio=Path("/tmp/turnalign-probe.wav"),
+                        min_commits=1,
                     ),
                 )
 
@@ -279,6 +285,8 @@ class DeploymentRehearsalTests(unittest.IsolatedAsyncioTestCase):
                     probe=RehearsalProbeConfig(
                         backend="fake",
                         model="model-a",
+                        probe_audio=Path("/tmp/turnalign-probe.wav"),
+                        min_commits=1,
                     ),
                 )
 
@@ -318,6 +326,8 @@ class DeploymentRehearsalTests(unittest.IsolatedAsyncioTestCase):
                     probe=RehearsalProbeConfig(
                         backend="fake",
                         model="model-a",
+                        probe_audio=Path("/tmp/turnalign-probe.wav"),
+                        min_commits=1,
                     ),
                 )
 
@@ -361,6 +371,8 @@ class DeploymentRehearsalTests(unittest.IsolatedAsyncioTestCase):
                     probe=RehearsalProbeConfig(
                         backend="fake",
                         model="model-a",
+                        probe_audio=Path("/tmp/turnalign-probe.wav"),
+                        min_commits=1,
                     ),
                 )
 
@@ -401,6 +413,8 @@ class DeploymentRehearsalTests(unittest.IsolatedAsyncioTestCase):
                     probe=RehearsalProbeConfig(
                         backend="fake",
                         model="model-a",
+                        probe_audio=Path("/tmp/turnalign-probe.wav"),
+                        min_commits=1,
                     ),
                 )
 
@@ -431,6 +445,8 @@ class DeploymentRehearsalTests(unittest.IsolatedAsyncioTestCase):
                     probe=RehearsalProbeConfig(
                         backend="fake",
                         model="model-a",
+                        probe_audio=Path("/tmp/turnalign-probe.wav"),
+                        min_commits=1,
                     ),
                 )
 
@@ -475,6 +491,8 @@ class DeploymentRehearsalTests(unittest.IsolatedAsyncioTestCase):
                     probe=RehearsalProbeConfig(
                         backend="fake",
                         model="model-a",
+                        probe_audio=Path("/tmp/turnalign-probe.wav"),
+                        min_commits=1,
                     ),
                 )
 
@@ -511,6 +529,8 @@ class DeploymentRehearsalTests(unittest.IsolatedAsyncioTestCase):
                     probe=RehearsalProbeConfig(
                         backend="fake",
                         model="model-a",
+                        probe_audio=Path("/tmp/turnalign-probe.wav"),
+                        min_commits=1,
                     ),
                 )
 
@@ -554,6 +574,8 @@ class DeploymentRehearsalTests(unittest.IsolatedAsyncioTestCase):
                     probe=RehearsalProbeConfig(
                         backend="fake",
                         model="model-a",
+                        probe_audio=Path("/tmp/turnalign-probe.wav"),
+                        min_commits=1,
                     ),
                 )
 
@@ -593,6 +615,8 @@ class DeploymentRehearsalTests(unittest.IsolatedAsyncioTestCase):
                     probe=RehearsalProbeConfig(
                         backend="fake",
                         model="model-a",
+                        probe_audio=Path("/tmp/turnalign-probe.wav"),
+                        min_commits=1,
                     ),
                 )
 
@@ -625,6 +649,8 @@ class DeploymentRehearsalTests(unittest.IsolatedAsyncioTestCase):
                     probe=RehearsalProbeConfig(
                         backend="fake",
                         model="model-a",
+                        probe_audio=Path("/tmp/turnalign-probe.wav"),
+                        min_commits=1,
                     ),
                 )
             self.assertEqual(os.readlink(current), str(releases / self.candidate))
@@ -659,6 +685,8 @@ class DeploymentRehearsalTests(unittest.IsolatedAsyncioTestCase):
                     probe=RehearsalProbeConfig(
                         backend="fake",
                         model="model-a",
+                        probe_audio=Path("/tmp/turnalign-probe.wav"),
+                        min_commits=1,
                     ),
                 )
             self.assertEqual(os.readlink(current), str(releases / self.candidate))
@@ -1110,6 +1138,8 @@ class DeploymentTransactionFileTests(unittest.TestCase):
                     probe=RehearsalProbeConfig(
                         backend="fake",
                         model="model-a",
+                        probe_audio=Path("/tmp/turnalign-probe.wav"),
+                        min_commits=1,
                     ),
                 ))
                 self.assertTrue(report.passed)

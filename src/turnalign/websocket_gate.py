@@ -1,9 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import io
 import json
+import math
+import os
+import stat
+import wave
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from math import ceil, isfinite
+from pathlib import Path
 from time import perf_counter
 from typing import cast
 from urllib.parse import urlsplit
@@ -11,6 +19,15 @@ from urllib.parse import urlsplit
 from .jsonutil import strict_json_object
 from .models import TranscriptEvent
 from .validation import EventStreamValidator
+
+_MAX_PROBE_AUDIO_FILE_BYTES = 16 * 1024 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class _ProbeAudioMaterial:
+    pcm: bytes
+    artifact_sha256: str | None
+    artifact_bytes: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,6 +41,7 @@ class WebSocketSessionResult:
     device: str | None = None
     language: str | None = None
     compute_type: str | None = None
+    loaded_models: tuple[dict[str, object], ...] = ()
     ready_seconds: float | None = None
     total_seconds: float | None = None
     events: int = 0
@@ -47,6 +65,7 @@ class WebSocketRecoveryResult:
     device: str | None = None
     language: str | None = None
     compute_type: str | None = None
+    loaded_models: tuple[dict[str, object], ...] = ()
     disconnected_audio_seconds: float | None = None
     first_last_acknowledged_sequence: int | None = None
     resumed_next_audio_sequence: int | None = None
@@ -62,6 +81,8 @@ class WebSocketRecoveryResult:
 class WebSocketGateReport:
     status: str
     source_commit: str | None
+    created_at: str
+    validity_seconds: float
     uri: str
     identity_consistent: bool
     backend: str | None
@@ -71,6 +92,10 @@ class WebSocketGateReport:
     device: str | None
     language: str | None
     compute_type: str | None
+    loaded_models: tuple[dict[str, object], ...]
+    probe_audio_sha256: str | None
+    probe_audio_bytes: int
+    probe_audio_rms: float
     sessions: int
     passed_sessions: int
     failed_sessions: int
@@ -117,6 +142,7 @@ class _ReadyIdentity:
     device: str | None
     language: str | None
     compute_type: str | None
+    loaded_models: tuple[dict[str, object], ...]
 
 
 def _valid_identity(value: object, *, required: bool = False) -> bool:
@@ -131,6 +157,50 @@ def _valid_identity(value: object, *, required: bool = False) -> bool:
             ord(character) < 32 or ord(character) == 127 for character in value
         )
     )
+
+
+def _loaded_model_entry(value: object) -> dict[str, object] | None:
+    if not isinstance(value, dict) or set(value) != {"path", "sha256", "bytes"}:
+        return None
+    path = value.get("path")
+    digest = value.get("sha256")
+    size = value.get("bytes")
+    if (
+        not isinstance(path, str)
+        or not path.startswith("/var/lib/turnalign/models/")
+        or not isinstance(digest, str)
+        or len(digest) != 64
+        or not all(character in "0123456789abcdef" for character in digest)
+        or isinstance(size, bool)
+        or not isinstance(size, int)
+        or size <= 0
+    ):
+        return None
+    return {
+        "path": path,
+        "sha256": digest,
+        "bytes": size,
+    }
+
+
+def _loaded_models(value: object) -> tuple[dict[str, object], ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise TypeError("server ready response has invalid loaded_models")
+    entries = []
+    for item in value:
+        entry = _loaded_model_entry(item)
+        if entry is None:
+            raise ValueError("server ready response has an invalid loaded model entry")
+        entries.append(entry)
+    identities = {
+        (entry["path"], entry["sha256"], entry["bytes"])
+        for entry in entries
+    }
+    if len(identities) != len(entries):
+        raise ValueError("server ready response contains duplicate loaded model entries")
+    return tuple(entries)
 
 
 def _ready_identity(
@@ -161,6 +231,7 @@ def _ready_identity(
         values[key] = cast(str | None, value)
     if not _valid_identity(revision):
         raise ValueError("server ready response has an invalid model revision")
+    loaded_models = _loaded_models(payload.get("loaded_models"))
     for label, requested, observed in (
         ("backend", requested_backend, backend),
         ("model", requested_model, values["model"]),
@@ -177,6 +248,7 @@ def _ready_identity(
         device=values["device"],
         language=values["language"],
         compute_type=values["compute_type"],
+        loaded_models=loaded_models,
     )
 
 
@@ -260,6 +332,106 @@ def _validate_options(
             )
 
 
+def _synthetic_probe_audio(
+    total_samples: int,
+    sample_rate: int,
+    channels: int,
+) -> bytes:
+    frame = bytearray()
+    amplitude = 0.25
+    for index in range(total_samples):
+        value = int(
+            amplitude * 32767 * math.sin(
+                2 * math.pi * 440 * index / sample_rate
+            )
+        )
+        encoded = value.to_bytes(2, "little", signed=True)
+        for _ in range(channels):
+            frame.extend(encoded)
+    return bytes(frame)
+
+
+def _rms_s16le(pcm: bytes) -> float:
+    if not pcm or len(pcm) % 2:
+        return 0.0
+    values = (
+        int.from_bytes(pcm[index:index + 2], "little", signed=True)
+        for index in range(0, len(pcm), 2)
+    )
+    count = 0
+    total = 0
+    for value in values:
+        total += value * value
+        count += 1
+    return math.sqrt(total / count) if count else 0.0
+
+
+def _probe_audio_material(
+    *,
+    audio_seconds: float,
+    sample_rate: int,
+    channels: int,
+    probe_audio_path: Path | None,
+) -> _ProbeAudioMaterial:
+    total_samples = max(1, round(sample_rate * audio_seconds))
+    frame_bytes = channels * 2
+    if probe_audio_path is None:
+        pcm = _synthetic_probe_audio(total_samples, sample_rate, channels)
+        return _ProbeAudioMaterial(pcm, None, len(pcm))
+    if sample_rate != 16_000 or channels != 1:
+        raise ValueError("probe-audio must be a 16 kHz mono PCM16 WAV file")
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(
+        probe_audio_path,
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow,
+    )
+    try:
+        initial = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(initial.st_mode)
+            or initial.st_size <= 0
+            or initial.st_size > _MAX_PROBE_AUDIO_FILE_BYTES
+        ):
+            raise ValueError("probe-audio must be a bounded regular file")
+        with os.fdopen(descriptor, "rb") as opened:
+            descriptor = -1
+            artifact = opened.read(_MAX_PROBE_AUDIO_FILE_BYTES + 1)
+            final = os.fstat(opened.fileno())
+        current = os.lstat(probe_audio_path)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if (
+        len(artifact) != initial.st_size
+        or len(artifact) > _MAX_PROBE_AUDIO_FILE_BYTES
+        or (initial.st_dev, initial.st_ino, initial.st_size, initial.st_mtime_ns)
+        != (final.st_dev, final.st_ino, final.st_size, final.st_mtime_ns)
+        or (final.st_dev, final.st_ino) != (current.st_dev, current.st_ino)
+        or stat.S_ISLNK(current.st_mode)
+    ):
+        raise ValueError("probe-audio changed while it was being read")
+    with wave.open(io.BytesIO(artifact), "rb") as source:
+        if (
+            source.getsampwidth() != 2
+            or source.getcomptype() != "NONE"
+            or source.getframerate() != 16_000
+            or source.getnchannels() != 1
+        ):
+            raise ValueError(
+                "probe-audio must be uncompressed signed 16-bit 16 kHz mono PCM"
+            )
+        data = source.readframes(total_samples)
+    if len(data) < total_samples * frame_bytes:
+        raise ValueError(
+            "probe-audio is shorter than the requested per-session duration"
+        )
+    return _ProbeAudioMaterial(
+        data[: total_samples * frame_bytes],
+        hashlib.sha256(artifact).hexdigest(),
+        len(artifact),
+    )
+
+
 def _validate_uri(uri: str) -> None:
     parsed = urlsplit(uri)
     if parsed.scheme not in {"ws", "wss"} or not parsed.hostname:
@@ -308,6 +480,7 @@ async def _run_session(
     language: str | None,
     compute_type: str | None,
     auth_token: str | None,
+    probe_audio: bytes,
 ) -> WebSocketSessionResult:
     try:
         from websockets.asyncio.client import connect
@@ -440,14 +613,20 @@ async def _run_session(
             try:
                 frame_samples = max(1, round(sample_rate * frame_ms / 1000))
                 total_samples = max(1, round(sample_rate * audio_seconds))
+                expected_bytes = total_samples * channels * 2
+                if len(probe_audio) != expected_bytes:
+                    raise ValueError("probe audio byte length does not match session duration")
                 sent_samples = 0
+                sent_bytes = 0
                 while sent_samples < total_samples:
                     if receiver.done():
                         await receiver
                     await flow_allowed.wait()
                     samples = min(frame_samples, total_samples - sent_samples)
-                    await websocket.send(bytes(samples * channels * 2))
+                    block = probe_audio[sent_bytes:sent_bytes + samples * channels * 2]
+                    await websocket.send(block)
                     sent_samples += samples
+                    sent_bytes += len(block)
                     if realtime:
                         await asyncio.sleep(samples / sample_rate)
                     else:
@@ -513,6 +692,7 @@ async def _run_session(
                 device=identity.device,
                 language=identity.language,
                 compute_type=identity.compute_type,
+                loaded_models=identity.loaded_models,
                 ready_seconds=ready_seconds,
                 total_seconds=total_seconds,
                 events=counters["events"],
@@ -557,6 +737,7 @@ async def _run_recovery_probe(
     language: str | None,
     compute_type: str | None,
     auth_token: str | None,
+    probe_audio: bytes,
 ) -> WebSocketRecoveryResult:
     try:
         from websockets.asyncio.client import connect
@@ -715,6 +896,10 @@ async def _run_recovery_probe(
         total_samples = max(1, round(sample_rate * audio_seconds))
         disconnect_target = total_samples // 2
         sent_samples = 0
+        sent_bytes = 0
+        expected_bytes = total_samples * channels * 2
+        if len(probe_audio) != expected_bytes:
+            raise ValueError("probe audio byte length does not match recovery duration")
 
         first = await connect(uri, max_size=20 * 1024 * 1024)
         try:
@@ -735,8 +920,10 @@ async def _run_recovery_probe(
                     )
                 samples = min(frame_samples, total_samples - sent_samples)
                 previous_acks = counters["audio_acks"]
-                await first.send(bytes(samples * channels * 2))
+                block = probe_audio[sent_bytes:sent_bytes + samples * channels * 2]
+                await first.send(block)
                 sent_samples += samples
+                sent_bytes += len(block)
                 if realtime:
                     await asyncio.sleep(samples / sample_rate)
                 await wait_until(
@@ -804,8 +991,10 @@ async def _run_recovery_probe(
                     await consume_message(resumed)
                 samples = min(frame_samples, total_samples - sent_samples)
                 previous_acks = counters["audio_acks"]
-                await resumed.send(bytes(samples * channels * 2))
+                block = probe_audio[sent_bytes:sent_bytes + samples * channels * 2]
+                await resumed.send(block)
                 sent_samples += samples
+                sent_bytes += len(block)
                 if realtime:
                     await asyncio.sleep(samples / sample_rate)
                 await wait_until(
@@ -841,6 +1030,7 @@ async def _run_recovery_probe(
             device=first_identity.device,
             language=first_identity.language,
             compute_type=first_identity.compute_type,
+            loaded_models=first_identity.loaded_models,
             disconnected_audio_seconds=disconnected_audio_seconds,
             first_last_acknowledged_sequence=first_last_ack,
             resumed_next_audio_sequence=resumed_next_audio_sequence,
@@ -890,9 +1080,18 @@ async def run_websocket_gate(
     verify_recovery: bool = False,
     recovery_resume_timeout: float = 5.0,
     source_commit: str | None = None,
+    probe_audio_path: Path | None = None,
+    validity_seconds: float = 86400.0,
 ) -> WebSocketGateReport:
     """Exercise a deployed WebSocket endpoint without retaining transcript text."""
 
+    if (
+        isinstance(validity_seconds, bool)
+        or not isinstance(validity_seconds, (int, float))
+        or not isfinite(validity_seconds)
+        or validity_seconds <= 0
+    ):
+        raise ValueError("validity_seconds must be finite and positive")
     _validate_uri(uri)
     _validate_options(
         sessions=sessions,
@@ -910,6 +1109,13 @@ async def run_websocket_gate(
         verify_recovery=verify_recovery,
         recovery_resume_timeout=recovery_resume_timeout,
     )
+    probe_material = _probe_audio_material(
+        audio_seconds=audio_seconds,
+        sample_rate=sample_rate,
+        channels=channels,
+        probe_audio_path=probe_audio_path,
+    )
+    probe_audio = probe_material.pcm
     results = tuple(await asyncio.gather(*(
         _run_session(
             uri,
@@ -931,6 +1137,7 @@ async def run_websocket_gate(
             language=language,
             compute_type=compute_type,
             auth_token=auth_token,
+            probe_audio=probe_audio,
         )
         for session in range(1, sessions + 1)
     )))
@@ -951,6 +1158,7 @@ async def run_websocket_gate(
             language=language,
             compute_type=compute_type,
             auth_token=auth_token,
+            probe_audio=probe_audio,
         )
     observed_identities = [
         (
@@ -961,6 +1169,12 @@ async def run_websocket_gate(
             result.device,
             result.language,
             result.compute_type,
+            json.dumps(
+                result.loaded_models,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
         )
         for result in results
         if result.passed and result.backend is not None
@@ -978,6 +1192,12 @@ async def run_websocket_gate(
             recovery_probe.device,
             recovery_probe.language,
             recovery_probe.compute_type,
+            json.dumps(
+                recovery_probe.loaded_models,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
         ))
     expected_identity_count = sessions + int(verify_recovery)
     identity_consistent = (
@@ -987,10 +1207,20 @@ async def run_websocket_gate(
     observed_identity = (
         observed_identities[0]
         if identity_consistent
-        else (None, None, None, None, None, None, None)
+        else (None, None, None, None, None, None, None, "")
+    )
+    loaded_models = (
+        results[0].loaded_models
+        if results and identity_consistent and results[0].passed
+        else ()
     )
     ready = [result.ready_seconds for result in results if result.ready_seconds is not None]
     total = [result.total_seconds for result in results if result.total_seconds is not None]
+    created_at = (
+        datetime.now(timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
     return WebSocketGateReport(
         status=(
             "passed"
@@ -1000,6 +1230,8 @@ async def run_websocket_gate(
             else "failed"
         ),
         source_commit=source_commit,
+        created_at=created_at,
+        validity_seconds=round(validity_seconds, 3),
         uri=uri,
         identity_consistent=identity_consistent,
         backend=observed_identity[0],
@@ -1009,6 +1241,10 @@ async def run_websocket_gate(
         device=observed_identity[4],
         language=observed_identity[5],
         compute_type=observed_identity[6],
+        loaded_models=loaded_models,
+        probe_audio_sha256=probe_material.artifact_sha256,
+        probe_audio_bytes=probe_material.artifact_bytes,
+        probe_audio_rms=round(_rms_s16le(probe_audio), 3),
         sessions=sessions,
         passed_sessions=passed,
         failed_sessions=sessions - passed,

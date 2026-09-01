@@ -35,7 +35,12 @@ from .registry import (
     supports_session_hints,
     validate_asr_hints,
 )
-from .resources import close_resources, model_revision, require_immutable_model_revision
+from .resources import (
+    close_resources,
+    model_revision,
+    observed_model_files,
+    require_immutable_model_revision,
+)
 from .session import transcribe_events
 
 LOGGER = logging.getLogger(__name__)
@@ -112,6 +117,7 @@ class _ServerMetrics:
         "sessions_incomplete_total": "Sessions closed without a terminal request.",
         "request_errors_total": "Session requests ending in a handled error.",
         "inference_failures_total": "Inference workers ending with an exception.",
+        "backend_cancel_timeouts_total": "Backend cancel hooks exceeding their deadline.",
         "recovery_resumes_total": "Sessions successfully resumed.",
         "audio_frames_total": "Binary audio frames accepted from clients.",
         "audio_bytes_total": "PCM audio bytes accepted from clients.",
@@ -258,6 +264,50 @@ def _control_message(
     return strict_json_object(message, label=label)
 
 
+_START_MESSAGE_FIELDS = frozenset({
+    "acknowledged_event_sequence",
+    "aligner",
+    "aligner_options",
+    "auth",
+    "backend",
+    "channels",
+    "compute_type",
+    "context",
+    "diarizer",
+    "diarizer_options",
+    "executable",
+    "hotword_boost",
+    "hotwords",
+    "language",
+    "max_utterance_seconds",
+    "model",
+    "model_path",
+    "online_diarizer",
+    "online_diarizer_options",
+    "partial_seconds",
+    "resume_session_id",
+    "resume_token",
+    "sample_rate",
+    "silence_seconds",
+    "type",
+    "vad_threshold",
+})
+_CONTROL_MESSAGE_FIELDS = frozenset({"type"})
+
+
+def _reject_unknown_fields(
+    message: dict[str, object],
+    *,
+    allowed: frozenset[str],
+    label: str,
+) -> None:
+    unknown = sorted(set(message) - allowed)
+    if unknown:
+        raise ValueError(
+            f"{label} contains unsupported field(s): {', '.join(unknown)}"
+        )
+
+
 def _bounded_request_float(
     request: dict[str, object],
     key: str,
@@ -383,6 +433,7 @@ async def serve(
     initialization_timeout: float = 120.0,
     finalization_timeout: float = 120.0,
     worker_shutdown_timeout: float = 5.0,
+    backend_cancel_timeout: float = 5.0,
     output_backpressure_timeout: float = 5.0,
     max_recovery_events: int = 2_048,
     max_recovery_event_bytes: int = 512 * 1024,
@@ -398,6 +449,7 @@ async def serve(
     backend_replicas: int = 1,
     preload: bool = False,
     require_immutable_revision: bool = False,
+    require_local_model: bool = False,
     allowed_origins: tuple[str | None, ...] = (None,),
     shutdown_event: asyncio.Event | None = None,
     shutdown_grace_timeout: float = 30.0,
@@ -422,6 +474,7 @@ async def serve(
         ("initialization_timeout", initialization_timeout),
         ("finalization_timeout", finalization_timeout),
         ("worker_shutdown_timeout", worker_shutdown_timeout),
+        ("backend_cancel_timeout", backend_cancel_timeout),
         ("output_backpressure_timeout", output_backpressure_timeout),
         ("start_timeout", start_timeout),
         ("client_idle_timeout", client_idle_timeout),
@@ -462,6 +515,8 @@ async def serve(
         raise ValueError("backend_replicas must be between 1 and 8")
     if not isinstance(require_immutable_revision, bool):
         raise TypeError("require_immutable_revision must be a boolean")
+    if not isinstance(require_local_model, bool):
+        raise TypeError("require_local_model must be a boolean")
     if not isinstance(preload, bool):
         raise TypeError("preload must be a boolean")
     _validate_allowed_origins(allowed_origins)
@@ -490,6 +545,7 @@ async def serve(
     shutdown_event = shutdown_event or asyncio.Event()
     sigterm_handler_installed = False
     previous_sigterm_handler = None
+    preloaded_model_evidence: tuple[dict[str, object], ...] = ()
 
     if owns_shutdown_event:
         try:
@@ -509,6 +565,7 @@ async def serve(
             executable=default_executable,
             model_path=default_model_path,
             extra=dict(default_backend_options or {}),
+            require_local_model=require_local_model,
         )
         preload_keys: list[str] = []
 
@@ -517,6 +574,10 @@ async def serve(
             try:
                 if require_immutable_revision:
                     require_immutable_model_revision(backend)
+                if require_local_model and not observed_model_files(backend):
+                    raise RuntimeError(
+                        "backend does not expose retained local model evidence"
+                    )
                 if warmup_file is not None:
                     list(backend.transcribe(file_chunks(warmup_file, ffmpeg=ffmpeg)))
             except BaseException:
@@ -536,6 +597,7 @@ async def serve(
                     preload_config,
                     create_preloaded_backend,
                 )
+                preloaded_model_evidence = observed_model_files(_backend)
                 preload_keys.append(key)
         except BaseException:
             backend_pool.close()
@@ -557,6 +619,11 @@ async def serve(
         backend_lease_lock = threading.Lock()
         backend_cancel_started = False
         backend_cancel_done = threading.Event()
+        backend_cancel_timed_out = False
+        backend_cancel_state_lock = threading.Lock()
+        backend_cancel_finished = False
+        backend_cleanup_requested = False
+        backend_cleanup_started = False
 
         def cancel_worker() -> None:
             nonlocal backend_cancel_started
@@ -568,6 +635,7 @@ async def serve(
                 backend_cancel_started = True
 
             def invoke_backend_cancel() -> None:
+                nonlocal backend_cancel_finished, backend_cleanup_started
                 try:
                     cancel = getattr(backend, "cancel", None)
                     if callable(cancel):
@@ -575,7 +643,21 @@ async def serve(
                 except Exception:
                     LOGGER.warning("backend cancellation failed", exc_info=True)
                 finally:
+                    with backend_cancel_state_lock:
+                        backend_cancel_finished = True
+                        cleanup = (
+                            backend_cleanup_requested
+                            and not backend_cleanup_started
+                        )
+                        if cleanup:
+                            backend_cleanup_started = True
                     backend_cancel_done.set()
+                    if cleanup:
+                        close_resources(
+                            (backend,),
+                            logger=LOGGER,
+                            reason="quarantined backend cancellation",
+                        )
 
             cancel_thread = threading.Thread(
                 target=invoke_backend_cancel,
@@ -609,6 +691,11 @@ async def serve(
                 first,
                 label="start message",
                 max_bytes=max_control_message_bytes,
+            )
+            _reject_unknown_fields(
+                request,
+                allowed=_START_MESSAGE_FIELDS,
+                label="start message",
             )
             if request.get("type") != "start":
                 raise ValueError("first message type must be start")
@@ -669,6 +756,7 @@ async def serve(
                     context=_optional_request_string(request, "context"),
                     boost=_optional_request_number(request, "hotword_boost"),
                 ),
+                require_local_model=require_local_model,
             )
             try:
                 validate_asr_hints(backend_name, config.hints)
@@ -844,6 +932,7 @@ async def serve(
                         "capabilities": asdict(backend.capabilities),
                         "backend_name": backend.name,
                         "model_revision": model_revision(backend),
+                        "loaded_models": observed_model_files(backend),
                     })
                     announced = True
                     for event in transcribe_events(
@@ -907,15 +996,29 @@ async def serve(
                 finally:
                     # A backend must not return to the reusable pool while its
                     # cancellation hook is still mutating or stopping it. A
-                    # permanently blocked hook therefore quarantines only this
-                    # already-bounded pool slot and worker thread.
+                    # permanently blocked hook must not pin the reusable slot
+                    # or worker; the instance is detached and quarantined.
+                    nonlocal backend_cancel_timed_out
+                    nonlocal backend_cleanup_requested, backend_cleanup_started
                     with backend_lease_lock:
                         wait_for_backend_cancel = backend_cancel_started
-                    if wait_for_backend_cancel:
-                        backend_cancel_done.wait()
+                    if wait_for_backend_cancel and not backend_cancel_done.wait(
+                        timeout=backend_cancel_timeout
+                    ):
+                        backend_cancel_timed_out = True
+                        metrics.add("backend_cancel_timeouts_total")
+                        LOGGER.warning(
+                            "backend cancellation exceeded %.3f seconds; "
+                            "detaching and quarantining the backend",
+                            backend_cancel_timeout,
+                        )
                     with backend_lease_lock:
                         leased_backend = backend_in_use
-                        if session_hints and leased_backend is not None:
+                        if (
+                            not backend_cancel_timed_out
+                            and session_hints
+                            and leased_backend is not None
+                        ):
                             set_hints = getattr(leased_backend, "set_hints", None)
                             if callable(set_hints):
                                 try:
@@ -927,8 +1030,37 @@ async def serve(
                                     )
                         backend_in_use = None
                         if pool_key is not None:
-                            if config.hints.active and not session_hints:
-                                backend_pool.discard(pool_key)
+                            if backend_cancel_timed_out:
+                                # The cancel hook may still own and mutate this
+                                # object. Remove the slot immediately, but let
+                                # that hook perform best-effort close only after
+                                # it returns; never call close concurrently.
+                                detached = backend_pool.detach(pool_key)
+                                if detached is not None:
+                                    start_cleanup = False
+                                    with backend_cancel_state_lock:
+                                        backend_cleanup_requested = True
+                                        if (
+                                            backend_cancel_finished
+                                            and not backend_cleanup_started
+                                        ):
+                                            backend_cleanup_started = True
+                                            start_cleanup = True
+                                    if start_cleanup:
+                                        threading.Thread(
+                                            target=close_resources,
+                                            args=((detached,),),
+                                            kwargs={
+                                                "logger": LOGGER,
+                                                "reason": (
+                                                    "quarantined backend cancellation"
+                                                ),
+                                            },
+                                            name="turnalign-backend-cleanup",
+                                            daemon=True,
+                                        ).start()
+                            elif config.hints.active and not session_hints:
+                                backend_pool.discard(pool_key, wait=False)
                             else:
                                 backend_pool.release(pool_key)
                     try:
@@ -995,6 +1127,7 @@ async def serve(
                 "backend": backend_name,
                 "backend_implementation": initialization["backend_name"],
                 "model_revision": initialization["model_revision"],
+                "loaded_models": initialization["loaded_models"],
                 "sample_rate": sample_rate,
                 "channels": channels,
                 "config": public_config,
@@ -1119,6 +1252,11 @@ async def serve(
                         label="control message",
                         max_bytes=max_control_message_bytes,
                     )
+                    _reject_unknown_fields(
+                        control,
+                        allowed=_CONTROL_MESSAGE_FIELDS,
+                        label="control message",
+                    )
                     if control.get("type") == "end":
                         end_requested = True
                         if frame_buffer:
@@ -1237,6 +1375,8 @@ async def serve(
             payload: dict[str, object] = {"status": "ok"}
             if path == "/readyz":
                 payload.update({"ready": True, "preloaded": preload})
+                if preload and preloaded_model_evidence:
+                    payload["loaded_models"] = preloaded_model_evidence
             response = connection.respond(
                 HTTPStatus.OK,
                 json.dumps(payload, separators=(",", ":")) + "\n",
@@ -1339,6 +1479,6 @@ async def serve(
             loop.remove_signal_handler(signal.SIGTERM)
             if previous_sigterm_handler is not None:
                 signal.signal(signal.SIGTERM, previous_sigterm_handler)
-        backend_pool.close()
+        backend_pool.close(wait=False)
         recovery_store.close()
         LOGGER.info("server_stopped")

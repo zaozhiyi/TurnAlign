@@ -10,10 +10,10 @@ StartLimitBurst=3
 Type=simple
 User=turnalign
 Group=turnalign
-WorkingDirectory=/var/lib/turnalign
-StateDirectory=turnalign
+WorkingDirectory=/var/lib/turnalign-state
+StateDirectory=turnalign-state
 CacheDirectory=turnalign
-Environment=HOME=/var/lib/turnalign
+Environment=HOME=/var/lib/turnalign-state
 LoadCredential=auth-token:/etc/turnalign/auth-token
 ExecStartPre=/usr/bin/test -r /var/lib/turnalign/warmup.wav
 ExecStartPre=/usr/bin/test -s ${CREDENTIALS_DIRECTORY}/auth-token
@@ -21,6 +21,10 @@ ExecStart=/opt/turnalign/current/venv/bin/python -I -B -u -m turnalign.cli serve
   --host 127.0.0.1 \
   --port 8765 \
   --backend funasr-streaming \
+  --model paraformer-zh-streaming \
+  --model-path /var/lib/turnalign/models/paraformer-zh-streaming \
+  --require-local-model \
+  --backend-option model_revision=562b758fecc801f13079d846d06b0b024fd670c4 \
   --device cpu \
   --preload \
   --warmup-file /var/lib/turnalign/warmup.wav \
@@ -37,6 +41,7 @@ ExecStart=/opt/turnalign/current/venv/bin/python -I -B -u -m turnalign.cli serve
   --client-idle-timeout 60 \
   --finalization-timeout 120 \
   --worker-shutdown-timeout 5 \
+  --backend-cancel-timeout 5 \
   --shutdown-grace-timeout 30
 Restart=on-failure
 RestartSec=5s

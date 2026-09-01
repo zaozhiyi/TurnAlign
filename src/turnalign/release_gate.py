@@ -3,11 +3,16 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from time import perf_counter
 
 from .models import AudioChunk, TranscriptEvent
 from .plugins import AsrBackend
-from .resources import is_immutable_model_revision, model_revision
+from .resources import (
+    is_immutable_model_revision,
+    model_revision,
+    observed_model_files,
+)
 from .session import transcribe_events
 from .validation import EventStreamValidator
 
@@ -17,7 +22,11 @@ class ReleaseGateReport:
     status: str
     source_commit: str | None
     input_audio_sha256: str | None
+    created_at: str
+    validity_seconds: float
     backend: str
+    model: str | None
+    loaded_models: tuple[dict[str, object], ...]
     native_streaming: bool
     model_revision: str | None
     max_realtime_factor: float
@@ -29,6 +38,7 @@ class ReleaseGateReport:
     require_partial: bool
     require_native_streaming: bool
     require_immutable_model_revision: bool
+    require_local_model: bool
     initialization_seconds: float
     events: int
     partials: int
@@ -53,6 +63,9 @@ def run_release_gate(
     chunks: Iterable[AudioChunk],
     backend: AsrBackend,
     *,
+    model: str | None = None,
+    require_local_model: bool = False,
+    validity_seconds: float = 86400.0,
     max_realtime_factor: float = 1.0,
     max_first_partial_seconds: float = 3.0,
     max_first_commit_seconds: float | None = None,
@@ -97,6 +110,13 @@ def run_release_gate(
         raise ValueError("initialization_seconds must be finite and non-negative")
     if isinstance(min_commits, bool) or not isinstance(min_commits, int) or min_commits <= 0:
         raise ValueError("min_commits must be positive")
+    if (
+        isinstance(validity_seconds, bool)
+        or not isinstance(validity_seconds, (int, float))
+        or not math.isfinite(validity_seconds)
+        or validity_seconds <= 0
+    ):
+        raise ValueError("validity_seconds must be finite and positive")
 
     validator = EventStreamValidator()
     started = perf_counter()
@@ -141,6 +161,7 @@ def run_release_gate(
     )
     native_streaming = bool(backend.capabilities.streaming)
     revision = model_revision(backend)
+    loaded_models = observed_model_files(backend)
     failures: list[str] = []
     failures.extend(protocol_failures)
     if runtime_failure is not None:
@@ -165,6 +186,8 @@ def run_release_gate(
             "model revision is not pinned to an immutable 40- or 64-character "
             "commit hash"
         )
+    if require_local_model and not loaded_models:
+        failures.append("backend did not load retained local model files")
     if initialization_seconds > max_initialization_seconds:
         failures.append(
             "initialization latency "
@@ -200,7 +223,15 @@ def run_release_gate(
         status="failed" if failures else "passed",
         source_commit=source_commit,
         input_audio_sha256=input_audio_sha256,
+        created_at=(
+            datetime.now(timezone.utc)
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z")
+        ),
+        validity_seconds=round(validity_seconds, 3),
         backend=backend.name,
+        model=model,
+        loaded_models=loaded_models,
         native_streaming=native_streaming,
         model_revision=revision,
         max_realtime_factor=max_realtime_factor,
@@ -212,6 +243,7 @@ def run_release_gate(
         require_partial=require_partial,
         require_native_streaming=require_native_streaming,
         require_immutable_model_revision=require_immutable_model_revision,
+        require_local_model=require_local_model,
         initialization_seconds=round(initialization_seconds, 3),
         events=counts["events"],
         partials=counts["partials"],

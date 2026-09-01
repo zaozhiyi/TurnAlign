@@ -27,8 +27,16 @@ class DeploymentArtifactTests(unittest.TestCase):
                 "-I -B -u -m turnalign.cli serve"
             ),
             "--preload",
+            "--model paraformer-zh-streaming",
+            "--model-path /var/lib/turnalign/models/paraformer-zh-streaming",
+            "--require-local-model",
+            "--backend-option model_revision=562b758fecc801f13079d846d06b0b024fd670c4",
             "--warmup-file /var/lib/turnalign/warmup.wav",
             "--require-immutable-model-revision",
+            "--backend-cancel-timeout 5",
+            "WorkingDirectory=/var/lib/turnalign-state",
+            "StateDirectory=turnalign-state",
+            "Environment=HOME=/var/lib/turnalign-state",
             "LoadCredential=auth-token:/etc/turnalign/auth-token",
             "--auth-token-file ${CREDENTIALS_DIRECTORY}/auth-token",
             "ExecStartPre=/usr/bin/test -r /var/lib/turnalign/warmup.wav",
@@ -36,6 +44,7 @@ class DeploymentArtifactTests(unittest.TestCase):
         ):
             self.assertIn(setting, content)
         self.assertNotIn("--allow-remote", content)
+        self.assertNotIn("StateDirectory=turnalign\n", content)
 
     def test_service_shutdown_and_recovery_limits_are_consistent(self):
         content = SERVICE.read_text(encoding="utf-8")

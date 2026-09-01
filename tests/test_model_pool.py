@@ -1,4 +1,5 @@
 import unittest
+from threading import Event
 
 from turnalign.hints import AsrHints
 from turnalign.model_pool import BackendPool, BackendPoolCapacityError
@@ -17,6 +18,20 @@ class FailingCloseBackend(FakeBackend):
     def close(self):
         self.closed = True
         raise RuntimeError("close failed")
+
+
+class BlockingCloseBackend(FakeBackend):
+    def __init__(self):
+        super().__init__()
+        self.started = Event()
+        self.release = Event()
+        self.finished = Event()
+
+    def close(self):
+        self.started.set()
+        self.release.wait()
+        super().close()
+        self.finished.set()
 
 
 class BackendPoolTests(unittest.TestCase):
@@ -149,6 +164,34 @@ class BackendPoolTests(unittest.TestCase):
         self.assertIs(acquired, replacement)
         pool.release(replacement_key)
         pool.close()
+
+    def test_detach_removes_without_running_untrusted_close(self):
+        pool = BackendPool(max_entries=1)
+        backend = FakeBackend()
+        key, _ = pool.acquire("a", AsrConfig(model="one"), lambda: backend)
+
+        self.assertIs(pool.detach(key), backend)
+        self.assertFalse(backend.closed)
+        replacement_key, replacement = pool.acquire(
+            "a", AsrConfig(model="one"), FakeBackend
+        )
+        self.assertIsInstance(replacement, FakeBackend)
+        pool.release(replacement_key)
+        pool.close()
+
+    def test_nonblocking_shutdown_detaches_before_untrusted_close_returns(self):
+        pool = BackendPool()
+        backend = BlockingCloseBackend()
+        key, _ = pool.acquire("a", AsrConfig(model="one"), lambda: backend)
+        pool.release(key)
+
+        pool.close(wait=False)
+
+        self.assertTrue(backend.started.wait(1))
+        self.assertFalse(backend.closed)
+        backend.release.set()
+        self.assertTrue(backend.finished.wait(1))
+        self.assertTrue(backend.closed)
 
     def test_close_failures_do_not_block_discard_replacement_or_pool_shutdown(self):
         pool = BackendPool(max_entries=2)

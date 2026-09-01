@@ -41,6 +41,7 @@ from .plugins import AsrConfig
 from .policy import AUTH_TOKEN_MAX_BYTES, ServerPolicy, validate_auth_token
 from .production_gate import (
     REQUIRED_ARTIFACT_KINDS,
+    create_deployment_state,
     create_host_profile,
     create_model_manifest,
     run_production_gate,
@@ -286,6 +287,7 @@ def quality_gate_files(args) -> int:
         min_reference_speech_seconds=args.min_reference_speech_seconds,
         text_normalization=_text_normalization(args),
         source_commit=source_commit,
+        model=getattr(args, "model", None),
         reference_sha256=(
             _sha256_file(args.reference) if source_commit is not None else None
         ),
@@ -328,6 +330,8 @@ def release_gate(args) -> int:
         report = run_release_gate(
             chunks,
             backend,
+            model=getattr(args, "model", None),
+            require_local_model=getattr(args, "require_local_model", False),
             max_realtime_factor=args.max_realtime_factor,
             max_first_partial_seconds=args.max_first_partial_seconds,
             max_first_commit_seconds=args.max_first_commit_seconds,
@@ -374,6 +378,7 @@ def websocket_gate(args) -> int:
         verify_recovery=args.verify_recovery,
         recovery_resume_timeout=args.recovery_resume_timeout,
         source_commit=getattr(args, "source_commit", None),
+        probe_audio_path=getattr(args, "probe_audio", None),
     ))
     _emit_gate_report(report, getattr(args, "report", None))
     return 0 if report.passed else 1
@@ -410,6 +415,7 @@ def _deployment_probe(args) -> RehearsalProbeConfig:
         model=args.model,
         language=args.language,
         compute_type=args.compute_type,
+        probe_audio=getattr(args, "probe_audio", None),
     )
 
 
@@ -500,6 +506,13 @@ def host_profile(args) -> int:
     return 0
 
 
+def deployment_status(args) -> int:
+    payload = create_deployment_state(args.validity_seconds)
+    write_json_report(args.output, payload)
+    print(json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False))
+    return 0
+
+
 def _effective_device(requested: str) -> str:
     return os.environ.get("TURNALIGN_DEVICE", requested).strip().lower()
 
@@ -564,6 +577,7 @@ def _config(args, *, device: str | None = None) -> AsrConfig:
         model_path=getattr(args, "model_path", None),
         extra=_extra_options(args.backend_option),
         hints=_hints(args),
+        require_local_model=getattr(args, "require_local_model", False),
     )
 
 
@@ -823,6 +837,12 @@ def _add_backend_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--compute-type")
     parser.add_argument("--executable", help="Executable used by command-based backends")
     parser.add_argument("--model-path", help="Local model path used by command-based backends")
+    parser.add_argument(
+        "--require-local-model",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Require backends to load immutable retained files under /var/lib/turnalign/models",
+    )
     parser.add_argument("--backend-option", action="append", default=[], metavar="KEY=VALUE")
     parser.add_argument("--hotword", action="append", default=[], help="Private phrase hint; repeat as needed")
     parser.add_argument(
@@ -867,7 +887,7 @@ def _add_deployment_probe_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--channels", type=int, default=1)
     parser.add_argument("--frame-ms", type=int, default=100)
     parser.add_argument("--timeout", type=float, default=120.0)
-    parser.add_argument("--min-commits", type=int, default=0)
+    parser.add_argument("--min-commits", type=int, default=1)
     parser.add_argument("--min-audio-acks", type=int, default=1)
     parser.add_argument("--max-dropped-partials", type=int, default=0)
     parser.add_argument("--max-backpressure-pauses", type=int, default=0)
@@ -881,6 +901,12 @@ def _add_deployment_probe_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--model", required=True)
     parser.add_argument("--language")
     parser.add_argument("--compute-type")
+    parser.add_argument(
+        "--probe-audio",
+        type=Path,
+        required=True,
+        help="Non-silent 16 kHz mono PCM16 WAV used by every deployment probe",
+    )
     authentication = parser.add_mutually_exclusive_group()
     authentication.add_argument(
         "--auth-token-env",
@@ -939,6 +965,7 @@ def main() -> int:
     quality_parser.add_argument("hypothesis", type=Path)
     quality_parser.add_argument("--report", type=Path, help="Persist the JSON gate report")
     quality_parser.add_argument("--source-commit", type=_source_commit_argument)
+    quality_parser.add_argument("--model", help="Model identity used to produce the hypothesis")
     quality_parser.add_argument("--max-cer", type=float)
     quality_parser.add_argument("--max-wer", type=float)
     quality_parser.add_argument("--max-diarization-error", type=float)
@@ -1008,7 +1035,7 @@ def main() -> int:
     websocket_gate_parser.add_argument("--channels", type=int, default=1)
     websocket_gate_parser.add_argument("--frame-ms", type=int, default=100)
     websocket_gate_parser.add_argument("--timeout", type=float, default=120.0)
-    websocket_gate_parser.add_argument("--min-commits", type=int, default=0)
+    websocket_gate_parser.add_argument("--min-commits", type=int, default=1)
     websocket_gate_parser.add_argument("--min-audio-acks", type=int, default=1)
     websocket_gate_parser.add_argument(
         "--max-dropped-partials",
@@ -1045,6 +1072,11 @@ def main() -> int:
     websocket_gate_parser.add_argument("--model")
     websocket_gate_parser.add_argument("--language")
     websocket_gate_parser.add_argument("--compute-type")
+    websocket_gate_parser.add_argument(
+        "--probe-audio",
+        type=Path,
+        help="Non-silent 16 kHz mono PCM16 WAV bound into production evidence",
+    )
     websocket_gate_auth = websocket_gate_parser.add_mutually_exclusive_group()
     websocket_gate_auth.add_argument(
         "--auth-token-env",
@@ -1137,6 +1169,17 @@ def main() -> int:
         help="Retained artifact other than host-profile; repeat for every kind",
     )
     host_profile_parser.add_argument("--output", type=Path, required=True)
+    deployment_state_parser = commands.add_parser(
+        "deployment-status",
+        help="Capture the live active release and pending transaction state",
+    )
+    deployment_state_parser.add_argument(
+        "--validity-seconds",
+        type=float,
+        default=300.0,
+        help="Maximum age of this live state snapshot when consumed by production-gate",
+    )
+    deployment_state_parser.add_argument("--output", type=Path, required=True)
     doctor_parser = commands.add_parser("doctor", help="Detect and select the local inference device")
     doctor_parser.add_argument(
         "--device",
@@ -1226,6 +1269,12 @@ def main() -> int:
     serve_parser.add_argument("--compute-type")
     serve_parser.add_argument("--executable", help="Default executable for command backends")
     serve_parser.add_argument("--model-path", help="Default local model path")
+    serve_parser.add_argument(
+        "--require-local-model",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Require backends to load immutable retained files under /var/lib/turnalign/models",
+    )
     serve_parser.add_argument(
         "--backend-option",
         action="append",
@@ -1319,6 +1368,12 @@ def main() -> int:
         type=float,
         default=5.0,
         help="Seconds allowed for a cancelled inference worker to stop",
+    )
+    serve_parser.add_argument(
+        "--backend-cancel-timeout",
+        type=float,
+        default=5.0,
+        help="Seconds allowed for a third-party backend cancel hook before discard",
     )
     serve_parser.add_argument(
         "--finalization-timeout",
@@ -1429,6 +1484,8 @@ def main() -> int:
         return model_manifest(args)
     if args.command == "host-profile":
         return host_profile(args)
+    if args.command == "deployment-status":
+        return deployment_status(args)
     if args.command == "doctor":
         print(json.dumps(runtime_report(args.device), ensure_ascii=False, indent=2))
         return 0
@@ -1505,6 +1562,7 @@ def main() -> int:
                 initialization_timeout=args.initialization_timeout,
                 finalization_timeout=args.finalization_timeout,
                 worker_shutdown_timeout=args.worker_shutdown_timeout,
+                backend_cancel_timeout=args.backend_cancel_timeout,
                 output_backpressure_timeout=args.output_backpressure_timeout,
                 max_recovery_events=args.max_recovery_events,
                 max_recovery_event_bytes=args.max_recovery_event_kib * 1024,
@@ -1522,6 +1580,7 @@ def main() -> int:
                 backend_replicas=args.backend_replicas,
                 preload=args.preload,
                 require_immutable_revision=args.require_immutable_model_revision,
+                require_local_model=args.require_local_model,
                 allowed_origins=(None, *args.allow_origin),
             ))
         except KeyboardInterrupt:

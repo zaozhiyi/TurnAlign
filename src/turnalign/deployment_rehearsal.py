@@ -63,6 +63,7 @@ class RehearsalProbeConfig:
     model: str | None = None
     language: str | None = None
     compute_type: str | None = None
+    probe_audio: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,6 +83,7 @@ class ReadinessEvidence:
     attempts: int
     seconds: float
     failure: str | None
+    loaded_models: tuple[dict[str, object], ...] = ()
 
     @property
     def passed(self) -> bool:
@@ -323,6 +325,31 @@ def _validate_websocket_uri(uri: str) -> None:
         raise ValueError(
             "deployment operations require a credential-free public wss:// endpoint"
         )
+
+
+def _parse_loaded_models(value: object) -> tuple[dict[str, object], ...]:
+    if not isinstance(value, list):
+        raise TypeError("readiness response has invalid loaded_models")
+    entries = []
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {"path", "sha256", "bytes"}:
+            raise ValueError("readiness response has an invalid loaded model entry")
+        path = item.get("path")
+        digest = item.get("sha256")
+        size = item.get("bytes")
+        if (
+            not isinstance(path, str)
+            or not path.startswith("/var/lib/turnalign/models/")
+            or not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+            or isinstance(size, bool)
+            or not isinstance(size, int)
+            or size <= 0
+        ):
+            raise ValueError("readiness response has an invalid loaded model entry")
+        entries.append({"path": path, "sha256": digest, "bytes": size})
+    return tuple(entries)
 
 
 def _required_release_owner() -> int:
@@ -901,6 +928,13 @@ def _wait_readiness(
                     and payload.get("ready") is True
                     and payload.get("preloaded") is True
                 ):
+                    loaded_models = _parse_loaded_models(
+                        payload.get("loaded_models")
+                    )
+                    if not loaded_models:
+                        raise ValueError(
+                            "readiness endpoint did not report loaded model evidence"
+                        )
                     return ReadinessEvidence(
                         uri=uri,
                         status_code=200,
@@ -909,6 +943,7 @@ def _wait_readiness(
                         attempts=attempts,
                         seconds=_seconds(started),
                         failure=None,
+                        loaded_models=loaded_models,
                     )
                 last_failure = "readiness endpoint did not confirm preloaded readiness"
         except (
@@ -932,6 +967,7 @@ def _wait_readiness(
         attempts=attempts,
         seconds=_seconds(started),
         failure=last_failure,
+        loaded_models=(),
     )
 
 
@@ -1006,6 +1042,7 @@ async def _exercise_phase(
                     verify_recovery=True,
                     recovery_resume_timeout=probe.recovery_resume_timeout,
                     source_commit=target_commit,
+                    probe_audio_path=probe.probe_audio,
                 )
                 websocket_report = report.to_dict()
                 if not report.passed:
@@ -1078,6 +1115,10 @@ async def _run_deployment_rehearsal_locked(
     selected_probe = probe or RehearsalProbeConfig()
     if selected_probe.backend is None or selected_probe.model is None:
         raise ValueError("deployment rehearsal requires an explicit backend and model")
+    if selected_probe.probe_audio is None:
+        raise ValueError("deployment rehearsal requires an explicit probe-audio WAV")
+    if selected_probe.min_commits < 1:
+        raise ValueError("deployment rehearsal requires at least one commit per session")
 
     runtime = _installed_runtime_identity(candidate_commit)
     if runtime["turnalign_source_commit"] != candidate_commit:
@@ -1260,6 +1301,10 @@ async def _run_deployment_activation_locked(
     selected_probe = probe or RehearsalProbeConfig()
     if selected_probe.backend is None or selected_probe.model is None:
         raise ValueError("deployment activation requires an explicit backend and model")
+    if selected_probe.probe_audio is None:
+        raise ValueError("deployment activation requires an explicit probe-audio WAV")
+    if selected_probe.min_commits < 1:
+        raise ValueError("deployment activation requires at least one commit per session")
 
     runtime = _installed_runtime_identity(candidate_commit)
     if runtime["turnalign_source_commit"] != candidate_commit:
@@ -1436,6 +1481,10 @@ async def _run_deployment_recovery_locked(
     selected_probe = probe or RehearsalProbeConfig()
     if selected_probe.backend is None or selected_probe.model is None:
         raise ValueError("deployment recovery requires an explicit backend and model")
+    if selected_probe.probe_audio is None:
+        raise ValueError("deployment recovery requires an explicit probe-audio WAV")
+    if selected_probe.min_commits < 1:
+        raise ValueError("deployment recovery requires at least one commit per session")
 
     transaction = _read_pending_transaction()
     runtime = _installed_runtime_identity(transaction.candidate_commit)

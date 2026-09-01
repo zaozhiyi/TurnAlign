@@ -6,6 +6,7 @@ import re
 import shlex
 from collections import defaultdict
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 from urllib.parse import urlsplit
 
 _UNIT_KEY_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9]*")
@@ -197,8 +198,10 @@ def validate_systemd_service(content: bytes) -> tuple[str, ...]:
     working_directory = _one(service, "WorkingDirectory", failures)
     if working_directory is None or not working_directory.startswith("/"):
         failures.append("systemd service must use an absolute working directory")
+    managed_directories: dict[str, str | None] = {}
     for key in ("StateDirectory", "CacheDirectory"):
         value = _one(service, key, failures)
+        managed_directories[key] = value
         if value is None or not value or "/" in value or value in {".", ".."}:
             failures.append(f"systemd service must define a managed {key}")
     if _positive_integer(_one(service, "LimitNOFILE", failures)) is None:
@@ -270,6 +273,10 @@ def validate_systemd_service(content: bytes) -> tuple[str, ...]:
         failures.append("systemd service must not enable TurnAlign remote binding")
     if tokens.count("--preload") != 1:
         failures.append("systemd service must preload model replicas")
+    if tokens.count("--require-local-model") != 1:
+        failures.append("systemd service must require retained local model files")
+    if "--no-require-local-model" in tokens:
+        failures.append("systemd service must not disable retained local model files")
     if tokens.count("--require-immutable-model-revision") != 1:
         failures.append("systemd service must require an immutable model revision")
 
@@ -288,8 +295,45 @@ def validate_systemd_service(content: bytes) -> tuple[str, ...]:
     warmup = _one_option(tokens, "--warmup-file", failures)
     if warmup is None or not warmup.startswith("/"):
         failures.append("systemd service must use an absolute warm-up file")
-    for option in ("--backend", "--device"):
+    backend = _one_option(tokens, "--backend", failures)
+    for option in ("--device", "--model"):
         _one_option(tokens, option, failures)
+    if backend in {"funasr", "funasr-streaming"}:
+        revisions = [
+            value.removeprefix("model_revision=")
+            for value in _option_values(tokens, "--backend-option")
+            if isinstance(value, str) and value.startswith("model_revision=")
+        ]
+        if len(revisions) != 1 or re.fullmatch(
+            r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})",
+            revisions[0] if revisions else "",
+        ) is None:
+            failures.append(
+                "systemd FunASR service must pin one immutable model_revision"
+            )
+    model_path_value = _one_option(tokens, "--model-path", failures)
+    if model_path_value is not None:
+        model_path = PurePosixPath(model_path_value)
+        model_root = PurePosixPath("/var/lib/turnalign/models")
+        if (
+            not model_path.is_absolute()
+            or str(model_path) != model_path_value
+            or model_path == model_root
+            or model_root not in model_path.parents
+            or any(part in {".", ".."} for part in model_path.parts)
+        ):
+            failures.append(
+                "systemd service model path must be a canonical child of "
+                "/var/lib/turnalign/models"
+            )
+        state_name = managed_directories.get("StateDirectory")
+        if isinstance(state_name, str) and "/" not in state_name:
+            writable_state = PurePosixPath("/var/lib") / state_name
+            if writable_state == model_path or writable_state in model_path.parents:
+                failures.append(
+                    "systemd service must not place model files under its writable "
+                    "StateDirectory"
+                )
 
     integer_options = {
         option: _positive_integer(_one_option(tokens, option, failures))
@@ -321,6 +365,7 @@ def validate_systemd_service(content: bytes) -> tuple[str, ...]:
             "--client-idle-timeout",
             "--finalization-timeout",
             "--worker-shutdown-timeout",
+            "--backend-cancel-timeout",
             "--shutdown-grace-timeout",
         )
     }

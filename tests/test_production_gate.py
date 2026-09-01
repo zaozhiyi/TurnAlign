@@ -7,6 +7,7 @@ import os
 import tempfile
 import unittest
 import zipfile
+from datetime import datetime, timezone
 from os import fstat as real_fstat
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,6 +26,11 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class ProductionGateTests(unittest.TestCase):
     BOOT_ID = "12345678-1234-4234-8234-123456789abc"
+    NOW = (
+        datetime.now(timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
 
     @staticmethod
     def _write_test_wheel(
@@ -103,15 +109,26 @@ class ProductionGateTests(unittest.TestCase):
         write_json_report(release, {
             "status": "passed",
             "source_commit": "b" * 40,
+            "created_at": ProductionGateTests.NOW,
+            "validity_seconds": 86400.0,
             "input_audio_sha256": hashlib.sha256(
                 b"immutable release-audio\n"
             ).hexdigest(),
             "failures": [],
             "backend": "native-streaming-test",
+            "model": "paraformer-zh-streaming",
+            "loaded_models": [{
+                "path": "/var/lib/turnalign/models/paraformer-zh-streaming/model.evidence",
+                "sha256": hashlib.sha256(
+                    b"immutable model\n"
+                ).hexdigest(),
+                "bytes": len(b"immutable model\n"),
+            }],
             "require_native_streaming": True,
             "native_streaming": True,
             "require_partial": True,
             "require_immutable_model_revision": True,
+            "require_local_model": True,
             "model_revision": "a" * 40,
             "min_audio_seconds": 30.0,
             "min_commits": 1,
@@ -133,12 +150,15 @@ class ProductionGateTests(unittest.TestCase):
         write_json_report(quality, {
             "status": "passed",
             "source_commit": "b" * 40,
+            "created_at": ProductionGateTests.NOW,
+            "validity_seconds": 86400.0,
             "reference_sha256": hashlib.sha256(
                 b"immutable quality-reference\n"
             ).hexdigest(),
             "hypothesis_sha256": hashlib.sha256(
                 b"immutable quality-hypothesis\n"
             ).hexdigest(),
+            "model": "paraformer-zh-streaming",
             "model_revision": "a" * 40,
             "failures": [],
             "max_character_error_rate": 0.1,
@@ -169,6 +189,8 @@ class ProductionGateTests(unittest.TestCase):
         write_json_report(websocket, {
             "status": "passed",
             "source_commit": "b" * 40,
+            "created_at": ProductionGateTests.NOW,
+            "validity_seconds": 86400.0,
             "uri": "wss://asr.example.com/ws",
             "identity_consistent": True,
             "backend": "native-streaming-test",
@@ -178,6 +200,18 @@ class ProductionGateTests(unittest.TestCase):
             "device": "cpu",
             "language": "zh",
             "compute_type": None,
+            "loaded_models": [{
+                "path": "/var/lib/turnalign/models/paraformer-zh-streaming/model.evidence",
+                "sha256": hashlib.sha256(
+                    b"immutable model\n"
+                ).hexdigest(),
+                "bytes": len(b"immutable model\n"),
+            }],
+            "probe_audio_sha256": hashlib.sha256(
+                b"immutable websocket-probe-audio\n"
+            ).hexdigest(),
+            "probe_audio_bytes": len(b"immutable websocket-probe-audio\n"),
+            "probe_audio_rms": 1234.5,
             "sessions": 8,
             "passed_sessions": 8,
             "failed_sessions": 0,
@@ -192,6 +226,13 @@ class ProductionGateTests(unittest.TestCase):
                 "device": "cpu",
                 "language": "zh",
                 "compute_type": None,
+                "loaded_models": [{
+                    "path": "/var/lib/turnalign/models/paraformer-zh-streaming/model.evidence",
+                    "sha256": hashlib.sha256(
+                        b"immutable model\n"
+                    ).hexdigest(),
+                    "bytes": len(b"immutable model\n"),
+                }],
                 "disconnected_audio_seconds": 30.0,
                 "first_last_acknowledged_sequence": 299,
                 "resumed_next_audio_sequence": 300,
@@ -227,6 +268,13 @@ class ProductionGateTests(unittest.TestCase):
                     "device": "cpu",
                     "language": "zh",
                     "compute_type": None,
+                    "loaded_models": [{
+                        "path": "/var/lib/turnalign/models/paraformer-zh-streaming/model.evidence",
+                        "sha256": hashlib.sha256(
+                            b"immutable model\n"
+                        ).hexdigest(),
+                        "bytes": len(b"immutable model\n"),
+                    }],
                     "ready_seconds": 2.0,
                     "total_seconds": 62.0,
                     "events": 2,
@@ -283,6 +331,13 @@ class ProductionGateTests(unittest.TestCase):
                     "attempts": 2,
                     "seconds": 1.0,
                     "failure": None,
+                    "loaded_models": [{
+                        "path": "/var/lib/turnalign/models/paraformer-zh-streaming/model.evidence",
+                        "sha256": hashlib.sha256(
+                            b"immutable model\n"
+                        ).hexdigest(),
+                        "bytes": len(b"immutable model\n"),
+                    }],
                 },
                 "websocket_report": probe,
                 "failures": [],
@@ -374,6 +429,10 @@ class ProductionGateTests(unittest.TestCase):
         artifacts = []
         for kind in REQUIRED_ARTIFACT_KINDS:
             path = root / f"{kind}.evidence"
+            if kind == "service-unit":
+                path = root / "turnalign.service"
+            elif kind == "nginx-config":
+                path = root / "turnalign.conf"
             if kind == "deployment-activation":
                 websocket_path = root / "websocket.json"
                 if not websocket_path.exists():
@@ -384,6 +443,15 @@ class ProductionGateTests(unittest.TestCase):
                     path,
                     ProductionGateTests._deployment_activation(websocket_path),
                 )
+            elif kind == "deployment-state":
+                write_json_report(path, {
+                    "schema_version": 1,
+                    "active_commit": "b" * 40,
+                    "pending_transaction_id": None,
+                    "boot_id": ProductionGateTests.BOOT_ID,
+                    "created_at": ProductionGateTests.NOW,
+                    "validity_seconds": 300.0,
+                })
             elif kind == "dependency-lock":
                 path.write_text(
                     "websockets==17.1 \\\n"
@@ -433,6 +501,8 @@ class ProductionGateTests(unittest.TestCase):
                 path.write_bytes(
                     (ROOT / "deploy" / "nginx" / "turnalign.conf.example").read_bytes()
                 )
+            elif kind == "websocket-probe-audio":
+                path.write_bytes(b"immutable websocket-probe-audio\n")
             else:
                 path.write_bytes(f"immutable {kind}\n".encode())
             artifacts.append((kind, path))
@@ -442,7 +512,7 @@ class ProductionGateTests(unittest.TestCase):
         )
         write_json_report(manifest, {
             "schema_version": 1,
-            "model_id": "modelscope://damo/paraformer-zh-streaming",
+            "model_id": "paraformer-zh-streaming",
             "model_revision": "a" * 40,
             "files": [{
                 "name": model.name,
@@ -458,6 +528,12 @@ class ProductionGateTests(unittest.TestCase):
         ]
         runtime_prefix = f"/opt/turnalign/releases/{'b' * 40}/venv"
         wheel = next(path for kind, path in artifacts if kind == "wheel")
+        service_path = next(
+            path for kind, path in artifacts if kind == "service-unit"
+        )
+        nginx_path = next(
+            path for kind, path in artifacts if kind == "nginx-config"
+        )
         with patch.object(
             production_gate_module,
             "_installed_runtime_identity",
@@ -471,6 +547,30 @@ class ProductionGateTests(unittest.TestCase):
             production_gate_module,
             "_installed_distribution_identity",
             return_value=ProductionGateTests._installed_distribution(wheel),
+        ), patch.object(
+            production_gate_module,
+            "_installed_dependency_identity",
+            return_value={
+                "websockets": {
+                    "name": "websockets",
+                    "version": "17.1",
+                    "root": (
+                        f"/opt/turnalign/releases/{'b' * 40}/venv/lib/"
+                        "python3.10/site-packages"
+                    ),
+                    "file_count": 1,
+                    "sha256": hashlib.sha256(b"dependency\n").hexdigest(),
+                    "bytes": len(b"dependency\n"),
+                },
+            },
+        ), patch.object(
+            production_gate_module,
+            "_SERVICE_UNIT_PATH",
+            service_path,
+        ), patch.object(
+            production_gate_module,
+            "_NGINX_CONFIG_PATH",
+            nginx_path,
         ), patch.object(
             production_gate_module,
             "_active_release_commit",
@@ -513,6 +613,204 @@ class ProductionGateTests(unittest.TestCase):
             self.assertEqual(
                 {artifact.kind for artifact in report.artifacts},
                 REQUIRED_ARTIFACT_KINDS,
+            )
+
+    def test_zero_commit_websocket_evidence_never_passes_production_gate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, quality, websocket = self._reports(root)
+            payload = json.loads(websocket.read_text(encoding="utf-8"))
+            payload["min_commits_per_session"] = 0
+            for result in payload["results"]:
+                result["commits"] = 0
+            payload["commits"] = 0
+            write_json_report(websocket, payload)
+            report = run_production_gate(
+                release,
+                quality,
+                websocket,
+                source_commit="b" * 40,
+                artifacts=self._artifacts(root),
+            )
+            self.assertFalse(report.passed)
+            self.assertTrue(
+                any("commit per session" in failure for failure in report.failures)
+            )
+
+    def test_stale_gate_report_cannot_be_replayed_as_current(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, quality, websocket = self._reports(root)
+            payload = json.loads(release.read_text(encoding="utf-8"))
+            payload["created_at"] = "2020-01-01T00:00:00.000Z"
+            payload["validity_seconds"] = 60.0
+            write_json_report(release, payload)
+            report = run_production_gate(
+                release,
+                quality,
+                websocket,
+                source_commit="b" * 40,
+                artifacts=self._artifacts(root),
+            )
+            self.assertFalse(report.passed)
+            self.assertTrue(
+                any("stale" in failure for failure in report.failures)
+            )
+
+    def test_future_or_excessively_long_gate_evidence_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for field, value, expected in (
+                ("created_at", "2099-01-01T00:00:00.000Z", "in the future"),
+                ("validity_seconds", 86_401.0, "no greater than 86400"),
+            ):
+                release, quality, websocket = self._reports(root)
+                payload = json.loads(release.read_text(encoding="utf-8"))
+                payload[field] = value
+                write_json_report(release, payload)
+                report = run_production_gate(
+                    release,
+                    quality,
+                    websocket,
+                    source_commit="b" * 40,
+                    artifacts=self._artifacts(root),
+                )
+                with self.subTest(field=field):
+                    self.assertFalse(report.passed)
+                    self.assertIn(expected, "\n".join(report.failures))
+
+    def test_model_id_is_bound_across_manifest_and_all_gate_reports(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, quality, websocket = self._reports(root)
+            artifacts = self._artifacts(root)
+            manifest = next(
+                path for kind, path in artifacts if kind == "model-manifest"
+            )
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            payload["model_id"] = "wrong-model"
+            write_json_report(manifest, payload)
+            report = run_production_gate(
+                release,
+                quality,
+                websocket,
+                source_commit="b" * 40,
+                artifacts=artifacts,
+            )
+            self.assertFalse(report.passed)
+            self.assertTrue(
+                any("model_id" in failure for failure in report.failures)
+            )
+
+    def test_installed_dependency_version_must_match_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, quality, websocket = self._reports(root)
+            artifacts = self._artifacts(root)
+            host_profile = next(
+                path for kind, path in artifacts if kind == "host-profile"
+            )
+            payload = json.loads(host_profile.read_text(encoding="utf-8"))
+            payload["installed_dependencies"]["websockets"]["version"] = "99.0"
+            write_json_report(host_profile, payload)
+            report = run_production_gate(
+                release,
+                quality,
+                websocket,
+                source_commit="b" * 40,
+                artifacts=artifacts,
+            )
+            self.assertFalse(report.passed)
+            self.assertTrue(
+                any("does not match the lock" in failure for failure in report.failures)
+            )
+
+    def test_http_dependency_index_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, quality, websocket = self._reports(root)
+            artifacts = self._artifacts(root)
+            lock = next(
+                path for kind, path in artifacts if kind == "dependency-lock"
+            )
+            lock.write_text(
+                "--index-url http://pypi.example/simple\n"
+                "websockets==17.1 \\\n"
+                f"    --hash=sha256:{'c' * 64}\n",
+                encoding="utf-8",
+            )
+            report = run_production_gate(
+                release,
+                quality,
+                websocket,
+                source_commit="b" * 40,
+                artifacts=artifacts,
+            )
+            self.assertFalse(report.passed)
+            self.assertTrue(
+                any("must use HTTPS" in failure for failure in report.failures)
+            )
+
+    def test_https_dependency_index_is_parsed_as_a_directive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, quality, websocket = self._reports(root)
+            artifacts = self._artifacts(root)
+            lock = next(
+                path for kind, path in artifacts if kind == "dependency-lock"
+            )
+            lock.write_text(
+                "--index-url https://pypi.example/simple\n"
+                "websockets==17.1 \\\n"
+                f"    --hash=sha256:{'c' * 64}\n",
+                encoding="utf-8",
+            )
+            host_profile = next(
+                path for kind, path in artifacts if kind == "host-profile"
+            )
+            profile = json.loads(host_profile.read_text(encoding="utf-8"))
+            lock_entry = next(
+                item
+                for item in profile["artifacts"]
+                if item["kind"] == "dependency-lock"
+            )
+            lock_entry["sha256"] = hashlib.sha256(lock.read_bytes()).hexdigest()
+            lock_entry["bytes"] = lock.stat().st_size
+            write_json_report(host_profile, profile)
+
+            report = run_production_gate(
+                release,
+                quality,
+                websocket,
+                source_commit="b" * 40,
+                artifacts=artifacts,
+            )
+            self.assertTrue(report.passed, report.failures)
+
+    def test_conditional_dependency_lock_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, quality, websocket = self._reports(root)
+            artifacts = self._artifacts(root)
+            lock = next(
+                path for kind, path in artifacts if kind == "dependency-lock"
+            )
+            lock.write_text(
+                "websockets==17.1; python_version >= '3.10' \\\n"
+                f"    --hash=sha256:{'c' * 64}\n",
+                encoding="utf-8",
+            )
+            report = run_production_gate(
+                release,
+                quality,
+                websocket,
+                source_commit="b" * 40,
+                artifacts=artifacts,
+            )
+            self.assertFalse(report.passed)
+            self.assertIn(
+                "contain no environment markers",
+                "\n".join(report.failures),
             )
 
     def test_reports_every_weakened_production_requirement(self):
@@ -745,6 +1043,28 @@ class ProductionGateTests(unittest.TestCase):
                 with self.subTest(expected=expected):
                     self.assertFalse(report.passed)
                     self.assertIn(expected, "\n".join(report.failures))
+
+    def test_loaded_model_path_is_bound_to_model_identity_and_file_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, quality, websocket = self._reports(root)
+            payload = json.loads(release.read_text(encoding="utf-8"))
+            payload["loaded_models"][0]["path"] = (
+                "/var/lib/turnalign/models/different-model/different-name.bin"
+            )
+            write_json_report(release, payload)
+            report = run_production_gate(
+                release,
+                quality,
+                websocket,
+                source_commit="b" * 40,
+                artifacts=self._artifacts(root),
+            )
+            self.assertFalse(report.passed)
+            self.assertIn(
+                "loaded runtime model evidence does not exactly match",
+                "\n".join(report.failures),
+            )
 
     def test_rejects_invalid_or_record_tampered_wheel(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1164,7 +1484,7 @@ class ProductionGateTests(unittest.TestCase):
     )
     def test_installed_distribution_hashes_only_secure_active_package_files(self):
         with tempfile.TemporaryDirectory() as directory:
-            prefix = Path(directory) / "venv"
+            prefix = Path(directory).resolve() / "venv"
             version = production_gate_module.sys.version_info
             root = (
                 prefix
@@ -1217,6 +1537,57 @@ class ProductionGateTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "unsafe or mutable"):
                     production_gate_module._installed_distribution_identity(runtime)
 
+    def test_installed_dependency_uses_a_bounded_tree_digest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            prefix = Path(directory).resolve() / "venv"
+            version = production_gate_module.sys.version_info
+            site_packages = (
+                prefix
+                / "lib"
+                / f"python{version.major}.{version.minor}"
+                / "site-packages"
+            )
+            package = site_packages / "websockets"
+            package.mkdir(parents=True)
+            (package / "__init__.py").write_bytes(b"first\n")
+            (package / "client.py").write_bytes(b"second\n")
+            lock = Path(directory) / "requirements.lock"
+            lock.write_text(
+                "websockets==17.1 \\\n"
+                f"    --hash=sha256:{'c' * 64}\n",
+                encoding="utf-8",
+            )
+
+            class Distribution:
+                version = "17.1"
+                files = (
+                    Path("websockets/client.py"),
+                    Path("websockets/__init__.py"),
+                )
+
+                @staticmethod
+                def locate_file(_name):
+                    return site_packages
+
+            with patch.object(
+                production_gate_module.importlib.metadata,
+                "distribution",
+                return_value=Distribution(),
+            ), patch.object(
+                production_gate_module,
+                "_root_owned_immutable",
+                return_value=True,
+            ):
+                identity = production_gate_module._installed_dependency_identity(
+                    lock,
+                    {"python_prefix": str(prefix)},
+                )["websockets"]
+
+            self.assertEqual(identity["file_count"], 2)
+            self.assertEqual(identity["bytes"], len(b"first\nsecond\n"))
+            self.assertRegex(identity["sha256"], r"^[0-9a-f]{64}$")
+            self.assertNotIn("files", identity)
+
     def test_host_profile_generation_requires_linux(self):
         runtime_prefix = f"/opt/turnalign/releases/{'b' * 40}/venv"
         with patch.object(
@@ -1268,7 +1639,7 @@ class ProductionGateTests(unittest.TestCase):
             self.assertEqual(system, "Linux")
             os.fstat(descriptor)
             events.append("captured")
-            return {"schema_version": 5}
+            return {"schema_version": 6}
 
         with patch.object(
             production_gate_module.platform,
@@ -1289,7 +1660,7 @@ class ProductionGateTests(unittest.TestCase):
         ):
             self.assertEqual(
                 create_host_profile("b" * 40, []),
-                {"schema_version": 5},
+                {"schema_version": 6},
             )
         self.assertEqual(events, ["checked", "captured"])
         with self.assertRaises(OSError):
@@ -1409,6 +1780,35 @@ class ProductionGateTests(unittest.TestCase):
                 (
                     ("bin/python -I -B -u -m", "bin/python -I -B -m"),
                     "isolated versioned Python runtime",
+                ),
+                (
+                    ("  --require-local-model \\\n", ""),
+                    "require retained local model files",
+                ),
+                (
+                    (
+                        "/var/lib/turnalign/models/paraformer-zh-streaming",
+                        "/tmp/paraformer-zh-streaming",
+                    ),
+                    "canonical child of /var/lib/turnalign/models",
+                ),
+                (
+                    ("  --backend-cancel-timeout 5 \\\n", ""),
+                    "--backend-cancel-timeout exactly once",
+                ),
+                (
+                    ("StateDirectory=turnalign-state", "StateDirectory=turnalign"),
+                    "must not place model files under its writable StateDirectory",
+                ),
+                (
+                    (
+                        (
+                            "  --backend-option model_revision="
+                            "562b758fecc801f13079d846d06b0b024fd670c4 \\\n"
+                        ),
+                        "",
+                    ),
+                    "must pin one immutable model_revision",
                 ),
             ):
                 artifacts = self._artifacts(root)

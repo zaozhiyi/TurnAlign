@@ -707,6 +707,8 @@ class CliIntegrationTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "rehearsal.json"
+            probe_audio = Path(directory) / "probe.wav"
+            probe_audio.write_bytes(b"RIFF")
 
             def fake_finalize(transaction_id, active_commit):
                 captured["finalized"] = (transaction_id, active_commit)
@@ -736,6 +738,8 @@ class CliIntegrationTests(unittest.TestCase):
                     "paraformer-zh-streaming",
                     "--report",
                     str(output),
+                    "--probe-audio",
+                    str(probe_audio),
                 ],
             ), patch("builtins.print"):
                 self.assertEqual(cli.main(), 0)
@@ -776,6 +780,8 @@ class CliIntegrationTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "activation.json"
+            probe_audio = Path(directory) / "probe.wav"
+            probe_audio.write_bytes(b"RIFF")
 
             def fake_finalize(transaction_id, active_commit):
                 captured["finalized"] = (transaction_id, active_commit)
@@ -805,6 +811,8 @@ class CliIntegrationTests(unittest.TestCase):
                     "paraformer-zh-streaming",
                     "--report",
                     str(output),
+                    "--probe-audio",
+                    str(probe_audio),
                 ],
             ), patch("builtins.print"):
                 self.assertEqual(cli.main(), 0)
@@ -834,6 +842,8 @@ class CliIntegrationTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "recovery.json"
+            probe_audio = Path(directory) / "probe.wav"
+            probe_audio.write_bytes(b"RIFF")
 
             def fake_finalize(transaction_id, active_commit):
                 captured["finalized"] = (transaction_id, active_commit)
@@ -858,6 +868,8 @@ class CliIntegrationTests(unittest.TestCase):
                     "paraformer-zh-streaming",
                     "--report",
                     str(output),
+                    "--probe-audio",
+                    str(probe_audio),
                 ],
             ), patch("builtins.print"):
                 self.assertEqual(cli.main(), 0)
@@ -933,6 +945,16 @@ class CliIntegrationTests(unittest.TestCase):
                     "bytes": 41,
                 }],
             }
+            service_path = next(
+                root / f"{kind}.evidence"
+                for kind in cli.REQUIRED_ARTIFACT_KINDS
+                if kind == "service-unit"
+            )
+            nginx_path = next(
+                root / f"{kind}.evidence"
+                for kind in cli.REQUIRED_ARTIFACT_KINDS
+                if kind == "nginx-config"
+            )
 
             with patch(
                 "turnalign.production_gate._installed_runtime_identity",
@@ -940,6 +962,15 @@ class CliIntegrationTests(unittest.TestCase):
             ), patch(
                 "turnalign.production_gate._installed_distribution_identity",
                 return_value=installed_distribution,
+            ), patch(
+                "turnalign.production_gate._installed_dependency_identity",
+                return_value={},
+            ), patch(
+                "turnalign.production_gate._SERVICE_UNIT_PATH",
+                service_path,
+            ), patch(
+                "turnalign.production_gate._NGINX_CONFIG_PATH",
+                nginx_path,
             ), patch(
                 "turnalign.production_gate._active_release_commit",
                 return_value="a" * 40,
@@ -956,7 +987,7 @@ class CliIntegrationTests(unittest.TestCase):
                 self.assertEqual(cli.main(), 0)
 
             payload = json.loads(output.read_text(encoding="utf-8"))
-            self.assertEqual(payload["schema_version"], 5)
+            self.assertEqual(payload["schema_version"], 6)
             self.assertEqual(payload["source_commit"], "a" * 40)
             self.assertEqual(payload["active_commit"], "a" * 40)
             self.assertEqual(payload["runtime"], runtime)

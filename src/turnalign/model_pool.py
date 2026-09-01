@@ -20,6 +20,16 @@ def _close_backend(backend: Any, *, reason: str) -> None:
     close_resources((backend,), logger=LOGGER, reason=reason)
 
 
+def _close_backend_async(backend: Any, *, reason: str) -> None:
+    """Run best-effort plugin cleanup without extending a lifecycle deadline."""
+    threading.Thread(
+        target=_close_backend,
+        kwargs={"backend": backend, "reason": reason},
+        name="turnalign-backend-cleanup",
+        daemon=True,
+    ).start()
+
+
 class BackendPoolCapacityError(RuntimeError):
     """Raised when every bounded backend slot is actively leased."""
 
@@ -154,23 +164,43 @@ class BackendPool:
                 entry.last_used = monotonic()
                 self._condition.notify_all()
 
-    def discard(self, key: str) -> None:
+    def discard(self, key: str, *, wait: bool = True) -> None:
         """Remove and close one lease instead of retaining sensitive session state."""
+        backend = self.detach(key)
+        if backend is not None:
+            if wait:
+                _close_backend(backend, reason="discard")
+            else:
+                _close_backend_async(backend, reason="discard")
+
+    def detach(self, key: str) -> Any | None:
+        """Remove one lease without invoking untrusted cleanup in the caller."""
         with self._condition:
             entry = self._entries.pop(key, None)
             self._condition.notify_all()
-        if entry is not None and entry.backend is not None:
-            _close_backend(entry.backend, reason="discard")
+        return entry.backend if entry is not None else None
 
-    def close(self) -> None:
+    def close(self, *, wait: bool = True) -> None:
         with self._condition:
             self._closed = True
             backends = [
                 entry.backend
                 for entry in self._entries.values()
-                if entry.backend is not None
+                if entry.backend is not None and not entry.busy
             ]
+            abandoned = sum(
+                entry.backend is not None and entry.busy
+                for entry in self._entries.values()
+            )
             self._entries.clear()
             self._condition.notify_all()
+        if abandoned:
+            LOGGER.warning(
+                "pool shutdown detached %d active backend(s) without concurrent close",
+                abandoned,
+            )
         for backend in backends:
-            _close_backend(backend, reason="pool shutdown")
+            if wait:
+                _close_backend(backend, reason="pool shutdown")
+            else:
+                _close_backend_async(backend, reason="pool shutdown")

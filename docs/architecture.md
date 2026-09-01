@@ -103,6 +103,9 @@ Once an entry is detached for eviction, sensitive-session discard, late
 initialization, or service shutdown, backend `close()` failures are logged and
 isolated. Cleanup continues across every remaining entry, and a third-party
 close exception cannot prevent the session sender sentinel or recovery release.
+Session-sensitive discard and normal service shutdown dispatch idle-backend
+cleanup outside their lifecycle deadline. Active backends are detached without
+concurrent close and left to process teardown if their worker cannot return.
 The same best-effort close boundary covers streaming sessions, VAD, alignment,
 offline and online diarization, two-pass refinement, timelines, and preload
 warmup failures. Every resource is attempted; cleanup errors are retained in
@@ -163,7 +166,9 @@ On cancellation, cooperative backends receive a cancel hook (the bundled
 whisper.cpp adapter terminates its active process). If a Python runtime cannot
 interrupt an in-flight call, the transport still times out cleanly while the
 recovery session remains active until that worker exits, so a reconnect cannot
-race the old writer.
+race the old writer. A cancel hook that misses its own deadline is detached from
+the pool and quarantined; the same backend instance is never reused or closed
+concurrently, and best-effort cleanup starts only after the hook returns.
 
 ## Realtime and offline pipelines
 

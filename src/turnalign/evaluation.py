@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from itertools import pairwise, permutations
 from math import isfinite
 from typing import Literal, cast
@@ -228,6 +229,9 @@ class QualityGateReport:
     source_commit: str | None
     reference_sha256: str | None
     hypothesis_sha256: str | None
+    created_at: str
+    validity_seconds: float
+    model: str | None
     model_revision: str | None
     evaluation: EvaluationReport
     max_character_error_rate: float | None
@@ -262,6 +266,8 @@ def evaluate_quality_gate(
     source_commit: str | None = None,
     reference_sha256: str | None = None,
     hypothesis_sha256: str | None = None,
+    model: str | None = None,
+    validity_seconds: float = 86400.0,
 ) -> QualityGateReport:
     maxima = {
         "max_character_error_rate": max_character_error_rate,
@@ -294,6 +300,13 @@ def evaluate_quality_gate(
         raise ValueError(
             "min_reference_speech_seconds must be non-negative and finite"
         )
+    if (
+        isinstance(validity_seconds, bool)
+        or not isinstance(validity_seconds, (int, float))
+        or not isfinite(validity_seconds)
+        or validity_seconds <= 0
+    ):
+        raise ValueError("validity_seconds must be finite and positive")
 
     evaluation = evaluate_events(
         reference,
@@ -357,6 +370,13 @@ def evaluate_quality_gate(
         source_commit=source_commit,
         reference_sha256=reference_sha256,
         hypothesis_sha256=hypothesis_sha256,
+        created_at=(
+            datetime.now(timezone.utc)
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z")
+        ),
+        validity_seconds=round(validity_seconds, 3),
+        model=model,
         model_revision=hypothesis_model_revision,
         evaluation=evaluation,
         max_character_error_rate=max_character_error_rate,

@@ -16,7 +16,7 @@ from ..jsonutil import strict_json_object
 from ..models import AudioChunk, Hypothesis
 from ..plugins import Accelerator, AsrConfig, BackendCapabilities
 from ..processes import process_error_tail
-from .common import collect_pcm
+from .common import collect_pcm, require_local_model_path
 
 _INDEXED_DEVICE = re.compile(r"^(?:cuda|rocm|vulkan):(\d+)$")
 _UNINDEXED_DEVICES = {"auto", "cpu", "cuda", "rocm", "vulkan", "mps"}
@@ -108,7 +108,19 @@ class WhisperCppBackend:
 
     def __init__(self, config: AsrConfig):
         self.executable = config.executable or "whisper-cli"
-        self.model_path = config.model_path or config.model
+        self._local_model_path = None
+        self.model_path: str
+        if config.require_local_model:
+            self._local_model_path = require_local_model_path(
+                config.model_path,
+                directory=False,
+            )
+            self.model_path = str(self._local_model_path)
+        else:
+            configured_model_path = config.model_path or config.model
+            if not configured_model_path:
+                raise ValueError("whisper-cpp requires --model-path")
+            self.model_path = configured_model_path
         self.language = config.language or "auto"
         self.device = config.device.strip().lower()
         self.no_gpu = self.device == "cpu"
@@ -139,13 +151,16 @@ class WhisperCppBackend:
                 "read the process list. Remove the hints or explicitly set backend "
                 "option allow_prompt_argv=true after accepting that risk"
             )
-        if not self.model_path:
-            raise ValueError("whisper-cpp requires --model-path")
         if shutil.which(self.executable) is None and not Path(self.executable).is_file():
             raise RuntimeError(f"whisper.cpp executable not found: {self.executable}")
         self._process_lock = threading.Lock()
         self._process: subprocess.Popen[bytes] | None = None
         self._cancel_requested = threading.Event()
+
+    def loaded_model_files(self):
+        if self._local_model_path is None:
+            return ()
+        return (self._local_model_path,)
 
     def set_hints(self, hints) -> None:
         initial_prompt = whisper_initial_prompt(hints)

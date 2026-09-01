@@ -5,7 +5,12 @@ from collections.abc import Iterable
 from ..hints import glm_transcription_prompt, whisper_initial_prompt
 from ..models import AudioChunk, Hypothesis, Word
 from ..plugins import Accelerator, AsrConfig, BackendCapabilities
-from .common import collect_pcm, pcm_to_float32
+from .common import (
+    collect_pcm,
+    local_model_files,
+    pcm_to_float32,
+    require_local_model_path,
+)
 
 _DEFAULT_WHISPER_MODEL = "openai/whisper-small"
 _DEFAULT_WHISPER_REVISION = "973afd24965f72e36ca33b3055d56a652f456b4d"
@@ -57,7 +62,16 @@ class TransformersWhisperBackend:
         except Exception as error:
             raise RuntimeError(f"Transformers dependency failed to initialize: {error}") from error
         options = dict(config.extra or {})
-        model_id = config.model or _DEFAULT_WHISPER_MODEL
+        self._local_model_path = None
+        if config.require_local_model:
+            self._local_model_path = require_local_model_path(
+                config.model_path,
+                directory=True,
+            )
+            model_id = str(self._local_model_path)
+            options["local_files_only"] = True
+        else:
+            model_id = config.model or _DEFAULT_WHISPER_MODEL
         self.model_revision = _model_revision(
             options,
             default=(
@@ -77,6 +91,9 @@ class TransformersWhisperBackend:
             revision=self.model_revision,
             **options,
         )
+
+    def loaded_model_files(self):
+        return local_model_files(self._local_model_path)
 
     def set_hints(self, hints) -> None:
         self.hints = hints
@@ -137,8 +154,17 @@ class GlmAsrBackend:
             raise RuntimeError(f"Transformers dependency failed to initialize: {error}") from error
         except Exception as error:
             raise RuntimeError(f"Transformers dependency failed to initialize: {error}") from error
-        model_id = config.model or _DEFAULT_GLM_MODEL
         kwargs = dict(config.extra or {})
+        self._local_model_path = None
+        if config.require_local_model:
+            self._local_model_path = require_local_model_path(
+                config.model_path,
+                directory=True,
+            )
+            model_id = str(self._local_model_path)
+            kwargs["local_files_only"] = True
+        else:
+            model_id = config.model or _DEFAULT_GLM_MODEL
         self.model_revision = _model_revision(
             kwargs,
             default=_DEFAULT_GLM_REVISION if model_id == _DEFAULT_GLM_MODEL else None,
@@ -172,6 +198,9 @@ class GlmAsrBackend:
         self.language = config.language
         self.hints = config.hints
         self.prompt = glm_transcription_prompt(config.hints)
+
+    def loaded_model_files(self):
+        return local_model_files(self._local_model_path)
 
     def set_hints(self, hints) -> None:
         self.hints = hints

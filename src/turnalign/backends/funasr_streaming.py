@@ -5,7 +5,11 @@ from typing import Any
 
 from ..models import AudioChunk, Hypothesis
 from ..plugins import Accelerator, AsrConfig, BackendCapabilities
-from .common import pcm_to_float32
+from .common import (
+    local_model_files,
+    pcm_to_float32,
+    require_local_model_path,
+)
 
 
 class FunAsrStreamingSession:
@@ -168,9 +172,17 @@ class FunAsrStreamingBackend:
         if device == "auto":
             device = "cuda:0" if self._cuda_available() else "cpu"
         options = dict(config.extra or {})
-        model = config.model or "paraformer-zh-streaming"
+        self._local_model_path = None
+        if config.require_local_model:
+            self._local_model_path = require_local_model_path(
+                config.model_path,
+                directory=True,
+            )
+            model = str(self._local_model_path)
+        else:
+            model = config.model_path or config.model or "paraformer-zh-streaming"
         options.setdefault("disable_update", True)
-        if model == "paraformer-zh-streaming":
+        if model == "paraformer-zh-streaming" and self._local_model_path is None:
             options.setdefault(
                 "model_revision",
                 "562b758fecc801f13079d846d06b0b024fd670c4",
@@ -189,6 +201,9 @@ class FunAsrStreamingBackend:
         )
         self.language = config.language or "zh"
         self.hints = config.hints
+
+    def loaded_model_files(self):
+        return local_model_files(self._local_model_path)
 
     def set_hints(self, hints) -> None:
         self.hints = hints
