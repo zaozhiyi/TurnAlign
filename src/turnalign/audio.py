@@ -12,6 +12,11 @@ from pathlib import Path
 from typing import BinaryIO
 
 from .models import AudioChunk
+from .processes import (
+    PROCESS_EXIT_TIMEOUT_SECONDS,
+    process_error_tail,
+    terminate_process,
+)
 
 
 def _chunk_bytes(sample_rate: int, channels: int, chunk_ms: int) -> int:
@@ -173,26 +178,34 @@ def file_chunks(path: Path, chunk_ms: int = 500, ffmpeg: str = "ffmpeg") -> Iter
         executable, "-nostdin", "-hide_banner", "-loglevel", "error", "-i", str(path),
         "-f", "s16le", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", "-",
     ]
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    if process.stdout is None:
-        process.kill()
-        process.wait()
-        raise RuntimeError("ffmpeg stdout pipe was not created")
-    size = _chunk_bytes(16_000, 1, chunk_ms)
-    start = 0.0
-    try:
-        while True:
-            data = process.stdout.read(size)
-            if not data:
-                break
-            yield AudioChunk(data, start)
-            start += len(data) / 32_000
-    finally:
-        process.stdout.close()
-    stderr = process.stderr.read().decode("utf-8", errors="replace") if process.stderr else ""
-    code = process.wait()
-    if code:
-        raise RuntimeError(f"ffmpeg failed with exit code {code}: {stderr.strip()}")
+    # A pipe for stderr can fill while stdout is being streamed and deadlock the
+    # decoder. A temporary file keeps memory bounded and can absorb diagnostics
+    # independently until the process exits.
+    with tempfile.TemporaryFile(mode="w+b") as error_output:
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=error_output)
+        if process.stdout is None:
+            terminate_process(process)
+            raise RuntimeError("ffmpeg stdout pipe was not created")
+        size = _chunk_bytes(16_000, 1, chunk_ms)
+        start = 0.0
+        try:
+            while True:
+                data = process.stdout.read(size)
+                if not data:
+                    break
+                yield AudioChunk(data, start)
+                start += len(data) / 32_000
+            try:
+                code = process.wait(timeout=PROCESS_EXIT_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired as error:
+                raise RuntimeError("ffmpeg did not exit after closing its output") from error
+            if code:
+                detail = process_error_tail(error_output)
+                suffix = f": {detail}" if detail else ""
+                raise RuntimeError(f"ffmpeg failed with exit code {code}{suffix}")
+        finally:
+            process.stdout.close()
+            terminate_process(process)
 
 
 def microphone_chunks(

@@ -14,6 +14,7 @@ from pathlib import Path
 from ..hints import whisper_initial_prompt
 from ..models import AudioChunk, Hypothesis
 from ..plugins import Accelerator, AsrConfig, BackendCapabilities
+from ..processes import process_error_tail
 from .common import collect_pcm
 
 _INDEXED_DEVICE = re.compile(r"^(?:cuda|rocm|vulkan):(\d+)$")
@@ -108,7 +109,7 @@ class WhisperCppBackend:
         if shutil.which(self.executable) is None and not Path(self.executable).is_file():
             raise RuntimeError(f"whisper.cpp executable not found: {self.executable}")
         self._process_lock = threading.Lock()
-        self._process: subprocess.Popen[str] | None = None
+        self._process: subprocess.Popen[bytes] | None = None
         self._cancel_requested = threading.Event()
 
     def set_hints(self, hints) -> None:
@@ -151,25 +152,27 @@ class WhisperCppBackend:
                 command.append("-fa" if self.flash_attention else "-nfa")
             if self.initial_prompt:
                 command.extend(["--prompt", self.initial_prompt])
-            with self._process_lock:
-                if self._cancel_requested.is_set():
-                    return
-                process = subprocess.Popen(
-                    command,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    creationflags=_windows_creationflags(),
-                )
-                self._process = process
-            try:
-                _, stderr = process.communicate()
-            finally:
+            with tempfile.TemporaryFile(mode="w+b") as error_output:
                 with self._process_lock:
-                    if self._process is process:
-                        self._process = None
-            if process.returncode:
-                raise RuntimeError(f"whisper.cpp failed: {stderr.strip()}")
+                    if self._cancel_requested.is_set():
+                        return
+                    process = subprocess.Popen(
+                        command,
+                        stdout=subprocess.DEVNULL,
+                        stderr=error_output,
+                        creationflags=_windows_creationflags(),
+                    )
+                    self._process = process
+                try:
+                    process.wait()
+                finally:
+                    with self._process_lock:
+                        if self._process is process:
+                            self._process = None
+                if process.returncode:
+                    detail = process_error_tail(error_output)
+                    suffix = f": {detail}" if detail else ""
+                    raise RuntimeError(f"whisper.cpp failed{suffix}")
             payload = json.loads(output_base.with_suffix(".json").read_text(encoding="utf-8"))
             items = payload.get("transcription") or payload.get("segments") or []
             if not items and payload.get("text"):
@@ -212,7 +215,7 @@ class WhisperCppBackend:
             escalation.daemon = True
             escalation.start()
 
-    def _kill_if_active(self, process: subprocess.Popen[str]) -> None:
+    def _kill_if_active(self, process: subprocess.Popen[bytes]) -> None:
         """Force-kill a CLI process that ignored the graceful termination."""
         with self._process_lock:
             active = self._process is process

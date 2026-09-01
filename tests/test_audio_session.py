@@ -1,11 +1,14 @@
+import io
+import subprocess
 import tempfile
 import unittest
 import wave
 from array import array
 from pathlib import Path
 from threading import Event
+from unittest.mock import patch
 
-from turnalign.audio import AudioTimeline, wave_chunks, write_wave
+from turnalign.audio import AudioTimeline, file_chunks, wave_chunks, write_wave
 from turnalign.models import AudioChunk, Hypothesis, SpeakerTurn, TranscriptEvent, Word
 from turnalign.offline import OfflineRefinementPipeline
 from turnalign.pipelines import TwoPassPipeline
@@ -247,6 +250,139 @@ class AudioTests(unittest.TestCase):
             self.assertAlmostEqual(decoded[-1].start, 0.1)
             with wave.open(str(path), "rb") as source:
                 self.assertEqual((source.getframerate(), source.getnchannels()), (16_000, 1))
+
+    def test_file_decoder_reaps_ffmpeg_when_consumer_stops_early(self):
+        class Process:
+            def __init__(self):
+                self.stdout = io.BytesIO(bytes(64_000))
+                self.returncode = None
+                self.terminated = False
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.terminated = True
+                self.returncode = -15
+
+            def kill(self):
+                self.returncode = -9
+
+            def wait(self, timeout=None):
+                del timeout
+                if self.returncode is None:
+                    self.returncode = 0
+                return self.returncode
+
+        process = Process()
+        with (
+            patch("turnalign.audio.shutil.which", return_value="/usr/bin/ffmpeg"),
+            patch("turnalign.audio.subprocess.Popen", return_value=process),
+        ):
+            decoded = file_chunks(Path("recording.mp3"), chunk_ms=100)
+            next(decoded)
+            decoded.close()
+        self.assertTrue(process.terminated)
+        self.assertTrue(process.stdout.closed)
+
+    def test_file_decoder_bounds_ffmpeg_diagnostics(self):
+        class Process:
+            def __init__(self):
+                self.stdout = io.BytesIO()
+                self.returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = -15
+
+            def kill(self):
+                self.returncode = -9
+
+            def wait(self, timeout=None):
+                del timeout
+                if self.returncode is None:
+                    self.returncode = 1
+                return self.returncode
+
+        process = Process()
+
+        def popen(*_args, **kwargs):
+            kwargs["stderr"].write(bytes(70_000) + b"diagnostic-tail")
+            return process
+
+        with (
+            patch("turnalign.audio.shutil.which", return_value="/usr/bin/ffmpeg"),
+            patch("turnalign.audio.subprocess.Popen", side_effect=popen),
+            self.assertRaisesRegex(RuntimeError, "earlier output truncated.*diagnostic-tail") as error,
+        ):
+            list(file_chunks(Path("broken.mp3")))
+        self.assertLess(len(str(error.exception)), 66_000)
+
+    def test_file_decoder_kills_ffmpeg_after_termination_timeout(self):
+        class Process:
+            def __init__(self):
+                self.stdout = io.BytesIO(bytes(64_000))
+                self.returncode = None
+                self.killed = False
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                return None
+
+            def kill(self):
+                self.killed = True
+                self.returncode = -9
+
+            def wait(self, timeout=None):
+                if timeout is not None and self.returncode is None:
+                    raise subprocess.TimeoutExpired("ffmpeg", timeout)
+                return self.returncode
+
+        process = Process()
+        with (
+            patch("turnalign.audio.shutil.which", return_value="/usr/bin/ffmpeg"),
+            patch("turnalign.audio.subprocess.Popen", return_value=process),
+        ):
+            decoded = file_chunks(Path("recording.mp3"), chunk_ms=100)
+            next(decoded)
+            decoded.close()
+        self.assertTrue(process.killed)
+        self.assertEqual(process.returncode, -9)
+
+    def test_file_decoder_bounds_wait_after_output_closes(self):
+        class Process:
+            def __init__(self):
+                self.stdout = io.BytesIO()
+                self.returncode = None
+                self.terminated = False
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.terminated = True
+                self.returncode = -15
+
+            def kill(self):
+                self.returncode = -9
+
+            def wait(self, timeout=None):
+                if timeout is not None and not self.terminated:
+                    raise subprocess.TimeoutExpired("ffmpeg", timeout)
+                return self.returncode
+
+        process = Process()
+        with (
+            patch("turnalign.audio.shutil.which", return_value="/usr/bin/ffmpeg"),
+            patch("turnalign.audio.subprocess.Popen", return_value=process),
+            self.assertRaisesRegex(RuntimeError, "did not exit after closing its output"),
+        ):
+            list(file_chunks(Path("stalled.mp3")))
+        self.assertTrue(process.terminated)
 
     def test_endpointing_keeps_preroll_and_flushes_speech(self):
         source = [chunk(0, 0), chunk(1200, 0.1), chunk(1200, 0.2)]

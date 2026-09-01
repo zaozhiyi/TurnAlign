@@ -1,4 +1,5 @@
 import json
+import subprocess
 import tempfile
 import unittest
 from array import array
@@ -98,7 +99,7 @@ class WhisperCppConfigurationTests(unittest.TestCase):
                 )
                 return SimpleNamespace(
                     returncode=0,
-                    communicate=lambda: ("", ""),
+                    wait=lambda: 0,
                 )
 
             pcm = array("h", [1000] * 1600).tobytes()
@@ -113,7 +114,29 @@ class WhisperCppConfigurationTests(unittest.TestCase):
             self.assertEqual(
                 captured["options"]["creationflags"], _windows_creationflags()
             )
+            self.assertEqual(captured["options"]["stdout"], subprocess.DEVNULL)
             self.assertEqual(result[0].text, "ok")
+
+    def test_failure_diagnostics_are_bounded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend = WhisperCppBackend(self._config(Path(directory)))
+
+            def fake_popen(_command, **options):
+                options["stderr"].write(bytes(70_000) + b"diagnostic-tail")
+                return SimpleNamespace(returncode=1, wait=lambda: 1)
+
+            with (
+                patch(
+                    "turnalign.backends.whisper_cpp.subprocess.Popen",
+                    side_effect=fake_popen,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "earlier output truncated.*diagnostic-tail",
+                ) as error,
+            ):
+                list(backend.transcribe([AudioChunk(bytes(3_200), 0.0)]))
+            self.assertLess(len(str(error.exception)), 66_000)
 
     def test_cancel_terminates_the_active_process(self):
         with tempfile.TemporaryDirectory() as directory:
