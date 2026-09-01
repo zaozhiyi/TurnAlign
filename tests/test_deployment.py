@@ -134,6 +134,8 @@ class DeploymentArtifactTests(unittest.TestCase):
             self.assertIn(requirement, content)
 
         ci = CI_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("_capture_systemd_effective_configuration", ci)
+        self.assertIn('identity["need_daemon_reload"] is False', ci)
         self.assertIn("_capture_nginx_effective_configuration", ci)
         self.assertIn('identity["warning_free"] is True', ci)
 

@@ -42,6 +42,7 @@ jobs:
           "$directory/actionlint" .github/workflows/*.yml
       - name: Verify systemd deployment unit
         run: |
+          set -euo pipefail
           if ! getent passwd turnalign >/dev/null; then
             sudo useradd --system --home /var/lib/turnalign-state --shell /usr/sbin/nologin turnalign
           fi
@@ -49,11 +50,41 @@ jobs:
             /opt/turnalign/current/venv/bin \
             /etc/turnalign \
             /var/lib/turnalign/models/paraformer-zh-streaming
-          sudo install -m 0755 /usr/bin/true \
-            /opt/turnalign/current/venv/bin/python
-          sudo install -m 0600 /dev/null /etc/turnalign/auth-token
+          printf '#!/bin/sh\nexec /usr/bin/sleep infinity\n' | sudo tee \
+            /opt/turnalign/current/venv/bin/python >/dev/null
+          sudo chmod 0755 /opt/turnalign/current/venv/bin/python
+          printf 'ci-only-auth-token\n' | sudo tee /etc/turnalign/auth-token >/dev/null
+          sudo chmod 0600 /etc/turnalign/auth-token
           sudo touch /var/lib/turnalign/warmup.wav
           systemd-analyze verify deploy/systemd/turnalign.service
+          sudo install -m 0644 deploy/systemd/turnalign.service \
+            /etc/systemd/system/turnalign.service
+          sudo systemctl daemon-reload
+          sudo systemctl start turnalign.service
+          trap 'sudo systemctl stop turnalign.service' EXIT
+          sudo env PYTHONPATH="$GITHUB_WORKSPACE/src" python3 - <<'PY'
+          from pathlib import Path
+
+          from turnalign.production_gate import (
+              _MAX_DEPLOYMENT_CONFIG_BYTES,
+              _capture_systemd_effective_configuration,
+              _snapshot_evidence,
+          )
+
+          path = Path("/etc/systemd/system/turnalign.service")
+          snapshot = _snapshot_evidence(
+              path,
+              capture_limit=_MAX_DEPLOYMENT_CONFIG_BYTES,
+              hard_limit=_MAX_DEPLOYMENT_CONFIG_BYTES,
+          )
+          identity = _capture_systemd_effective_configuration(snapshot)
+          assert identity["fragment_path"] == str(path)
+          assert identity["drop_in_paths"] == []
+          assert identity["need_daemon_reload"] is False
+          assert identity["active_state"] == "active"
+          assert identity["sub_state"] == "running"
+          assert identity["sha256"] == snapshot.sha256
+          PY
       - name: Exercise systemd network isolation
         run: |
           sudo systemd-run --quiet --collect --wait --pipe \
