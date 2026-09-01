@@ -14,6 +14,7 @@ from http import HTTPStatus
 from pathlib import Path
 from time import monotonic
 from typing import Any, ClassVar, TypeVar
+from urllib.parse import urlsplit
 
 from .audio import file_chunks
 from .hints import AsrHints
@@ -58,6 +59,46 @@ def _require_positive_finite(name: str, value: object) -> float:
     ):
         raise ValueError(f"{name} must be finite and positive")
     return float(value)
+
+
+def _validate_allowed_origins(origins: object) -> None:
+    if not isinstance(origins, tuple) or not origins:
+        raise ValueError("allowed_origins must contain unique exact origins")
+    seen: set[str | None] = set()
+    for origin in origins:
+        if origin is None:
+            if origin in seen:
+                raise ValueError("allowed_origins must contain unique exact origins")
+            seen.add(origin)
+            continue
+        if (
+            not isinstance(origin, str)
+            or not origin
+            or origin != origin.strip()
+            or any(ord(character) < 32 or ord(character) == 127 for character in origin)
+        ):
+            raise ValueError("allowed_origins must contain unique exact origins")
+        if origin in seen:
+            raise ValueError("allowed_origins must contain unique exact origins")
+        seen.add(origin)
+        try:
+            parsed = urlsplit(origin)
+            _ = parsed.port
+        except ValueError as error:
+            raise ValueError("allowed_origins contains an invalid URI or port") from error
+        if (
+            parsed.scheme not in {"http", "https"}
+            or parsed.hostname is None
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path
+            or parsed.query
+            or parsed.fragment
+            or parsed.netloc.endswith(":")
+        ):
+            raise ValueError(
+                "allowed_origins entries must be exact http(s)://host[:port] origins"
+            )
 
 
 class _ServerMetrics:
@@ -423,11 +464,7 @@ async def serve(
         raise TypeError("require_immutable_revision must be a boolean")
     if not isinstance(preload, bool):
         raise TypeError("preload must be a boolean")
-    if not isinstance(allowed_origins, tuple) or not allowed_origins or any(
-        origin is not None and (not isinstance(origin, str) or not origin.strip())
-        for origin in allowed_origins
-    ):
-        raise ValueError("allowed_origins must contain None or non-empty origins")
+    _validate_allowed_origins(allowed_origins)
     try:
         from websockets.asyncio.server import serve as websocket_serve
         from websockets.exceptions import ConnectionClosed

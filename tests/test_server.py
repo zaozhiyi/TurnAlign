@@ -332,6 +332,23 @@ class ServerConfigurationTests(unittest.IsolatedAsyncioTestCase):
             ({"allowed_origins": ()}, "allowed_origins"),
             ({"allowed_origins": "https://app.example"}, "allowed_origins"),
             ({"allowed_origins": (None, "")}, "allowed_origins"),
+            ({"allowed_origins": (None, None)}, "allowed_origins"),
+            ({
+                "allowed_origins": (
+                    None,
+                    "https://app.example",
+                    "https://app.example",
+                )
+            }, "allowed_origins"),
+            ({"allowed_origins": (None, " https://app.example")}, "allowed_origins"),
+            ({"allowed_origins": (None, "https://app.\texample")}, "allowed_origins"),
+            ({"allowed_origins": (None, "ws://app.example")}, "exact"),
+            ({"allowed_origins": (None, "https://user@app.example")}, "exact"),
+            ({"allowed_origins": (None, "https://app.example/")}, "exact"),
+            ({"allowed_origins": (None, "https://app.example?x=1")}, "exact"),
+            ({"allowed_origins": (None, "https://app.example#x")}, "exact"),
+            ({"allowed_origins": (None, "https://app.example:99999")}, "port"),
+            ({"allowed_origins": (None, "https://app.example:")}, "exact"),
         ):
             with self.subTest(options=options), self.assertRaisesRegex(ValueError, message):
                 await serve(default_backend="fake", **options)

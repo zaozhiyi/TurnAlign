@@ -94,6 +94,9 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   verifies that its default backend is allowed by policy and that default model,
   language and compute identities are valid. `preload` requires a real boolean,
   preventing truthy configuration values from producing false readiness claims.
+- Browser Origin allowlists reject duplicates, surrounding whitespace,
+  credentials, paths, query strings, fragments, non-HTTP schemes and invalid
+  ports before binding. Accepted entries match the browser Origin form exactly.
 - Repeated component options reject empty, whitespace or duplicate keys. Their
   JSON values use the same strict parser, so duplicate object members and
   `NaN`/`Infinity` cannot enter ASR, VAD, alignment or diarization configuration.
