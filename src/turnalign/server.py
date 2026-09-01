@@ -362,6 +362,12 @@ async def serve(
     shutdown_grace_timeout: float = 30.0,
 ) -> None:
     policy = policy or ServerPolicy.defaults(default_backend, default_model)
+    policy.validate_defaults(
+        backend=default_backend,
+        model=default_model,
+        language=default_language,
+        compute_type=default_compute_type,
+    )
     policy.validate_bind(host)
     if isinstance(port, bool) or not isinstance(port, int) or not 0 <= port <= 65_535:
         raise ValueError("port must be between 0 and 65535")
@@ -415,6 +421,8 @@ async def serve(
         raise ValueError("backend_replicas must be between 1 and 8")
     if not isinstance(require_immutable_revision, bool):
         raise TypeError("require_immutable_revision must be a boolean")
+    if not isinstance(preload, bool):
+        raise TypeError("preload must be a boolean")
     if not isinstance(allowed_origins, tuple) or not allowed_origins or any(
         origin is not None and (not isinstance(origin, str) or not origin.strip())
         for origin in allowed_origins

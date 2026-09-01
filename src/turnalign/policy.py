@@ -134,6 +134,25 @@ class ServerPolicy:
         if not self.allow_remote and not _is_loopback(host):
             raise ValueError("non-loopback WebSocket binding requires allow_remote=True")
 
+    def validate_defaults(
+        self,
+        *,
+        backend: str,
+        model: str | None,
+        language: str | None,
+        compute_type: str | None,
+    ) -> None:
+        default_backend = _validate_policy_name(backend, label="default backend")
+        if default_backend not in self.allowed_backends:
+            raise ValueError("default backend is not allowed by server policy")
+        for label, value in (
+            ("default model", model),
+            ("default language", language),
+            ("default compute type", compute_type),
+        ):
+            if value is not None:
+                _validate_policy_name(value, label=label)
+
     def validate_start(
         self,
         request: dict[str, Any],

@@ -348,6 +348,21 @@ class ServerConfigurationTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(name=name), self.assertRaisesRegex(ValueError, name):
                 await serve(default_backend="fake", **{name: float("nan")})
 
+    async def test_rejects_inconsistent_defaults_before_preload_or_binding(self):
+        policy = ServerPolicy(allowed_backends=frozenset({"approved"}))
+        with patch("turnalign.server.create_asr") as create, self.assertRaisesRegex(
+            ValueError, "default backend"
+        ):
+            await serve(
+                default_backend="forbidden",
+                policy=policy,
+                preload=True,
+            )
+        create.assert_not_called()
+
+        with self.assertRaisesRegex(TypeError, "preload"):
+            await serve(default_backend="fake", preload=1)
+
     async def test_websocket_gate_rejects_credentials_in_uri(self):
         for uri, message in (
             ("wss://user:secret@example.test/ws", "auth-token-env"),

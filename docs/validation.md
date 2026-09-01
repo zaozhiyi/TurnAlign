@@ -21,7 +21,7 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   materialization limit before constructing the float model input.
 - All source and test modules pass `compileall`.
 - Ruff is enforced in CI and passes over `src` and `tests`.
-- The built wheel passes all 268 tests from site-packages on Python 3.10 with
+- The built wheel passes all 269 tests from site-packages on Python 3.10 with
   `websockets` 14.0 and on Python 3.12 with `websockets` 17.1. The Python 3.12
   run also passes under `python -O`, so production invariants do not depend on
   removable `assert` statements.
@@ -90,6 +90,10 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
 - Model-pool reuse keys are canonical SHA-256 fingerprints of strict finite JSON
   configuration. Non-serializable options are rejected instead of stringified,
   and raw paths, component settings or private hints are not retained in keys.
+- Before allocating a model pool, preloading, or binding a socket, the service
+  verifies that its default backend is allowed by policy and that default model,
+  language and compute identities are valid. `preload` requires a real boolean,
+  preventing truthy configuration values from producing false readiness claims.
 - Repeated component options reject empty, whitespace or duplicate keys. Their
   JSON values use the same strict parser, so duplicate object members and
   `NaN`/`Infinity` cannot enter ASR, VAD, alignment or diarization configuration.
