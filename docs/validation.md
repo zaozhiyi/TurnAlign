@@ -21,7 +21,7 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   materialization limit before constructing the float model input.
 - All source and test modules pass `compileall`.
 - Ruff is enforced in CI and passes over `src` and `tests`.
-- The built wheel passes all 259 tests from site-packages on Python 3.10 with
+- The built wheel passes all 261 tests from site-packages on Python 3.10 with
   `websockets` 14.0 and on Python 3.12 with `websockets` 17.1. The Python 3.12
   run also passes under `python -O`, so production invariants do not depend on
   removable `assert` statements.
@@ -83,6 +83,9 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
 - Core audio and transcript models apply the same strict runtime typing to PCM,
   timestamps, protocol counters, confidence values and event kinds. JSON boolean
   values therefore cannot masquerade as numeric release or quality evidence.
+- Event JSONL, WebSocket controls, gate reports and SBOM inputs share strict JSON
+  semantics: duplicate keys and `NaN`/`Infinity` are rejected, while generated
+  evidence refuses non-standard numeric output and remains atomically written.
 - The same listener now serves minimal `/healthz` and `/readyz` probes, disables
   WebSocket compression, rejects browser origins unless explicitly allowed, and
   performs bounded graceful shutdown. An isolated subprocess test sends a real

@@ -245,6 +245,7 @@ class RecoveryStore:
             payload_bytes = len(json.dumps(
                 payload,
                 ensure_ascii=False,
+                allow_nan=False,
                 separators=(",", ":"),
             ).encode("utf-8"))
         if payload_bytes > self.max_event_bytes:
@@ -283,6 +284,7 @@ class RecoveryStore:
             payload_bytes = len(json.dumps(
                 payload,
                 ensure_ascii=False,
+                allow_nan=False,
                 separators=(",", ":"),
             ).encode("utf-8"))
             self._retain_event(session, payload, payload_bytes)

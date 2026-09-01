@@ -216,6 +216,13 @@ class ProductionGateTests(unittest.TestCase):
                     artifacts=self._artifacts(root),
                 )
 
+    def test_report_writer_rejects_nonstandard_numbers_atomically(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "report.json"
+            with self.assertRaises(ValueError):
+                write_json_report(report, {"metric": float("nan")})
+            self.assertFalse(report.exists())
+
     def test_rejects_noncanonical_source_commit(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

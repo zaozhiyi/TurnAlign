@@ -26,6 +26,7 @@ from .devices import runtime_report
 from .evaluation import TextNormalization, evaluate_events, evaluate_quality_gate
 from .exporters import render_srt, render_text
 from .hints import AsrHints
+from .jsonutil import strict_json_object
 from .models import TranscriptEvent
 from .offline import OfflineRefinementPipeline
 from .pipelines import TwoPassPipeline
@@ -138,7 +139,7 @@ def _emit_gate_report(report, path: Path | None) -> None:
     payload = report.to_dict()
     if path is not None:
         write_json_report(path, payload)
-    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    print(json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False))
 
 
 def _artifact_argument(value: str) -> tuple[str, Path]:
@@ -170,7 +171,7 @@ def replay(source: Path, output: Path | None) -> int:
                 text=hypothesis.text,
                 metadata=hypothesis.metadata,
             )
-            line = json.dumps(event.to_dict(), ensure_ascii=False)
+            line = json.dumps(event.to_dict(), ensure_ascii=False, allow_nan=False)
             if destination:
                 destination.write(line + "\n")
             else:
@@ -183,7 +184,7 @@ def replay(source: Path, output: Path | None) -> int:
             end=last_end,
             metadata={"segments": count},
         )
-        line = json.dumps(end_event.to_dict(), ensure_ascii=False)
+        line = json.dumps(end_event.to_dict(), ensure_ascii=False, allow_nan=False)
         if destination:
             destination.write(line + "\n")
         else:
@@ -203,7 +204,9 @@ def validate_events(source: Path) -> int:
             if not line.strip():
                 continue
             try:
-                event = TranscriptEvent.from_dict(json.loads(line))
+                event = TranscriptEvent.from_dict(
+                    strict_json_object(line, label=f"{source}:{line_number}")
+                )
                 validator.accept(event)
             except (TypeError, ValueError, json.JSONDecodeError) as error:
                 raise ValueError(f"{source}:{line_number}: {error}") from error
@@ -227,7 +230,9 @@ def _read_events(
             if not line.strip():
                 continue
             try:
-                event = TranscriptEvent.from_dict(json.loads(line))
+                event = TranscriptEvent.from_dict(
+                    strict_json_object(line, label=f"{source}:{line_number}")
+                )
                 if validator is not None:
                     validator.accept(event)
                 events.append(event)
@@ -252,7 +257,9 @@ def evaluate_files(reference: Path, hypothesis: Path, args) -> int:
         _read_events(hypothesis),
         text_normalization=_text_normalization(args),
     )
-    print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
+    print(json.dumps(
+        report.to_dict(), ensure_ascii=False, indent=2, allow_nan=False
+    ))
     return 0
 
 
@@ -300,7 +307,9 @@ def release_gate(args) -> int:
 
     def write_event(event: TranscriptEvent) -> None:
         if destination is not None:
-            destination.write(json.dumps(event.to_dict(), ensure_ascii=False) + "\n")
+            destination.write(json.dumps(
+                event.to_dict(), ensure_ascii=False, allow_nan=False
+            ) + "\n")
             destination.flush()
 
     try:
@@ -471,7 +480,7 @@ def _write_events(events, output: Path | None, output_format: str = "jsonl") -> 
             output.parent.mkdir(parents=True, exist_ok=True)
             destination = output.open("w", encoding="utf-8")
         for event in events:
-            line = json.dumps(event.to_dict(), ensure_ascii=False)
+            line = json.dumps(event.to_dict(), ensure_ascii=False, allow_nan=False)
             if destination:
                 destination.write(line + "\n")
                 destination.flush()

@@ -17,6 +17,7 @@ from typing import Any, ClassVar, TypeVar
 
 from .audio import file_chunks
 from .hints import AsrHints
+from .jsonutil import strict_json_object
 from .model_pool import BackendPool, BackendPoolCapacityError
 from .models import AudioChunk
 from .plugins import AsrConfig
@@ -203,21 +204,6 @@ def _json(item: object) -> str:
     )
 
 
-def _strict_json_object(
-    pairs: list[tuple[str, object]],
-) -> dict[str, object]:
-    payload: dict[str, object] = {}
-    for key, value in pairs:
-        if key in payload:
-            raise ValueError(f"duplicate JSON key: {key}")
-        payload[key] = value
-    return payload
-
-
-def _reject_json_constant(value: str) -> object:
-    raise ValueError(f"non-standard JSON number: {value}")
-
-
 def _control_message(
     message: object,
     *,
@@ -228,14 +214,7 @@ def _control_message(
         raise TypeError(f"{label} must be a JSON object")
     if len(message) > max_bytes or len(message.encode("utf-8")) > max_bytes:
         raise ValueError(f"{label} exceeds {max_bytes} bytes")
-    payload = json.loads(
-        message,
-        object_pairs_hook=_strict_json_object,
-        parse_constant=_reject_json_constant,
-    )
-    if not isinstance(payload, dict):
-        raise TypeError(f"{label} must be a JSON object")
-    return payload
+    return strict_json_object(message, label=label)
 
 
 def _bounded_request_float(

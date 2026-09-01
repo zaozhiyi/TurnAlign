@@ -680,6 +680,31 @@ class CliIntegrationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "missing end"):
                 validate_events(source)
 
+    def test_validate_rejects_ambiguous_or_nonstandard_json(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "events.jsonl"
+            for content, message in (
+                (
+                    (
+                        '{"kind":"end","segment_id":"session","revision":1,'
+                        '"revision":2,"start":0,"end":0}\n'
+                    ),
+                    "duplicate JSON key",
+                ),
+                (
+                    (
+                        '{"kind":"end","segment_id":"session","revision":1,'
+                        '"start":0,"end":0,"metadata":{"value":NaN}}\n'
+                    ),
+                    "non-standard JSON number",
+                ),
+            ):
+                source.write_text(content, encoding="utf-8")
+                with self.subTest(message=message), self.assertRaisesRegex(
+                    ValueError, message
+                ):
+                    validate_events(source)
+
     def test_quality_gate_cli_passes_and_fails_with_nonzero_exit(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -12,6 +12,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
+from .jsonutil import strict_json_loads
+
 _COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
 _MODEL_REVISION_PATTERN = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})")
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
@@ -95,7 +97,13 @@ def write_json_report(path: Path, payload: dict[str, object]) -> None:
             delete=False,
         ) as destination:
             temporary_name = destination.name
-            json.dump(payload, destination, ensure_ascii=False, indent=2)
+            json.dump(
+                payload,
+                destination,
+                ensure_ascii=False,
+                indent=2,
+                allow_nan=False,
+            )
             destination.write("\n")
             destination.flush()
             os.fsync(destination.fileno())
@@ -107,19 +115,6 @@ def write_json_report(path: Path, payload: dict[str, object]) -> None:
                 Path(temporary_name).unlink()
             except FileNotFoundError:
                 pass
-
-
-def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    result: dict[str, object] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"duplicate JSON key: {key}")
-        result[key] = value
-    return result
-
-
-def _invalid_constant(value: str) -> object:
-    raise ValueError(f"non-finite JSON number: {value}")
 
 
 def _metadata_signature(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
@@ -233,11 +228,7 @@ def _load_report(path: Path) -> tuple[dict[str, object], EvidenceFile]:
     if snapshot.content is None:  # hard_limit makes this unreachable.
         raise ValueError(f"gate report exceeds {_MAX_REPORT_BYTES} bytes: {path}")
     try:
-        payload = json.loads(
-            snapshot.content.decode("utf-8"),
-            object_pairs_hook=_unique_object,
-            parse_constant=_invalid_constant,
-        )
+        payload = strict_json_loads(snapshot.content.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
         raise ValueError(f"invalid gate report {path}: {error}") from error
     if not isinstance(payload, dict):
@@ -495,11 +486,7 @@ def _validate_sbom(
         failures.append(f"SBOM exceeds {_MAX_SBOM_BYTES} bytes")
         return {}
     try:
-        payload = json.loads(
-            snapshot.content.decode("utf-8"),
-            object_pairs_hook=_unique_object,
-            parse_constant=_invalid_constant,
-        )
+        payload = strict_json_loads(snapshot.content.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
         failures.append(f"SBOM is not strict JSON: {error}")
         return {}
