@@ -125,7 +125,7 @@ class ProductionGateTests(unittest.TestCase):
                     }],
                 })
             else:
-                path.write_text(f"immutable {kind}\n", encoding="utf-8")
+                path.write_bytes(f"immutable {kind}\n".encode())
             artifacts.append((kind, path))
         return artifacts
 
