@@ -32,6 +32,7 @@ include = [
   "/deploy",
   "/LICENSE",
   "/README.md",
+  "/SECURITY.md",
   "/docs",
   "/examples",
   "/pyproject.toml",

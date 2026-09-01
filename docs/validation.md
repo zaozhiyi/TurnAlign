@@ -21,7 +21,7 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   materialization limit before constructing the float model input.
 - All source and test modules pass `compileall`.
 - Ruff is enforced in CI and passes over `src` and `tests`.
-- The built wheel passes all 225 tests from site-packages on Python 3.10 with
+- The built wheel passes all 229 tests from site-packages on Python 3.10 with
   `websockets` 14.0 and on Python 3.12 with `websockets` 17.1. The Python 3.12
   run also passes under `python -O`, so production invariants do not depend on
   removable `assert` statements.
@@ -130,6 +130,12 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   bounded recovery capacity, an unprivileged systemd security profile, TLS
   WebSocket upgrade headers, proxy rate/connection limits, disabled retry, and
   proxy timeouts longer than the application's idle timeout.
+- CodeQL runs the extended Python security query suite on pull requests and
+  uploads trusted main/scheduled results to code scanning. Fork pull requests
+  analyze without upload because their token is intentionally read-only. All
+  workflow actions are pinned to immutable commits; Dependabot checks Python
+  and GitHub Actions weekly, and `SECURITY.md` documents the current private
+  reporting limitation and non-public fallback process.
 - `turnalign evaluate reference.jsonl hypothesis.jsonl` reports CER, WER,
   permutation-invariant speaker error, segment counts, and revision updates per
   segment. The speaker metric is a single-active-speaker interval score, not a
