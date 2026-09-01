@@ -27,6 +27,7 @@ class FakeWebSocketReport:
         }
 
 
+@unittest.skipUnless(os.name == "posix", "deployment rehearsal is Linux/POSIX-only")
 class DeploymentRehearsalTests(unittest.IsolatedAsyncioTestCase):
     previous = "a" * 40
     candidate = "b" * 40
