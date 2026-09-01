@@ -237,6 +237,37 @@ class CoordinatedDiarizer(FakeDiarizer):
 
 
 class AudioTests(unittest.TestCase):
+    def test_disk_timeline_rolls_back_an_incomplete_write(self):
+        class ShortWriteFile:
+            def __init__(self, wrapped):
+                self.wrapped = wrapped
+
+            def __getattr__(self, name):
+                return getattr(self.wrapped, name)
+
+            def write(self, data):
+                return self.wrapped.write(data[: len(data) // 2])
+
+        timeline = AudioTimeline()
+        try:
+            first = chunk(1_500, 0)
+            timeline.append(first)
+            timeline._file = ShortWriteFile(timeline._file)
+
+            with self.assertRaisesRegex(OSError, "write was incomplete"):
+                timeline.append(chunk(1_500, 0.1))
+
+            self.assertEqual(timeline.chunk_count, 1)
+            self.assertAlmostEqual(timeline.end, 0.1)
+            timeline._file.seek(0, 2)
+            self.assertEqual(timeline._file.tell(), len(first.pcm_s16le))
+            self.assertEqual(
+                timeline.slice(0, 0.1).pcm_s16le,
+                first.pcm_s16le,
+            )
+        finally:
+            timeline.close()
+
     def test_pcm_rms_distinguishes_voice_and_silence(self):
         self.assertEqual(pcm_rms(chunk(0, 0)), 0)
         self.assertGreater(pcm_rms(chunk(2000, 0)), 0.05)

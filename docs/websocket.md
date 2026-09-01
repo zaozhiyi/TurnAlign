@@ -241,6 +241,11 @@ backpressure count, dropped-partial count and output-backpressure timeout count.
 Every accepted internal audio chunk is appended to a disk-backed in-process
 recovery timeline. After each binary client frame the server returns:
 
+Timeline appends are transactional at the file boundary: short writes or flush
+failures don't advance recovery metadata and are truncated back to the previous
+length. If that rollback itself fails, the temporary file is closed immediately
+rather than retaining unaccounted audio on disk.
+
 ```json
 {
   "type": "audio_ack",
