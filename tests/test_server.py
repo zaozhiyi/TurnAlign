@@ -296,11 +296,15 @@ class ServerConfigurationTests(unittest.IsolatedAsyncioTestCase):
     async def test_rejects_invalid_lifecycle_limits_before_binding(self):
         for options, message in (
             ({"port": -1}, "port"),
+            ({"port": True}, "port"),
+            ({"internal_chunk_ms": 20.5}, "internal_chunk_ms"),
             ({"initialization_timeout": 0}, "initialization_timeout"),
+            ({"initialization_timeout": True}, "initialization_timeout"),
             ({"finalization_timeout": 0}, "finalization_timeout"),
             ({"worker_shutdown_timeout": 0}, "worker_shutdown_timeout"),
             ({"output_backpressure_timeout": 0}, "output_backpressure_timeout"),
             ({"max_recovery_events": 0}, "max_recovery_events"),
+            ({"max_recovery_events": 1.5}, "max_recovery_events"),
             ({"max_recovery_event_bytes": 0}, "max_recovery_event_bytes"),
             ({
                 "max_recovery_event_bytes": 9,
@@ -314,6 +318,7 @@ class ServerConfigurationTests(unittest.IsolatedAsyncioTestCase):
                 "max_recovery_total_bytes": 8,
             }, "cannot exceed"),
             ({"max_concurrent_sessions": 0}, "max_concurrent_sessions"),
+            ({"max_concurrent_sessions": True}, "max_concurrent_sessions"),
             ({"start_timeout": 0}, "start_timeout"),
             ({"client_idle_timeout": 0}, "client_idle_timeout"),
             ({"shutdown_grace_timeout": 0}, "shutdown_grace_timeout"),
@@ -322,8 +327,10 @@ class ServerConfigurationTests(unittest.IsolatedAsyncioTestCase):
             ({"max_control_message_bytes": True}, "max_control_message_bytes"),
             ({"max_control_message_bytes": 1024 * 1024 + 1}, "max_control_message_bytes"),
             ({"backend_replicas": 0}, "backend_replicas"),
+            ({"backend_replicas": 1.5}, "backend_replicas"),
             ({"backend_replicas": 9}, "backend_replicas"),
             ({"allowed_origins": ()}, "allowed_origins"),
+            ({"allowed_origins": "https://app.example"}, "allowed_origins"),
             ({"allowed_origins": (None, "")}, "allowed_origins"),
         ):
             with self.subTest(options=options), self.assertRaisesRegex(ValueError, message):

@@ -25,6 +25,12 @@ class RecoveryEventLimitError(RuntimeError):
     pass
 
 
+def _require_positive_int(name: str, value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
 @dataclass(slots=True)
 class RecoverySession:
     session_id: str
@@ -58,20 +64,17 @@ class RecoveryStore:
         max_audio_bytes_per_session: int = 512 * 1024 * 1024,
         max_total_audio_bytes: int = 2 * 1024 * 1024 * 1024,
     ) -> None:
-        if max_sessions <= 0:
-            raise ValueError("max_sessions must be positive")
-        if max_events_per_session <= 0:
-            raise ValueError("max_events_per_session must be positive")
-        if max_event_bytes <= 0:
-            raise ValueError("max_event_bytes must be positive")
-        if max_event_bytes_per_session <= 0:
-            raise ValueError("max_event_bytes_per_session must be positive")
+        for name, value in (
+            ("max_sessions", max_sessions),
+            ("max_events_per_session", max_events_per_session),
+            ("max_event_bytes", max_event_bytes),
+            ("max_event_bytes_per_session", max_event_bytes_per_session),
+            ("max_audio_bytes_per_session", max_audio_bytes_per_session),
+            ("max_total_audio_bytes", max_total_audio_bytes),
+        ):
+            _require_positive_int(name, value)
         if max_event_bytes > max_event_bytes_per_session:
             raise ValueError("max_event_bytes cannot exceed max_event_bytes_per_session")
-        if max_audio_bytes_per_session <= 0:
-            raise ValueError("max_audio_bytes_per_session must be positive")
-        if max_total_audio_bytes <= 0:
-            raise ValueError("max_total_audio_bytes must be positive")
         if max_audio_bytes_per_session > max_total_audio_bytes:
             raise ValueError(
                 "max_audio_bytes_per_session cannot exceed max_total_audio_bytes"

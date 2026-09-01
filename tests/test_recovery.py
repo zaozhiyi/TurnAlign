@@ -119,6 +119,19 @@ class RecoveryStoreTests(unittest.TestCase):
                 max_audio_bytes_per_session=10,
                 max_total_audio_bytes=8,
             )
+        for name in (
+            "max_sessions",
+            "max_events_per_session",
+            "max_event_bytes",
+            "max_event_bytes_per_session",
+            "max_audio_bytes_per_session",
+            "max_total_audio_bytes",
+        ):
+            for invalid in (True, 1.5):
+                with self.subTest(name=name, invalid=invalid), self.assertRaisesRegex(
+                    ValueError, name
+                ):
+                    RecoveryStore(**{name: invalid})
 
     def test_audio_capacity_is_bounded_and_completed_audio_is_released(self):
         store = RecoveryStore(

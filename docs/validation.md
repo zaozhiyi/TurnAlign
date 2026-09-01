@@ -77,6 +77,9 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   not send the initial start message or become idle. Initialization, worker
   shutdown, output pressure and recovery-event retention are independently
   bounded and configurable.
+- Lifecycle, queue, recovery and replica capacities reject booleans, fractional
+  values and malformed origin collections before binding. This prevents public
+  API configuration coercion from silently changing admission or trust policy.
 - The same listener now serves minimal `/healthz` and `/readyz` probes, disables
   WebSocket compression, rejects browser origins unless explicitly allowed, and
   performs bounded graceful shutdown. An isolated subprocess test sends a real

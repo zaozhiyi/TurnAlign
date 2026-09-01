@@ -42,6 +42,23 @@ _MAX_WEBSOCKET_MESSAGE_BYTES = 16 * 1024 * 1024
 _MAX_PENDING_WEBSOCKET_FRAMES = 4
 
 
+def _require_positive_int(name: str, value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def _require_positive_finite(name: str, value: object) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value <= 0
+    ):
+        raise ValueError(f"{name} must be finite and positive")
+    return float(value)
+
+
 class _ServerMetrics:
     """Thread-safe, label-free counters that never retain transcript data."""
 
@@ -367,9 +384,13 @@ async def serve(
 ) -> None:
     policy = policy or ServerPolicy.defaults(default_backend, default_model)
     policy.validate_bind(host)
-    if not 0 <= port <= 65_535:
+    if isinstance(port, bool) or not isinstance(port, int) or not 0 <= port <= 65_535:
         raise ValueError("port must be between 0 and 65535")
-    if not 20 <= internal_chunk_ms <= 100:
+    if (
+        isinstance(internal_chunk_ms, bool)
+        or not isinstance(internal_chunk_ms, int)
+        or not 20 <= internal_chunk_ms <= 100
+    ):
         raise ValueError("internal_chunk_ms must be between 20 and 100")
     for name, value in (
         ("initialization_timeout", initialization_timeout),
@@ -381,25 +402,22 @@ async def serve(
         ("shutdown_grace_timeout", shutdown_grace_timeout),
         ("recovery_ttl_seconds", recovery_ttl_seconds),
     ):
-        if not math.isfinite(value) or value <= 0:
-            raise ValueError(f"{name} must be finite and positive")
-    if max_recovery_events <= 0:
-        raise ValueError("max_recovery_events must be positive")
-    if max_recovery_event_bytes <= 0:
-        raise ValueError("max_recovery_event_bytes must be positive")
-    if max_recovery_event_bytes_per_session <= 0:
-        raise ValueError("max_recovery_event_bytes_per_session must be positive")
+        _require_positive_finite(name, value)
+    for name, value in (
+        ("max_recovery_events", max_recovery_events),
+        ("max_recovery_event_bytes", max_recovery_event_bytes),
+        ("max_recovery_event_bytes_per_session", max_recovery_event_bytes_per_session),
+        ("max_recovery_sessions", max_recovery_sessions),
+        ("max_recovery_audio_bytes", max_recovery_audio_bytes),
+        ("max_recovery_total_bytes", max_recovery_total_bytes),
+        ("max_concurrent_sessions", max_concurrent_sessions),
+    ):
+        _require_positive_int(name, value)
     if max_recovery_event_bytes > max_recovery_event_bytes_per_session:
         raise ValueError(
             "max_recovery_event_bytes cannot exceed "
             "max_recovery_event_bytes_per_session"
         )
-    if max_recovery_sessions <= 0:
-        raise ValueError("max_recovery_sessions must be positive")
-    if max_recovery_audio_bytes <= 0:
-        raise ValueError("max_recovery_audio_bytes must be positive")
-    if max_recovery_total_bytes <= 0:
-        raise ValueError("max_recovery_total_bytes must be positive")
     if max_recovery_audio_bytes > max_recovery_total_bytes:
         raise ValueError(
             "max_recovery_audio_bytes cannot exceed max_recovery_total_bytes"
@@ -410,13 +428,15 @@ async def serve(
         or not 1 <= max_control_message_bytes <= 1024 * 1024
     ):
         raise ValueError("max_control_message_bytes must be between 1 and 1048576")
-    if max_concurrent_sessions <= 0:
-        raise ValueError("max_concurrent_sessions must be positive")
-    if not 1 <= backend_replicas <= 8:
+    if (
+        isinstance(backend_replicas, bool)
+        or not isinstance(backend_replicas, int)
+        or not 1 <= backend_replicas <= 8
+    ):
         raise ValueError("backend_replicas must be between 1 and 8")
     if not isinstance(require_immutable_revision, bool):
         raise TypeError("require_immutable_revision must be a boolean")
-    if not allowed_origins or any(
+    if not isinstance(allowed_origins, tuple) or not allowed_origins or any(
         origin is not None and (not isinstance(origin, str) or not origin.strip())
         for origin in allowed_origins
     ):
