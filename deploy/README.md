@@ -57,6 +57,12 @@ Model weights must be downloaded ahead of deployment under the `turnalign`
 account. The unit starts with `--preload`, a real warm-up inference, and
 `--require-immutable-model-revision`; missing dependencies, weights, or an
 unreadable warm-up file therefore fail before the socket is ready.
+The reference unit also applies `IPAddressDeny=any` with
+`IPAddressAllow=localhost`: the model process can accept Nginx and host-local
+monitoring traffic but cannot fetch weights, call third-party APIs, or otherwise
+open Internet connections. Complete every download and cache validation before
+starting the service. A backend that genuinely requires remote inference is not
+compatible with this reference profile and needs a separately reviewed unit.
 
 ## 2. Install the service
 

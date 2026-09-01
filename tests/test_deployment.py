@@ -53,6 +53,8 @@ class DeploymentArtifactTests(unittest.TestCase):
             "ProtectHome=true",
             "CapabilityBoundingSet=",
             "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+            "IPAddressDeny=any",
+            "IPAddressAllow=localhost",
         ):
             self.assertIn(setting, content)
 

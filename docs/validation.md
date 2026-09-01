@@ -152,6 +152,9 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   Ubuntu CI also parses the real unit with `systemd-analyze verify` and the
   proxy configuration with `nginx -t` using an ephemeral self-signed test
   certificate.
+- The CPU unit denies all IP traffic except localhost. This preserves Nginx,
+  readiness and host-local metrics access while making the documented
+  prefetch-only model/dependency assumption an enforced egress boundary.
 - CodeQL runs the extended Python security query suite on pull requests and
   uploads trusted main/scheduled results to code scanning. Fork pull requests
   analyze without upload because their token is intentionally read-only. All
