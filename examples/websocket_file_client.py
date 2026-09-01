@@ -29,7 +29,10 @@ async def main() -> None:
                 "sample_rate": source.getframerate(),
                 "channels": source.getnchannels(),
             }))
-            print(await socket.recv())
+            ready = json.loads(await socket.recv())
+            public_ready = dict(ready)
+            public_ready.pop("resume_token", None)
+            print(json.dumps(public_ready, ensure_ascii=False))
             can_send = asyncio.Event()
             can_send.set()
 

@@ -154,7 +154,8 @@ Private hotword/context values are never copied into ready, event or error
 messages; only counts and usage flags are exposed.
 `resume_token` is the exception: it is a per-session credential returned only
 to the client and required for recovery. Keep it out of logs, URLs, analytics,
-and persisted transcripts.
+and persisted transcripts. Clients that don't implement recovery should discard
+it immediately after parsing `ready`; diagnostic output should redact the field.
 
 Segmentation controls are finite and bounded: `vad_threshold` is 0–1,
 `silence_seconds` is 0.1–10, `max_utterance_seconds` is 1–300, and
