@@ -36,10 +36,18 @@ class BackendPool:
     """Reuse bounded model replicas and serialize each unsafe instance."""
 
     def __init__(self, max_entries: int = 8, max_entries_per_key: int = 1) -> None:
-        if max_entries <= 0:
-            raise ValueError("max_entries must be positive")
-        if max_entries_per_key <= 0:
-            raise ValueError("max_entries_per_key must be positive")
+        if (
+            isinstance(max_entries, bool)
+            or not isinstance(max_entries, int)
+            or max_entries <= 0
+        ):
+            raise ValueError("max_entries must be a positive integer")
+        if (
+            isinstance(max_entries_per_key, bool)
+            or not isinstance(max_entries_per_key, int)
+            or max_entries_per_key <= 0
+        ):
+            raise ValueError("max_entries_per_key must be a positive integer")
         if max_entries_per_key > max_entries:
             raise ValueError("max_entries_per_key cannot exceed max_entries")
         self.max_entries = max_entries

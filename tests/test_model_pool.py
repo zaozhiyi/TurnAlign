@@ -19,6 +19,14 @@ class FailingCloseBackend(FakeBackend):
 
 
 class BackendPoolTests(unittest.TestCase):
+    def test_capacity_requires_strict_positive_integers(self):
+        for name in ("max_entries", "max_entries_per_key"):
+            for value in (True, 1.5):
+                with self.subTest(name=name, value=value), self.assertRaisesRegex(
+                    ValueError, name
+                ):
+                    BackendPool(**{name: value})
+
     def test_per_config_replicas_allow_parallel_leases_then_reuse(self):
         pool = BackendPool(max_entries=2, max_entries_per_key=2)
         created = []

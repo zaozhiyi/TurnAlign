@@ -2,11 +2,38 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from math import isfinite
-from typing import Any, Literal
+from typing import Any, Literal, TypeGuard
 
 
-def _valid_range(start: float, end: float) -> bool:
-    return isfinite(start) and isfinite(end) and start >= 0 and end >= start
+def _finite_number(value: object) -> TypeGuard[int | float]:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and isfinite(value)
+    )
+
+
+def _valid_range(start: object, end: object) -> bool:
+    return (
+        _finite_number(start)
+        and _finite_number(end)
+        and start >= 0
+        and end >= start
+    )
+
+
+def _valid_confidence(value: object) -> bool:
+    return value is None or (
+        _finite_number(value) and 0 <= value <= 1
+    )
+
+
+def _positive_int(value: object) -> bool:
+    return not isinstance(value, bool) and isinstance(value, int) and value > 0
+
+
+def _non_negative_int(value: object) -> bool:
+    return not isinstance(value, bool) and isinstance(value, int) and value >= 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,10 +45,14 @@ class AudioChunk:
     is_final: bool = False
 
     def __post_init__(self) -> None:
-        if not isfinite(self.start) or self.start < 0:
+        if not isinstance(self.pcm_s16le, bytes):
+            raise TypeError("PCM data must be bytes")
+        if not _valid_range(self.start, self.start):
             raise ValueError("audio chunk start must be non-negative")
-        if self.sample_rate <= 0 or self.channels <= 0:
-            raise ValueError("sample_rate and channels must be positive")
+        if not _positive_int(self.sample_rate) or not _positive_int(self.channels):
+            raise ValueError("sample_rate and channels must be positive integers")
+        if not isinstance(self.is_final, bool):
+            raise TypeError("is_final must be a boolean")
         frame_bytes = 2 * self.channels
         if len(self.pcm_s16le) % frame_bytes:
             raise ValueError("PCM data must contain complete signed 16-bit frames")
@@ -45,10 +76,18 @@ class SpeechSegment:
     def __post_init__(self) -> None:
         if not _valid_range(self.start, self.end):
             raise ValueError("invalid speech segment time range")
-        if not self.chunks:
+        if (
+            not isinstance(self.chunks, list)
+            or not self.chunks
+            or not all(isinstance(chunk, AudioChunk) for chunk in self.chunks)
+        ):
             raise ValueError("speech segment must contain audio chunks")
-        if self.confidence is not None and not 0 <= self.confidence <= 1:
+        if not _valid_confidence(self.confidence):
             raise ValueError("speech confidence must be between zero and one")
+        if not isinstance(self.forced_split, bool):
+            raise TypeError("forced_split must be a boolean")
+        if not isinstance(self.metadata, dict):
+            raise TypeError("speech metadata must be a dictionary")
 
 
 @dataclass(slots=True)
@@ -60,8 +99,14 @@ class Word:
     speaker: str | None = None
 
     def __post_init__(self) -> None:
+        if not isinstance(self.text, str):
+            raise TypeError("word text must be a string")
         if not _valid_range(self.start, self.end):
             raise ValueError("invalid word time range")
+        if not _valid_confidence(self.confidence):
+            raise ValueError("word confidence must be between zero and one")
+        if self.speaker is not None and not isinstance(self.speaker, str):
+            raise TypeError("word speaker must be a string")
 
 
 @dataclass(slots=True)
@@ -75,8 +120,12 @@ class SpeakerTurn:
     def __post_init__(self) -> None:
         if not _valid_range(self.start, self.end):
             raise ValueError("invalid speaker turn time range")
-        if not self.speaker:
+        if not isinstance(self.speaker, str) or not self.speaker:
             raise ValueError("speaker must not be empty")
+        if not _valid_confidence(self.confidence):
+            raise ValueError("speaker confidence must be between zero and one")
+        if not isinstance(self.overlap, bool):
+            raise TypeError("overlap must be a boolean")
 
 
 @dataclass(slots=True)
@@ -91,11 +140,26 @@ class Hypothesis:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        if not isinstance(self.text, str):
+            raise TypeError("hypothesis text must be a string")
         if not _valid_range(self.start, self.end):
             raise ValueError("invalid hypothesis time range")
+        if not isinstance(self.words, list) or not all(
+            isinstance(word, Word) for word in self.words
+        ):
+            raise TypeError("hypothesis words must be Word objects")
+        if self.language is not None and not isinstance(self.language, str):
+            raise TypeError("hypothesis language must be a string")
+        if not _valid_confidence(self.confidence):
+            raise ValueError("hypothesis confidence must be between zero and one")
+        if not isinstance(self.final, bool):
+            raise TypeError("hypothesis final must be a boolean")
+        if not isinstance(self.metadata, dict):
+            raise TypeError("hypothesis metadata must be a dictionary")
 
 
 EventKind = Literal["partial", "commit", "replace", "speaker_merge", "end"]
+_EVENT_KINDS = frozenset({"partial", "commit", "replace", "speaker_merge", "end"})
 
 
 @dataclass(slots=True)
@@ -116,22 +180,41 @@ class TranscriptEvent:
     acknowledged_sequence: int | None = None
 
     def __post_init__(self) -> None:
-        if not self.segment_id:
+        if self.kind not in _EVENT_KINDS:
+            raise ValueError("unknown event kind")
+        if not isinstance(self.segment_id, str) or not self.segment_id:
             raise ValueError("segment_id must not be empty")
-        if self.revision < 1:
+        if not _positive_int(self.revision):
             raise ValueError("revision must be at least 1")
-        if self.protocol_version < 1:
+        if not _positive_int(self.protocol_version):
             raise ValueError("protocol_version must be at least 1")
-        if self.sequence is not None and self.sequence < 0:
+        if self.sequence is not None and not _non_negative_int(self.sequence):
             raise ValueError("sequence must be non-negative")
-        if self.acknowledged_sequence is not None and self.acknowledged_sequence < 0:
+        if (
+            self.acknowledged_sequence is not None
+            and not _non_negative_int(self.acknowledged_sequence)
+        ):
             raise ValueError("acknowledged_sequence must be non-negative")
         if self.source_timestamp is not None and (
-            not isfinite(self.source_timestamp) or self.source_timestamp < 0
+            not _finite_number(self.source_timestamp) or self.source_timestamp < 0
         ):
             raise ValueError("source_timestamp must be non-negative")
         if not _valid_range(self.start, self.end):
             raise ValueError("invalid event time range")
+        if not isinstance(self.text, str):
+            raise TypeError("event text must be a string")
+        if not isinstance(self.words, list) or not all(
+            isinstance(word, Word) for word in self.words
+        ):
+            raise TypeError("event words must be Word objects")
+        if self.speaker is not None and not isinstance(self.speaker, str):
+            raise TypeError("event speaker must be a string")
+        if not isinstance(self.metadata, dict):
+            raise TypeError("event metadata must be a dictionary")
+        if self.session_id is not None and (
+            not isinstance(self.session_id, str) or not self.session_id
+        ):
+            raise ValueError("session_id must be a non-empty string")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

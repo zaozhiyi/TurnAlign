@@ -94,6 +94,45 @@ class ModelTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "sequence"):
             TranscriptEvent("partial", "s", 1, 0, 1, sequence=-1)
 
+    def test_protocol_models_reject_boolean_numeric_fields(self):
+        for field, value in (
+            ("revision", True),
+            ("protocol_version", True),
+            ("sequence", False),
+            ("acknowledged_sequence", False),
+            ("start", True),
+            ("end", True),
+            ("source_timestamp", True),
+        ):
+            payload = {
+                "kind": "partial",
+                "segment_id": "s",
+                "revision": 1,
+                "start": 0,
+                "end": 1,
+                field: value,
+            }
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                TranscriptEvent.from_dict(payload)
+        with self.assertRaises(ValueError):
+            TranscriptEvent.from_dict({
+                "kind": "unknown",
+                "segment_id": "s",
+                "revision": 1,
+                "start": 0,
+                "end": 1,
+            })
+
+    def test_audio_chunk_rejects_ambiguous_runtime_types(self):
+        for options in (
+            {"sample_rate": True},
+            {"channels": 1.5},
+            {"start": False},
+            {"is_final": 1},
+        ):
+            with self.subTest(options=options), self.assertRaises((TypeError, ValueError)):
+                AudioChunk(bytes(4), 0, **options)
+
 
 class ValidationTests(unittest.TestCase):
     def test_partial_commit_replace_end_sequence(self):
