@@ -482,6 +482,10 @@ def _read_linux_boot_id() -> str:
 
 
 def _installed_runtime_identity(source_commit: str | None = None) -> dict[str, str]:
+    if sys.flags.isolated != 1 or not sys.dont_write_bytecode:
+        raise ValueError(
+            "production host commands require Python -I -B before -m turnalign.cli"
+        )
     try:
         package_resource = importlib.resources.files("turnalign")
         embedded_identity = package_resource.joinpath("_source_commit.txt").read_text(

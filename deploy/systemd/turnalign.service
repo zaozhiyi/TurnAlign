@@ -14,12 +14,10 @@ WorkingDirectory=/var/lib/turnalign
 StateDirectory=turnalign
 CacheDirectory=turnalign
 Environment=HOME=/var/lib/turnalign
-Environment=PYTHONUNBUFFERED=1
-Environment=PYTHONDONTWRITEBYTECODE=1
 LoadCredential=auth-token:/etc/turnalign/auth-token
 ExecStartPre=/usr/bin/test -r /var/lib/turnalign/warmup.wav
 ExecStartPre=/usr/bin/test -s ${CREDENTIALS_DIRECTORY}/auth-token
-ExecStart=/opt/turnalign/current/venv/bin/turnalign serve \
+ExecStart=/opt/turnalign/current/venv/bin/python -I -B -u -m turnalign.cli serve \
   --host 127.0.0.1 \
   --port 8765 \
   --backend funasr-streaming \

@@ -249,17 +249,23 @@ def validate_systemd_service(content: bytes) -> tuple[str, ...]:
     except ValueError:
         tokens = []
     if (
-        len(tokens) < 2
+        len(tokens) < 7
         or not tokens[0].startswith("/")
-        or tokens[0].rsplit("/", 1)[-1] != "turnalign"
-        or tokens[1] != "serve"
+        or tokens[:7] != [
+            "/opt/turnalign/current/venv/bin/python",
+            "-I",
+            "-B",
+            "-u",
+            "-m",
+            "turnalign.cli",
+            "serve",
+        ]
     ):
-        failures.append("systemd ExecStart must invoke an absolute TurnAlign serve command")
-        return tuple(failures)
-    if tokens[0] != "/opt/turnalign/current/venv/bin/turnalign":
         failures.append(
-            "systemd ExecStart must use the version-switchable current release path"
+            "systemd ExecStart must invoke TurnAlign through the isolated "
+            "versioned Python runtime"
         )
+        return tuple(failures)
     if "--allow-remote" in tokens:
         failures.append("systemd service must not enable TurnAlign remote binding")
     if tokens.count("--preload") != 1:

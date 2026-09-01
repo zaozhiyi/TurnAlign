@@ -22,7 +22,10 @@ class DeploymentArtifactTests(unittest.TestCase):
         content = SERVICE.read_text(encoding="utf-8")
         for setting in (
             "--host 127.0.0.1",
-            "ExecStart=/opt/turnalign/current/venv/bin/turnalign serve",
+            (
+                "ExecStart=/opt/turnalign/current/venv/bin/python "
+                "-I -B -u -m turnalign.cli serve"
+            ),
             "--preload",
             "--warmup-file /var/lib/turnalign/warmup.wav",
             "--require-immutable-model-revision",

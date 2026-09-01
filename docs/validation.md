@@ -90,7 +90,8 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   names, sizes and SHA-256 digests. It also revalidates both rehearsal
   transitions, systemd/readiness exit evidence, complete per-phase WebSocket
   reports, candidate restoration, and restored backend/model identity.
-- `/opt/turnalign/current/venv/bin/turnalign host-profile` must run from the
+- `/opt/turnalign/current/venv/bin/python -I -B -u -m turnalign.cli host-profile` must
+  run from the
   active candidate on the Linux target host. It derives the source commit from
   the installed Wheel instead of requiring a production Git checkout, records
   bounded platform inventory plus the current Linux boot identity, and binds
@@ -100,7 +101,10 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   retained artifact. Schema 4 rejects a source checkout shadowing the installed
   package, non-root-owned or writable package files, symlinks, and any missing,
   modified or extra file (including bytecode) relative to the retained Wheel.
-  Run root-only deployment rehearsals with `PYTHONDONTWRITEBYTECODE=1`. The
+  Production service and administrative commands use the exact versioned
+  `python -I -B -u -m turnalign.cli` prefix, which isolates environment/user
+  import paths, disables bytecode creation, keeps logs unbuffered, and removes
+  the generated console launcher from the trust boundary. The
   aggregate gate independently revalidates that complete set and requires the
   host profile and rollback
   rehearsal to come from the same boot, so another installation, host run or

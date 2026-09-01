@@ -8,6 +8,7 @@ import unittest
 import zipfile
 from os import fstat as real_fstat
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from turnalign import production_gate as production_gate_module
@@ -891,6 +892,20 @@ class ProductionGateTests(unittest.TestCase):
     def test_runtime_identity_requires_the_bound_versioned_wheel(self):
         source_commit = "b" * 40
         prefix = f"/opt/turnalign/releases/{source_commit}/venv"
+        flags_patch = patch.object(
+            production_gate_module.sys,
+            "flags",
+            SimpleNamespace(isolated=1),
+        )
+        bytecode_patch = patch.object(
+            production_gate_module.sys,
+            "dont_write_bytecode",
+            True,
+        )
+        flags_patch.start()
+        bytecode_patch.start()
+        self.addCleanup(flags_patch.stop)
+        self.addCleanup(bytecode_patch.stop)
 
         class SourceIdentity:
             def __init__(self, value: str):
@@ -957,6 +972,18 @@ class ProductionGateTests(unittest.TestCase):
             return_value=SourceIdentity(f"{'c' * 40}\n"),
         ), self.assertRaisesRegex(ValueError, "does not match the candidate"):
             production_gate_module._installed_runtime_identity(source_commit)
+
+    def test_runtime_identity_requires_isolated_no_bytecode_python(self):
+        with patch.object(
+            production_gate_module.sys,
+            "flags",
+            SimpleNamespace(isolated=0),
+        ), patch.object(
+            production_gate_module.sys,
+            "dont_write_bytecode",
+            False,
+        ), self.assertRaisesRegex(ValueError, "Python -I -B"):
+            production_gate_module._installed_runtime_identity("b" * 40)
 
     @unittest.skipUnless(
         production_gate_module.os.name == "posix",
@@ -1061,10 +1088,22 @@ class ProductionGateTests(unittest.TestCase):
                 ),
                 (
                     (
-                        "/opt/turnalign/current/venv/bin/turnalign",
-                        "/opt/turnalign/venv/bin/turnalign",
+                        "/opt/turnalign/current/venv/bin/python -I -B -u",
+                        "/opt/turnalign/venv/bin/python -I -B -u",
                     ),
-                    "version-switchable current release path",
+                    "isolated versioned Python runtime",
+                ),
+                (
+                    ("bin/python -I -B -u -m", "bin/python -B -u -m"),
+                    "isolated versioned Python runtime",
+                ),
+                (
+                    ("bin/python -I -B -u -m", "bin/python -I -u -m"),
+                    "isolated versioned Python runtime",
+                ),
+                (
+                    ("bin/python -I -B -u -m", "bin/python -I -B -m"),
+                    "isolated versioned Python runtime",
                 ),
             ):
                 artifacts = self._artifacts(root)

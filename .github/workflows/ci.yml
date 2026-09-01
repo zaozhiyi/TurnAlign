@@ -47,7 +47,7 @@ jobs:
           fi
           sudo install -d /opt/turnalign/current/venv/bin /etc/turnalign /var/lib/turnalign
           sudo install -m 0755 /usr/bin/true \
-            /opt/turnalign/current/venv/bin/turnalign
+            /opt/turnalign/current/venv/bin/python
           sudo install -m 0600 /dev/null /etc/turnalign/auth-token
           sudo touch /var/lib/turnalign/warmup.wav
           systemd-analyze verify deploy/systemd/turnalign.service

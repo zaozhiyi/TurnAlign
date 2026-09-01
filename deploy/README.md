@@ -69,7 +69,7 @@ VCS, local-path, unhashed, unlocked and build-only components fail.
 
 The example paths assume:
 
-- executable: `/opt/turnalign/current/venv/bin/turnalign`
+- executable: `/opt/turnalign/current/venv/bin/python -I -B -u -m turnalign.cli`
 - service account: `turnalign`
 - state/model cache: `/var/lib/turnalign`
 - root-only authentication credential: `/etc/turnalign/auth-token`
@@ -183,8 +183,8 @@ Before routing users, retain all of the following with the release artifact:
    symlink and systemd path:
 
    ```bash
-   sudo PYTHONDONTWRITEBYTECODE=1 \
-     /opt/turnalign/current/venv/bin/turnalign deployment-rehearsal \
+   sudo /opt/turnalign/current/venv/bin/python -I -B -u -m turnalign.cli \
+     deployment-rehearsal \
      wss://asr.example.com/ws \
      --previous-commit <preceding-source-commit> \
      --candidate-commit <candidate-source-commit> \
@@ -193,9 +193,12 @@ Before routing users, retain all of the following with the release artifact:
      --report rollback-rehearsal.json
    ```
 
-   Keep bytecode generation disabled for this root-run command: the final gate
-   requires the installed package tree to equal the reviewed Wheel exactly and
-   therefore rejects added `__pycache__`/`.pyc` files. The command refuses
+   Keep the exact `-I -B -u -m turnalign.cli` prefix: it ignores environment/user
+   import paths, bypasses the installer-generated console launcher, disables
+   bytecode generation, and keeps journal output unbuffered. The final gate
+   requires the installed package tree to
+   equal the reviewed Wheel exactly and therefore rejects added
+   `__pycache__`/`.pyc` files. The command refuses
    non-Linux/non-root execution, an unbound candidate
    runtime, mutable or non-root-owned release directories, a non-public probe,
    and any initial active release other than the candidate. A root-only
@@ -214,7 +217,8 @@ Before routing users, retain all of the following with the release artifact:
 
 Persist each gate with `--report`, generate retained-model provenance with
 `turnalign model-manifest`, and run
-`/opt/turnalign/current/venv/bin/turnalign host-profile` on the target host after
+`/opt/turnalign/current/venv/bin/python -I -B -u -m turnalign.cli host-profile` on the
+target host after
 activating the candidate and finalizing the other eleven artifact classes. The
 command reads the commit embedded in the installed Wheel, so the production
 host does not need a Git checkout. It refuses non-Linux hosts, source checkouts,
