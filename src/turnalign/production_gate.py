@@ -45,6 +45,8 @@ _MAX_REPORT_BYTES = 2 * 1024 * 1024
 _MAX_SBOM_BYTES = 16 * 1024 * 1024
 _MAX_LOCK_BYTES = 4 * 1024 * 1024
 _MAX_MODEL_MANIFEST_BYTES = 2 * 1024 * 1024
+_MAX_MODEL_FILES = 65_536
+_MAX_MODEL_BYTES = 64 * 1024 * 1024 * 1024
 _MAX_HOST_PROFILE_BYTES = 2 * 1024 * 1024
 _MAX_DEPLOYMENT_ACTIVATION_BYTES = 8 * 1024 * 1024
 _MAX_ROLLBACK_REHEARSAL_BYTES = 8 * 1024 * 1024
@@ -412,11 +414,52 @@ def _valid_model_id(value: object) -> bool:
     )
 
 
+def enumerate_model_files(model_root: Path) -> list[Path]:
+    """Safely enumerate every regular file retained under a model root."""
+
+    try:
+        resolved_root = model_root.resolve(strict=True)
+        root_metadata = model_root.lstat()
+    except OSError as error:
+        raise ValueError(f"model_root is unavailable: {model_root}") from error
+    if stat.S_ISLNK(root_metadata.st_mode) or not resolved_root.is_dir():
+        raise ValueError(f"model_root must be a non-symlink directory: {model_root}")
+
+    entries: list[Path] = []
+    total_size = 0
+    for directory, directory_names, file_names in os.walk(
+        resolved_root,
+        topdown=True,
+        followlinks=False,
+    ):
+        directory_names.sort()
+        file_names.sort()
+        directory_path = Path(directory)
+        for name in directory_names:
+            child = directory_path / name
+            metadata = child.lstat()
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                raise ValueError(f"model tree contains an unsafe directory: {child}")
+        for name in file_names:
+            child = directory_path / name
+            metadata = child.lstat()
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                raise ValueError(f"model tree contains an unsafe file: {child}")
+            if metadata.st_size <= 0:
+                raise ValueError(f"model tree contains an empty file: {child}")
+            total_size += metadata.st_size
+            if len(entries) >= _MAX_MODEL_FILES or total_size > _MAX_MODEL_BYTES:
+                raise ValueError("model tree exceeds production evidence limits")
+            entries.append(child)
+    if not entries:
+        raise ValueError(f"model_root contains no regular files: {model_root}")
+    return entries
+
+
 def create_model_manifest(
     model_id: str,
     model_revision: str,
     model_root: Path,
-    files: list[Path],
 ) -> dict[str, object]:
     """Hash immutable model files into the schema consumed by production-gate."""
 
@@ -424,39 +467,31 @@ def create_model_manifest(
         raise ValueError("model_id must be a non-empty bounded identifier")
     if _MODEL_REVISION_PATTERN.fullmatch(model_revision) is None:
         raise ValueError("model_revision must be an immutable 40- or 64-character hash")
-    if not files:
-        raise ValueError("at least one model file is required")
-    try:
-        resolved_root = model_root.resolve(strict=True)
-    except OSError as error:
-        raise ValueError(f"model_root is unavailable: {model_root}") from error
-    if not resolved_root.is_dir():
-        raise ValueError(f"model_root must be a directory: {model_root}")
+    files = enumerate_model_files(model_root)
+    resolved_root = model_root.resolve(strict=True)
     entries = []
-    relative_paths = set()
     for path in files:
-        try:
-            resolved_path = path.resolve(strict=True)
-            relative_path = resolved_path.relative_to(resolved_root).as_posix()
-        except (OSError, ValueError) as error:
-            raise ValueError(
-                f"model file must be retained under model_root: {path}"
-            ) from error
-        if relative_path in relative_paths:
-            raise ValueError(f"model files must have unique relative paths: {relative_path}")
-        relative_paths.add(relative_path)
-        snapshot = _snapshot_evidence(resolved_path)
+        relative_path = path.relative_to(resolved_root).as_posix()
+        snapshot = _snapshot_evidence(path)
         entries.append({
             "path": relative_path,
             "sha256": snapshot.sha256,
             "bytes": snapshot.size,
         })
-    return {
+    payload: dict[str, object] = {
         "schema_version": 2,
         "model_id": model_id,
         "model_revision": model_revision,
         "files": sorted(entries, key=lambda item: cast(str, item["path"])),
     }
+    encoded = (
+        json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
+    ).encode("utf-8")
+    if len(encoded) > _MAX_MODEL_MANIFEST_BYTES:
+        raise ValueError(
+            f"model manifest exceeds {_MAX_MODEL_MANIFEST_BYTES} encoded bytes"
+        )
+    return payload
 
 
 def create_host_profile(

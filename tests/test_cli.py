@@ -665,7 +665,14 @@ class CliIntegrationTests(unittest.TestCase):
                 "a" * 40,
             ]
             for kind in sorted(cli.REQUIRED_ARTIFACT_KINDS):
+                if kind == "model":
+                    continue
                 arguments.extend(("--artifact", f"{kind}={kind}.evidence"))
+            model_root = root / "model"
+            (model_root / "encoder").mkdir(parents=True)
+            (model_root / "weights.bin").write_bytes(b"weights")
+            (model_root / "encoder" / "config.json").write_bytes(b"config")
+            arguments.extend(("--model-root", str(model_root)))
             arguments.extend(("--report", str(output)))
             with patch.object(cli, "run_production_gate", fake_gate), patch(
                 "sys.argv", arguments
@@ -676,6 +683,14 @@ class CliIntegrationTests(unittest.TestCase):
             self.assertEqual(
                 {kind for kind, _path in captured["artifacts"]},
                 cli.REQUIRED_ARTIFACT_KINDS,
+            )
+            self.assertEqual(
+                sorted(
+                    path.relative_to(model_root.resolve()).as_posix()
+                    for kind, path in captured["artifacts"]
+                    if kind == "model"
+                ),
+                ["encoder/config.json", "weights.bin"],
             )
             self.assertEqual(
                 json.loads(output.read_text(encoding="utf-8"))["status"],
@@ -900,12 +915,6 @@ class CliIntegrationTests(unittest.TestCase):
                 "a" * 40,
                 "--model-root",
                 str(root),
-                "--file",
-                str(first),
-                "--file",
-                str(second),
-                "--file",
-                str(duplicate_basename),
                 "--output",
                 str(output),
             ]), patch("builtins.print"):
@@ -922,6 +931,73 @@ class CliIntegrationTests(unittest.TestCase):
                 cli._sha256_file(first),
             )
 
+    def test_model_manifest_rejects_empty_model_tree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "model-manifest.json"
+            with patch("sys.argv", [
+                "turnalign",
+                "model-manifest",
+                "--model-id",
+                "model",
+                "--model-revision",
+                "a" * 40,
+                "--model-root",
+                str(root),
+                "--output",
+                str(output),
+            ]), self.assertRaisesRegex(ValueError, "contains no regular files"):
+                cli.main()
+
+    def test_model_root_cannot_duplicate_explicit_model_artifacts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model = root / "model.bin"
+            model.write_bytes(b"model")
+            arguments = [
+                "turnalign",
+                "production-gate",
+                "release.json",
+                "quality.json",
+                "websocket.json",
+                "--source-commit",
+                "a" * 40,
+                "--artifact",
+                f"model={model}",
+                "--model-root",
+                str(root),
+            ]
+            with patch("sys.argv", arguments), self.assertRaisesRegex(
+                ValueError,
+                "cannot be combined",
+            ):
+                cli.main()
+
+    def test_model_manifest_rejects_oversized_encoded_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "model.bin").write_bytes(b"model")
+            arguments = [
+                "turnalign",
+                "model-manifest",
+                "--model-id",
+                "model",
+                "--model-revision",
+                "a" * 40,
+                "--model-root",
+                str(root),
+                "--output",
+                str(root.parent / "model-manifest.json"),
+            ]
+            with patch(
+                "turnalign.production_gate._MAX_MODEL_MANIFEST_BYTES",
+                1,
+            ), patch("sys.argv", arguments), self.assertRaisesRegex(
+                ValueError,
+                "model manifest exceeds",
+            ):
+                cli.main()
+
     def test_host_profile_binds_source_host_and_artifacts(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -931,9 +1007,15 @@ class CliIntegrationTests(unittest.TestCase):
                 "host-profile",
             ]
             for kind in sorted(cli.REQUIRED_ARTIFACT_KINDS - {"host-profile"}):
+                if kind == "model":
+                    continue
                 path = root / f"{kind}.evidence"
                 path.write_text(f"immutable {kind}\n", encoding="utf-8")
                 arguments.extend(("--artifact", f"{kind}={path}"))
+            model_root = root / "model"
+            model_root.mkdir()
+            (model_root / "weights.bin").write_bytes(b"weights")
+            arguments.extend(("--model-root", str(model_root)))
             arguments.extend(("--output", str(output)))
             runtime_prefix = f"/opt/turnalign/releases/{'a' * 40}/venv"
             runtime = {

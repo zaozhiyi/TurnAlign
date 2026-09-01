@@ -202,7 +202,6 @@ turnalign websocket-gate wss://asr.example/ws --sessions 8 \
 turnalign model-manifest --model-id paraformer-zh-streaming \
   --model-revision "$MODEL_REVISION" \
   --model-root /var/lib/turnalign/models/paraformer-zh-streaming \
-  --file /var/lib/turnalign/models/paraformer-zh-streaming/model.safetensors \
   --output model-manifest.json
 sudo /opt/turnalign/releases/$CANDIDATE_COMMIT/venv/bin/python \
   -I -B -u -m turnalign.cli deployment-activate \
@@ -232,7 +231,7 @@ sudo /opt/turnalign/current/venv/bin/python -I -B -u -m turnalign.cli host-profi
   --artifact sbom=sbom.cdx.json --artifact release-audio=sample-30s.wav \
   --artifact quality-reference=reference.jsonl \
   --artifact quality-hypothesis=release-events.jsonl \
-  --artifact model=/models/model.safetensors \
+  --model-root /var/lib/turnalign/models/paraformer-zh-streaming \
   --artifact model-manifest=model-manifest.json \
   --artifact nginx-config=/etc/nginx/conf.d/turnalign.conf \
   --artifact service-unit=/etc/systemd/system/turnalign.service \
@@ -248,7 +247,7 @@ turnalign production-gate release-report.json quality-report.json websocket-repo
   --artifact release-audio=sample-30s.wav \
   --artifact quality-reference=reference.jsonl \
   --artifact quality-hypothesis=release-events.jsonl \
-  --artifact model=/models/model.safetensors \
+  --model-root /var/lib/turnalign/models/paraformer-zh-streaming \
   --artifact model-manifest=model-manifest.json \
   --artifact nginx-config=/etc/nginx/conf.d/turnalign.conf \
   --artifact service-unit=/etc/systemd/system/turnalign.service \
@@ -263,6 +262,8 @@ python examples/websocket_file_client.py sample.wav --backend glm-asr --language
 `release-gate` 必须调用真实后端，而不是 mock。它会验证事件状态机、原生流式声明、首个 partial、可选的首次 commit 延迟、最少 commit 数、初始化时间和 RTF，并在任一门槛失败时返回非零退出码。默认要求至少 10 秒音频；应将 `--output` 生成的 JSONL 与命令输出一并保存为发布证据。准确率发布门禁使用人工标注 JSONL 执行 `turnalign quality-gate`：至少配置一项 CER、WER、说话人错误或修订稳定性上限，并按目标场景设定最小标注规模；任一条件失败时返回非零退出码。中文参考没有人工分词时应以 CER 为主。说话人指标是单活跃说话人区间分数，不等同于支持重叠语音与 collar 的标准 DER。阈值必须由实际产品容忍度和代表性语料得出，仓库不提供虚构的通用阈值。`turnalign evaluate` 仍可用于只生成指标、不阻断发布的分析。
 
 `websocket-gate` 使用非静音探测音频并发检查已部署服务的协议、流控、确认、完成率和延迟，不保存识别文本或恢复凭证。开发态无 `--probe-audio` 时会生成确定性的 440 Hz PCM 探测音；生产证据必须显式提供 `--probe-audio`，报告会绑定该 WAV 的 SHA-256、字节数和 RMS。默认要求每会话至少一个 commit 和 ACK 且不允许丢弃 partial，可用 `--min-commits`、`--min-audio-acks`、`--max-dropped-partials` 和 `--max-backpressure-pauses` 收紧目标环境门槛。它只证明传输与生命周期，不证明识别质量；突发测试不加 `--realtime`，长稳测试则加上该参数。生产 TLS 应由反向代理或服务网格终止，门槛直接访问外部 `wss://` 地址。非浏览器客户默认允许；浏览器 Origin 默认拒绝，必须用 `--allow-origin` 精确放行。`GET /healthz` 和 `GET /readyz` 可用作存活/就绪探针；仅回环访问的 `GET /metrics` 提供不含标签、文本和凭证的 Prometheus 运行指标，示例 Nginx 明确拒绝公网 `/metrics`。进程收到 `SIGTERM` 后会停止接入、关闭现有连接并在 `--shutdown-grace-timeout` 后强制取消未退出的处理器。恢复音频默认限制为每会话 512 MiB、每进程 2 GiB，完成后立即释放临时文件；断线会话的默认恢复窗口为 300 秒，超时由后台任务自动清理。相关上限均可通过 `serve --help` 调整。服务进程默认最多接受 32 个会话，但同一模型默认只有一个实例；需要进程内并行时显式设置 `--backend-replicas N`（最多 8，模型内存也近似乘以 N），或部署多个单副本进程。生产服务应加 `--preload`，在监听端口前加载全部副本；配合 `--warmup-file` 可在启动阶段执行真实推理。首次消息、客户端空闲、模型初始化、结束收尾和工作线程退出时间均有界，可通过 `turnalign serve --help` 调整。命令行后端的可执行文件、模型路径和参数可由运维侧通过 `--executable`、`--model-path` 和 `--backend-option KEY=VALUE` 固定，无需开放客户端路径权限。内置后端的私密热词按租约注入并在归还时清空，不同热词会话可复用同一大模型实例。
+
+`model-manifest`、`host-profile` 和 `production-gate` 的 `--model-root` 使用同一套安全递归枚举，自动纳入目录下每个非空普通文件，并拒绝符号链接、特殊文件、空模型树及超出证据上限的模型树。不要再同时传入手工 `model` 工件；这样可以避免真实模型包含嵌套目录或同名配置文件时漏采、压平或错绑证据。
 
 ready 响应会公开非敏感的后端请求名、后端实现名、模型、设备、不可变模型 revision 和已加载本地模型文件的绝对路径/SHA-256/大小。生产服务必须用 `--preload --require-local-model`，把模型放在 root-owned、group/others 不可写且整条祖先路径不可被服务账号替换的 `/var/lib/turnalign/models` 下；可写状态使用独立的 `/var/lib/turnalign-state`。后端如不支持本地加载证据则不会通过生产门禁。`websocket-gate` 要求所有普通及恢复会话观察到完全一致的部署身份和已加载模型集，`production-gate` 再把实际后端实现、模型身份、revision 和逐文件模型证据与 release/quality/模型清单交叉校验，避免公网探测误测到另一套权重。
 
@@ -497,7 +498,6 @@ turnalign websocket-gate wss://asr.example/ws --sessions 8 \
 turnalign model-manifest --model-id paraformer-zh-streaming \
   --model-revision "$MODEL_REVISION" \
   --model-root /var/lib/turnalign/models/paraformer-zh-streaming \
-  --file /var/lib/turnalign/models/paraformer-zh-streaming/model.safetensors \
   --output model-manifest.json
 sudo /opt/turnalign/releases/$CANDIDATE_COMMIT/venv/bin/python \
   -I -B -u -m turnalign.cli deployment-activate \
@@ -528,7 +528,7 @@ sudo /opt/turnalign/current/venv/bin/python -I -B -u -m turnalign.cli host-profi
   --artifact sbom=sbom.cdx.json --artifact release-audio=sample-30s.wav \
   --artifact quality-reference=reference.jsonl \
   --artifact quality-hypothesis=release-events.jsonl \
-  --artifact model=/models/model.safetensors \
+  --model-root /var/lib/turnalign/models/paraformer-zh-streaming \
   --artifact model-manifest=model-manifest.json \
   --artifact nginx-config=/etc/nginx/conf.d/turnalign.conf \
   --artifact service-unit=/etc/systemd/system/turnalign.service \
@@ -544,7 +544,7 @@ turnalign production-gate release-report.json quality-report.json websocket-repo
   --artifact release-audio=sample-30s.wav \
   --artifact quality-reference=reference.jsonl \
   --artifact quality-hypothesis=release-events.jsonl \
-  --artifact model=/models/model.safetensors \
+  --model-root /var/lib/turnalign/models/paraformer-zh-streaming \
   --artifact model-manifest=model-manifest.json \
   --artifact nginx-config=/etc/nginx/conf.d/turnalign.conf \
   --artifact service-unit=/etc/systemd/system/turnalign.service \
@@ -678,9 +678,12 @@ hypothesis, model files, model manifest, Nginx configuration, systemd unit and
 host profile into one auditable fifteen-artifact verdict. Activation, rehearsal
 and host profile must identify the same Linux boot; activation and rehearsal must
 also identify the same preceding/candidate pair. The deployed and restored
-backend/model identities must match the standalone candidate probe. The model manifest must
-bind the report revision to the exact
-names, sizes, and SHA-256 digests of every retained model artifact. The host
+backend/model identities must match the standalone candidate probe. The model
+manifest must bind the report revision to the exact relative paths, sizes, and
+SHA-256 digests of every retained model artifact. The same `--model-root`
+option safely and recursively expands the complete model tree for
+`model-manifest`, `host-profile`, and `production-gate`; do not combine it with
+manually supplied `model` artifacts. The host
 profile must be generated by the active candidate command on the Linux target
 host. It reads the embedded commit without requiring a production Git checkout
 and binds the installed Wheel version, versioned Python

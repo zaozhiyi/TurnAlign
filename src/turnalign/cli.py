@@ -44,6 +44,7 @@ from .production_gate import (
     create_deployment_state,
     create_host_profile,
     create_model_manifest,
+    enumerate_model_files,
     run_production_gate,
     write_json_report,
 )
@@ -160,6 +161,19 @@ def _artifact_argument(value: str) -> tuple[str, Path]:
         choices = ", ".join(sorted(REQUIRED_ARTIFACT_KINDS))
         raise argparse.ArgumentTypeError(f"artifact KIND must be one of: {choices}")
     return kind, Path(raw_path)
+
+
+def _production_artifacts(args) -> list[tuple[str, Path]]:
+    artifacts = list(args.artifact)
+    model_root = getattr(args, "model_root", None)
+    if model_root is None:
+        return artifacts
+    if any(kind == "model" for kind, _path in artifacts):
+        raise ValueError(
+            "--model-root cannot be combined with explicit model artifacts"
+        )
+    artifacts.extend(("model", path) for path in enumerate_model_files(model_root))
+    return artifacts
 
 
 def replay(source: Path, output: Path | None) -> int:
@@ -390,7 +404,7 @@ def production_gate(args) -> int:
         args.quality_report,
         args.websocket_report,
         source_commit=args.source_commit,
-        artifacts=args.artifact,
+        artifacts=_production_artifacts(args),
     )
     _emit_gate_report(report, args.report)
     return 0 if report.passed else 1
@@ -493,7 +507,6 @@ def model_manifest(args) -> int:
         args.model_id,
         args.model_revision,
         args.model_root,
-        args.file,
     )
     write_json_report(args.output, payload)
     print(json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False))
@@ -501,7 +514,7 @@ def model_manifest(args) -> int:
 
 
 def host_profile(args) -> int:
-    payload = create_host_profile(args.source_commit, args.artifact)
+    payload = create_host_profile(args.source_commit, _production_artifacts(args))
     write_json_report(args.output, payload)
     print(json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False))
     return 0
@@ -1131,6 +1144,11 @@ def main() -> int:
         help="Immutable release artifact; repeat for every required kind",
     )
     production_gate_parser.add_argument(
+        "--model-root",
+        type=Path,
+        help="Recursively add every retained file under this model root",
+    )
+    production_gate_parser.add_argument(
         "--report",
         type=Path,
         help="Persist the aggregate JSON verdict",
@@ -1146,13 +1164,6 @@ def main() -> int:
         type=Path,
         required=True,
         help="Root directory used to preserve each retained model file's relative path",
-    )
-    model_manifest_parser.add_argument(
-        "--file",
-        action="append",
-        type=Path,
-        required=True,
-        help="Retained model file or archive; repeat for every file",
     )
     model_manifest_parser.add_argument("--output", type=Path, required=True)
     host_profile_parser = commands.add_parser(
@@ -1174,6 +1185,11 @@ def main() -> int:
         required=True,
         metavar="KIND=PATH",
         help="Retained artifact other than host-profile; repeat for every kind",
+    )
+    host_profile_parser.add_argument(
+        "--model-root",
+        type=Path,
+        help="Recursively add every retained file under this model root",
     )
     host_profile_parser.add_argument("--output", type=Path, required=True)
     deployment_state_parser = commands.add_parser(

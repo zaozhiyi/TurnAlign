@@ -317,7 +317,11 @@ Before routing users, retain all of the following with the release artifact:
    gate, whose model, host and production-corpus evidence is environment-specific.
 
 Persist each gate with `--report`, generate retained-model provenance with
-`turnalign model-manifest`, and run
+`turnalign model-manifest --model-root /var/lib/turnalign/models/<model-id>`,
+and pass the same `--model-root` to both `host-profile` and `production-gate`.
+The commands recursively enumerate every non-empty regular file, preserve
+relative paths, and reject symlinks, special files, empty model trees,
+incomplete manual/automatic mixtures, and oversized model trees. Then run
 `sudo /opt/turnalign/current/venv/bin/python -I -B -u -m turnalign.cli host-profile` on the
 target host after
 activating the candidate and finalizing the other fourteen artifact classes. The
