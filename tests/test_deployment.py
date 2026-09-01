@@ -133,6 +133,10 @@ class DeploymentArtifactTests(unittest.TestCase):
         ):
             self.assertIn(requirement, content)
 
+        ci = CI_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("_capture_nginx_effective_configuration", ci)
+        self.assertIn('identity["warning_free"] is True', ci)
+
     def test_distribution_sbom_environment_is_reproducible_and_runtime_only(self):
         requirement = (
             "sbom-env/bin/python -m pip install --upgrade \\\n"

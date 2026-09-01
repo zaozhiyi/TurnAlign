@@ -137,6 +137,27 @@ jobs:
           sudo install -m 0644 deploy/nginx/turnalign.conf.example \
             /etc/nginx/conf.d/turnalign.conf
           sudo nginx -t
+          sudo env PYTHONPATH="$GITHUB_WORKSPACE/src" python3 - <<'PY'
+          from pathlib import Path
+
+          from turnalign.production_gate import (
+              _MAX_DEPLOYMENT_CONFIG_BYTES,
+              _capture_nginx_effective_configuration,
+              _snapshot_evidence,
+          )
+
+          path = Path("/etc/nginx/conf.d/turnalign.conf")
+          snapshot = _snapshot_evidence(
+              path,
+              capture_limit=_MAX_DEPLOYMENT_CONFIG_BYTES,
+              hard_limit=_MAX_DEPLOYMENT_CONFIG_BYTES,
+          )
+          identity = _capture_nginx_effective_configuration(snapshot)
+          assert identity["configuration_path"] == str(path)
+          assert identity["loaded_occurrences"] == 1
+          assert identity["warning_free"] is True
+          assert identity["sha256"] == snapshot.sha256
+          PY
 
   test:
     if: github.event_name != 'schedule'
