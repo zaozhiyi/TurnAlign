@@ -13,6 +13,7 @@ from unittest.mock import patch
 from turnalign import production_gate as production_gate_module
 from turnalign.production_gate import (
     REQUIRED_ARTIFACT_KINDS,
+    create_host_profile,
     run_production_gate,
     write_json_report,
 )
@@ -241,6 +242,16 @@ class ProductionGateTests(unittest.TestCase):
                 "bytes": model.stat().st_size,
             }],
         })
+        host_profile = next(
+            path for kind, path in artifacts if kind == "host-profile"
+        )
+        profile_artifacts = [
+            (kind, path) for kind, path in artifacts if kind != "host-profile"
+        ]
+        write_json_report(
+            host_profile,
+            create_host_profile("b" * 40, profile_artifacts),
+        )
         return artifacts
 
     def test_passes_and_hash_binds_all_required_evidence(self):
@@ -497,6 +508,45 @@ class ProductionGateTests(unittest.TestCase):
                 artifacts = self._artifacts(root)
                 wheel = next(path for kind, path in artifacts if kind == "wheel")
                 mutate(wheel)
+                report = run_production_gate(
+                    release,
+                    quality,
+                    websocket,
+                    source_commit="b" * 40,
+                    artifacts=artifacts,
+                )
+
+                with self.subTest(expected=expected):
+                    self.assertFalse(report.passed)
+                    self.assertIn(expected, "\n".join(report.failures))
+
+    def test_binds_host_profile_to_source_and_every_other_artifact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, quality, websocket = self._reports(root)
+            for mutate, expected in (
+                (
+                    lambda payload: payload.update(source_commit="c" * 40),
+                    "not bound to the production source commit",
+                ),
+                (
+                    lambda payload: payload["platform"].update(
+                        logical_cpu_count=True
+                    ),
+                    "complete typed platform evidence",
+                ),
+                (
+                    lambda payload: payload["artifacts"][0].update(bytes=1),
+                    "does not match the retained deployment artifacts",
+                ),
+            ):
+                artifacts = self._artifacts(root)
+                profile = next(
+                    path for kind, path in artifacts if kind == "host-profile"
+                )
+                payload = json.loads(profile.read_text(encoding="utf-8"))
+                mutate(payload)
+                write_json_report(profile, payload)
                 report = run_production_gate(
                     release,
                     quality,

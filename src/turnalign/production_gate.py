@@ -9,6 +9,7 @@ import ipaddress
 import json
 import math
 import os
+import platform
 import re
 import stat
 import tempfile
@@ -29,6 +30,7 @@ _MAX_REPORT_BYTES = 2 * 1024 * 1024
 _MAX_SBOM_BYTES = 16 * 1024 * 1024
 _MAX_LOCK_BYTES = 4 * 1024 * 1024
 _MAX_MODEL_MANIFEST_BYTES = 2 * 1024 * 1024
+_MAX_HOST_PROFILE_BYTES = 2 * 1024 * 1024
 _MAX_WHEEL_BYTES = 64 * 1024 * 1024
 _MAX_WHEEL_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
 _MAX_WHEEL_ENTRIES = 4_096
@@ -341,6 +343,65 @@ def create_model_manifest(
         "model_id": model_id,
         "model_revision": model_revision,
         "files": sorted(entries, key=lambda item: cast(str, item["name"])),
+    }
+
+
+def create_host_profile(
+    source_commit: str,
+    artifacts: list[tuple[str, Path]],
+) -> dict[str, object]:
+    """Capture host identity and bind every other retained production artifact."""
+
+    if _COMMIT_PATTERN.fullmatch(source_commit) is None:
+        raise ValueError("source_commit must be a lowercase 40-character Git commit")
+    expected_kinds = REQUIRED_ARTIFACT_KINDS - {"host-profile"}
+    evidence = []
+    kinds = set()
+    identities = set()
+    for kind, path in artifacts:
+        if kind not in expected_kinds:
+            raise ValueError(f"unsupported host-profile artifact kind: {kind}")
+        snapshot = _snapshot_evidence(path)
+        identity = (kind, path.name)
+        if identity in identities:
+            raise ValueError(
+                f"host-profile artifacts require unique kind/name pairs: {kind}={path.name}"
+            )
+        identities.add(identity)
+        kinds.add(kind)
+        evidence.append({
+            "kind": kind,
+            "name": path.name,
+            "sha256": snapshot.sha256,
+            "bytes": snapshot.size,
+        })
+    missing = expected_kinds - kinds
+    if missing:
+        raise ValueError(
+            "host-profile is missing required artifact kinds: "
+            + ", ".join(sorted(missing))
+        )
+    for kind in expected_kinds - {"model"}:
+        if sum(item["kind"] == kind for item in evidence) != 1:
+            raise ValueError(f"host-profile artifact kind must appear once: {kind}")
+    logical_cpu_count = os.cpu_count()
+    if logical_cpu_count is None or logical_cpu_count <= 0:
+        raise RuntimeError("cannot determine the host logical CPU count")
+    return {
+        "schema_version": 1,
+        "source_commit": source_commit,
+        "platform": {
+            "system": platform.system(),
+            "release": platform.release(),
+            "machine": platform.machine(),
+            "python_implementation": platform.python_implementation(),
+            "python_version": platform.python_version(),
+            "logical_cpu_count": logical_cpu_count,
+        },
+        "artifacts": sorted(
+            evidence,
+            key=lambda item: (cast(str, item["kind"]), cast(str, item["name"])),
+        ),
     }
 
 
@@ -1143,6 +1204,107 @@ def _validate_wheel(snapshot: _EvidenceSnapshot, failures: list[str]) -> None:
             return
 
 
+def _validate_host_profile(
+    snapshot: _EvidenceSnapshot,
+    source_commit: str,
+    artifacts: list[ArtifactEvidence],
+    failures: list[str],
+) -> None:
+    if snapshot.content is None:
+        failures.append(f"host profile exceeds {_MAX_HOST_PROFILE_BYTES} bytes")
+        return
+    try:
+        payload = strict_json_loads(snapshot.content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        failures.append(f"host profile is not strict JSON: {error}")
+        return
+    if not isinstance(payload, dict) or set(payload) != {
+        "schema_version",
+        "source_commit",
+        "platform",
+        "artifacts",
+    }:
+        failures.append("host profile has an invalid top-level schema")
+        return
+    if (
+        isinstance(payload.get("schema_version"), bool)
+        or payload.get("schema_version") != 1
+    ):
+        failures.append("host profile has an unsupported schema version")
+    if payload.get("source_commit") != source_commit:
+        failures.append("host profile is not bound to the production source commit")
+
+    platform_data = payload.get("platform")
+    text_fields = (
+        "system",
+        "release",
+        "machine",
+        "python_implementation",
+        "python_version",
+    )
+    if not (
+        isinstance(platform_data, dict)
+        and set(platform_data) == {*text_fields, "logical_cpu_count"}
+        and all(
+            isinstance(platform_data.get(name), str)
+            and bool(platform_data[name])
+            and platform_data[name].strip() == platform_data[name]
+            and len(platform_data[name]) <= 256
+            and not any(
+                ord(character) < 32 or ord(character) == 127
+                for character in platform_data[name]
+            )
+            for name in text_fields
+        )
+        and _positive_integer(platform_data.get("logical_cpu_count"))
+    ):
+        failures.append("host profile lacks complete typed platform evidence")
+
+    entries = payload.get("artifacts")
+    if not isinstance(entries, list) or not entries:
+        failures.append("host profile has no retained artifact evidence")
+        return
+    reported: list[tuple[str, str, str, int]] = []
+    for item in entries:
+        if not isinstance(item, dict) or set(item) != {
+            "kind",
+            "name",
+            "sha256",
+            "bytes",
+        }:
+            failures.append("host profile contains an invalid artifact entry")
+            return
+        kind = item.get("kind")
+        name = item.get("name")
+        digest = item.get("sha256")
+        size = item.get("bytes")
+        if (
+            not isinstance(kind, str)
+            or kind not in REQUIRED_ARTIFACT_KINDS - {"host-profile"}
+            or not isinstance(name, str)
+            or not name
+            or Path(name).name != name
+            or not isinstance(digest, str)
+            or _SHA256_PATTERN.fullmatch(digest) is None
+            or not _positive_integer(size)
+        ):
+            failures.append("host profile contains an invalid artifact identity")
+            return
+        reported.append((kind, name, digest, cast(int, size)))
+    if len({(kind, name) for kind, name, _digest, _size in reported}) != len(
+        reported
+    ):
+        failures.append("host profile contains duplicate artifact identities")
+        return
+    actual = [
+        (item.kind, item.name, item.sha256, item.bytes)
+        for item in artifacts
+        if item.kind != "host-profile"
+    ]
+    if sorted(reported) != sorted(actual):
+        failures.append("host profile does not match the retained deployment artifacts")
+
+
 def run_production_gate(
     release_path: Path,
     quality_path: Path,
@@ -1173,6 +1335,7 @@ def run_production_gate(
             raise ValueError(f"unsupported artifact kind: {kind}")
         capture_limit = {
             "dependency-lock": _MAX_LOCK_BYTES,
+            "host-profile": _MAX_HOST_PROFILE_BYTES,
             "model-manifest": _MAX_MODEL_MANIFEST_BYTES,
             "sbom": _MAX_SBOM_BYTES,
             "wheel": _MAX_WHEEL_BYTES,
@@ -1219,6 +1382,14 @@ def run_production_gate(
             model_manifest_snapshots[0],
             release.get("model_revision"),
             evidence_by_kind.get("model", []),
+            failures,
+        )
+    host_profile_snapshots = artifact_snapshots.get("host-profile", [])
+    if len(host_profile_snapshots) == 1:
+        _validate_host_profile(
+            host_profile_snapshots[0],
+            source_commit,
+            artifact_evidence,
             failures,
         )
 

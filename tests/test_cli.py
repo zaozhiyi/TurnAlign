@@ -716,6 +716,33 @@ class CliIntegrationTests(unittest.TestCase):
                 cli._sha256_file(first),
             )
 
+    def test_host_profile_binds_source_host_and_artifacts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "host-profile.json"
+            arguments = [
+                "turnalign",
+                "host-profile",
+                "--source-commit",
+                "a" * 40,
+            ]
+            for kind in sorted(cli.REQUIRED_ARTIFACT_KINDS - {"host-profile"}):
+                path = root / f"{kind}.evidence"
+                path.write_text(f"immutable {kind}\n", encoding="utf-8")
+                arguments.extend(("--artifact", f"{kind}={path}"))
+            arguments.extend(("--output", str(output)))
+
+            with patch("sys.argv", arguments), patch("builtins.print"):
+                self.assertEqual(cli.main(), 0)
+
+            payload = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(payload["source_commit"], "a" * 40)
+            self.assertGreater(payload["platform"]["logical_cpu_count"], 0)
+            self.assertEqual(
+                {item["kind"] for item in payload["artifacts"]},
+                cli.REQUIRED_ARTIFACT_KINDS - {"host-profile"},
+            )
+
     def test_replay_creates_parent_and_valid_end_event(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

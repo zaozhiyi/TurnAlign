@@ -139,9 +139,11 @@ Before routing users, retain all of the following with the release artifact:
 6. Rollback is tested by restoring the preceding immutable artifact and model
    bundle, not by mutating the running environment.
 
-Persist each gate with `--report`, generate the retained-file provenance with
-`turnalign model-manifest`, then run `turnalign production-gate` with the source
-commit and all eleven required artifact kinds shown in the root README. Keep
+Persist each gate with `--report`, generate retained-model provenance with
+`turnalign model-manifest`, and run `turnalign host-profile` on the target host
+after the other ten artifact classes are final. Then run `turnalign
+production-gate` with the source commit and all eleven required artifact kinds
+shown in the root README. Keep
 the resulting aggregate report beside the release artifact; it rejects local
 `ws://`, missing recovery/latency controls, mutable model revisions, undersized
 quality evidence, and incomplete artifact sets.

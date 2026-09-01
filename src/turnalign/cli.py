@@ -34,6 +34,7 @@ from .plugins import AsrConfig
 from .policy import AUTH_TOKEN_MAX_BYTES, ServerPolicy, validate_auth_token
 from .production_gate import (
     REQUIRED_ARTIFACT_KINDS,
+    create_host_profile,
     create_model_manifest,
     run_production_gate,
     write_json_report,
@@ -389,6 +390,13 @@ def model_manifest(args) -> int:
         args.model_revision,
         args.file,
     )
+    write_json_report(args.output, payload)
+    print(json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False))
+    return 0
+
+
+def host_profile(args) -> int:
+    payload = create_host_profile(args.source_commit, args.artifact)
     write_json_report(args.output, payload)
     print(json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False))
     return 0
@@ -937,6 +945,22 @@ def main() -> int:
         help="Retained model file or archive; repeat for every file",
     )
     model_manifest_parser.add_argument("--output", type=Path, required=True)
+    host_profile_parser = commands.add_parser(
+        "host-profile",
+        help="Bind target-host identity to retained production artifacts",
+    )
+    host_profile_parser.add_argument(
+        "--source-commit", type=_source_commit_argument, required=True
+    )
+    host_profile_parser.add_argument(
+        "--artifact",
+        action="append",
+        type=_artifact_argument,
+        required=True,
+        metavar="KIND=PATH",
+        help="Retained artifact other than host-profile; repeat for every kind",
+    )
+    host_profile_parser.add_argument("--output", type=Path, required=True)
     doctor_parser = commands.add_parser("doctor", help="Detect and select the local inference device")
     doctor_parser.add_argument(
         "--device",
@@ -1221,6 +1245,8 @@ def main() -> int:
         return production_gate(args)
     if args.command == "model-manifest":
         return model_manifest(args)
+    if args.command == "host-profile":
+        return host_profile(args)
     if args.command == "doctor":
         print(json.dumps(runtime_report(args.device), ensure_ascii=False, indent=2))
         return 0

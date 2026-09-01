@@ -21,7 +21,7 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   materialization limit before constructing the float model input.
 - All source and test modules pass `compileall`.
 - Ruff is enforced in CI and passes over `src` and `tests`.
-- The built wheel passes all 273 tests from site-packages on Python 3.10 with
+- The built wheel passes all 275 tests from site-packages on Python 3.10 with
   `websockets` 14.0 and on Python 3.12 with `websockets` 17.1. The Python 3.12
   run also passes under `python -O`, so production invariants do not depend on
   removable `assert` statements.
@@ -71,6 +71,10 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   against retained artifacts, release/quality model revisions must agree, and a
   strict model manifest must bind that revision to the exact retained model file
   names, sizes and SHA-256 digests.
+- `turnalign host-profile` records bounded platform inventory on the target host
+  and binds the final source commit plus exact name, size and SHA-256 identity of
+  every other retained artifact. The aggregate gate independently revalidates
+  that complete set, so artifacts from another release cannot be mixed in.
 - The aggregate gate opens the retained wheel as a bounded ZIP, rejects unsafe,
   duplicate, encrypted or symlink entries, verifies one coherent TurnAlign
   `dist-info` directory and console entry point, and recomputes every `RECORD`
