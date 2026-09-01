@@ -1119,6 +1119,55 @@ class WebSocketTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(report.passed)
         self.assertIn("invalid buffered_bytes", report.results[0].failure)
 
+    async def test_websocket_gate_rejects_ambiguous_or_binary_server_json(self):
+        from websockets.asyncio.server import serve as websocket_serve
+
+        for response, expected in (
+            (
+                (
+                    '{"type":"ready","type":"error","protocol_version":1,'
+                    '"session_id":"ambiguous"}'
+                ),
+                "duplicate JSON key",
+            ),
+            (
+                (
+                    '{"type":"ready","protocol_version":1,'
+                    '"session_id":"nonstandard","value":NaN}'
+                ),
+                "non-standard JSON number",
+            ),
+            (
+                (
+                    b'{"type":"ready","protocol_version":1,'
+                    b'"session_id":"binary"}'
+                ),
+                "unexpected binary frame",
+            ),
+        ):
+            probe = socket.socket()
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+            probe.close()
+
+            async def malformed_server(websocket, payload=response):
+                await websocket.recv()
+                await websocket.send(payload)
+                with suppress(Exception):
+                    await websocket.wait_closed()
+
+            async with websocket_serve(malformed_server, "127.0.0.1", port):
+                report = await run_websocket_gate(
+                    f"ws://127.0.0.1:{port}",
+                    sessions=1,
+                    audio_seconds=0.1,
+                    frame_ms=20,
+                    timeout=2,
+                )
+            with self.subTest(expected=expected):
+                self.assertFalse(report.passed)
+                self.assertIn(expected, report.results[0].failure)
+
     async def test_audio_is_persisted_before_inference_can_observe_it(self):
         probe = socket.socket()
         probe.bind(("127.0.0.1", 0))

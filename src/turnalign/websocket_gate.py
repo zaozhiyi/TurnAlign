@@ -7,6 +7,7 @@ from math import ceil, isfinite
 from time import perf_counter
 from urllib.parse import urlsplit
 
+from .jsonutil import strict_json_object
 from .models import TranscriptEvent
 from .validation import EventStreamValidator
 
@@ -82,6 +83,12 @@ class WebSocketGateReport:
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
+
+
+def _parse_server_response(raw: object) -> dict[str, object]:
+    if not isinstance(raw, str):
+        raise TypeError("server returned an unexpected binary frame")
+    return strict_json_object(raw, label="server response")
 
 
 def _validate_options(
@@ -232,9 +239,7 @@ async def _run_session(
                 if value is not None:
                     request[key] = value
             await websocket.send(json.dumps(request, ensure_ascii=False))
-            ready = json.loads(await websocket.recv())
-            if not isinstance(ready, dict):
-                raise TypeError("server ready response must be a JSON object")
+            ready = _parse_server_response(await websocket.recv())
             if ready.get("type") == "error":
                 raise RuntimeError(
                     f"server rejected session: {ready.get('code', 'unknown_error')}: "
@@ -264,12 +269,7 @@ async def _run_session(
             async def receive() -> None:
                 nonlocal final_buffered_bytes, last_acknowledged_sequence
                 while True:
-                    raw = await websocket.recv()
-                    if not isinstance(raw, str):
-                        raise TypeError("server returned an unexpected binary frame")
-                    payload = json.loads(raw)
-                    if not isinstance(payload, dict):
-                        raise TypeError("server response must be a JSON object")
+                    payload = _parse_server_response(await websocket.recv())
                     message_type = payload.get("type")
                     if message_type == "error":
                         raise RuntimeError(
@@ -494,13 +494,7 @@ async def _run_recovery_probe(
             return request
 
         async def receive_json(websocket) -> dict[str, object]:
-            raw = await websocket.recv()
-            if not isinstance(raw, str):
-                raise TypeError("server returned an unexpected binary frame")
-            payload = json.loads(raw)
-            if not isinstance(payload, dict):
-                raise TypeError("server response must be a JSON object")
-            return payload
+            return _parse_server_response(await websocket.recv())
 
         def validate_ready(
             payload: dict[str, object],
