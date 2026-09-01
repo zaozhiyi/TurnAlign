@@ -9,6 +9,8 @@ from typing import Any
 from .model_pool import BackendPoolCapacityError
 from .recovery import RecoveryCapacityError, RecoveryConflictError
 
+AUTH_TOKEN_MAX_BYTES = 8 * 1024
+
 
 class ServerBusyError(RuntimeError):
     pass
@@ -21,6 +23,30 @@ def _is_loopback(host: str) -> bool:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
         return False
+
+
+def validate_auth_token(token: object) -> str:
+    if not isinstance(token, str) or not token:
+        raise ValueError("authentication token must be a non-empty string")
+    if "\r" in token or "\n" in token or "\x00" in token:
+        raise ValueError("authentication token must contain one non-empty token")
+    try:
+        encoded = token.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise ValueError("authentication token must contain valid UTF-8 text") from error
+    if len(encoded) > AUTH_TOKEN_MAX_BYTES:
+        raise ValueError(
+            f"authentication token exceeds {AUTH_TOKEN_MAX_BYTES} bytes"
+        )
+    return token
+
+
+def _auth_tokens_equal(supplied: str, expected: str) -> bool:
+    try:
+        supplied_bytes = supplied.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return hmac.compare_digest(supplied_bytes, expected.encode("utf-8"))
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +68,8 @@ class ServerPolicy:
     def __post_init__(self) -> None:
         if not math.isfinite(self.max_session_seconds) or self.max_session_seconds <= 0:
             raise ValueError("max_session_seconds must be finite and positive")
+        if self.auth_token is not None:
+            validate_auth_token(self.auth_token)
 
     @classmethod
     def defaults(cls, backend: str, model: str | None = None) -> ServerPolicy:
@@ -65,7 +93,10 @@ class ServerPolicy:
     ) -> tuple[str, str | None, str | None, str | None]:
         if self.auth_token is not None:
             supplied = request.get("auth")
-            if not isinstance(supplied, str) or not hmac.compare_digest(supplied, self.auth_token):
+            if not isinstance(supplied, str) or not _auth_tokens_equal(
+                supplied,
+                self.auth_token,
+            ):
                 raise PermissionError("authentication failed")
 
         backend = str(request.get("backend") or default_backend)

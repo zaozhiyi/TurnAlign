@@ -117,6 +117,29 @@ class ServerPolicyTests(unittest.TestCase):
         self.assertEqual(policy.public_error(raised.exception)["code"], "unauthorized")
         self.assertNotIn("secret", str(policy.public_error(raised.exception)))
 
+    def test_authentication_supports_utf8_and_rejects_invalid_configuration(self):
+        policy = ServerPolicy(
+            allowed_backends=frozenset({"fake"}),
+            auth_token="私密令牌",
+        )
+        self.assertEqual(
+            policy.validate_start(
+                {"auth": "私密令牌"},
+                default_backend="fake",
+                default_model=None,
+            ),
+            ("fake", None, None, None),
+        )
+        with self.assertRaises(PermissionError):
+            policy.validate_start(
+                {"auth": "私密令牌2"},
+                default_backend="fake",
+                default_model=None,
+            )
+        for token in ("", "first\nsecond", "nul\x00token", "密" * 3_000):
+            with self.subTest(token=token[:20]), self.assertRaises(ValueError):
+                ServerPolicy(auth_token=token)
+
     def test_internal_paths_are_redacted(self):
         policy = ServerPolicy.defaults("fake")
         payload = policy.public_error(RuntimeError("failed at /Users/private/model.bin"))

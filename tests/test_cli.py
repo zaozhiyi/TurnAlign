@@ -361,6 +361,9 @@ class CliIntegrationTests(unittest.TestCase):
 
             self.assertEqual(cli._authentication_token(args), "private-token")
 
+            token_path.write_text("私密令牌\n", encoding="utf-8")
+            self.assertEqual(cli._authentication_token(args), "私密令牌")
+
             token_path.write_text("first\nsecond\n", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "one non-empty token"):
                 cli._authentication_token(args)
@@ -378,6 +381,20 @@ class CliIntegrationTests(unittest.TestCase):
                 token_path.chmod(0o640)
                 with self.assertRaisesRegex(ValueError, "group or others"):
                     cli._authentication_token(args)
+
+    def test_authentication_token_environment_uses_the_same_bounds(self):
+        args = SimpleNamespace(
+            auth_token_env="TURNALIGN_TEST_AUTH_TOKEN",
+            auth_token_file=None,
+        )
+        with patch.dict(os.environ, {"TURNALIGN_TEST_AUTH_TOKEN": "私密令牌"}):
+            self.assertEqual(cli._authentication_token(args), "私密令牌")
+        for token in ("first\nsecond", "x" * (8 * 1024 + 1)):
+            with self.subTest(length=len(token)), patch.dict(
+                os.environ,
+                {"TURNALIGN_TEST_AUTH_TOKEN": token},
+            ), self.assertRaises(ValueError):
+                cli._authentication_token(args)
 
     @unittest.skipUnless(os.name == "posix", "secure symlink rejection is POSIX-only")
     def test_authentication_token_file_rejects_symlinks(self):

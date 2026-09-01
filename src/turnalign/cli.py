@@ -30,7 +30,7 @@ from .models import TranscriptEvent
 from .offline import OfflineRefinementPipeline
 from .pipelines import TwoPassPipeline
 from .plugins import AsrConfig
-from .policy import ServerPolicy
+from .policy import AUTH_TOKEN_MAX_BYTES, ServerPolicy, validate_auth_token
 from .production_gate import (
     REQUIRED_ARTIFACT_KINDS,
     run_production_gate,
@@ -45,7 +45,6 @@ from .session import transcribe_events
 from .validation import EventStreamValidator
 from .websocket_gate import run_websocket_gate
 
-_MAX_AUTH_TOKEN_BYTES = 8 * 1024
 _SOURCE_COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
 
 
@@ -100,13 +99,13 @@ def _read_auth_token_file(path: Path) -> str:
             )
         with os.fdopen(descriptor, "rb") as source:
             descriptor = -1
-            raw_token = source.read(_MAX_AUTH_TOKEN_BYTES + 1)
+            raw_token = source.read(AUTH_TOKEN_MAX_BYTES + 1)
     finally:
         if descriptor >= 0:
             os.close(descriptor)
-    if len(raw_token) > _MAX_AUTH_TOKEN_BYTES:
+    if len(raw_token) > AUTH_TOKEN_MAX_BYTES:
         raise ValueError(
-            f"authentication token file exceeds {_MAX_AUTH_TOKEN_BYTES} bytes"
+            f"authentication token file exceeds {AUTH_TOKEN_MAX_BYTES} bytes"
         )
     if raw_token.endswith(b"\r\n"):
         raw_token = raw_token[:-2]
@@ -115,7 +114,7 @@ def _read_auth_token_file(path: Path) -> str:
     if not raw_token or b"\r" in raw_token or b"\n" in raw_token or b"\x00" in raw_token:
         raise ValueError("authentication token file must contain one non-empty token")
     try:
-        return raw_token.decode("utf-8")
+        return validate_auth_token(raw_token.decode("utf-8"))
     except UnicodeDecodeError as error:
         raise ValueError("authentication token file must contain UTF-8 text") from error
 
@@ -129,7 +128,7 @@ def _authentication_token(args) -> str | None:
             raise ValueError(
                 f"authentication token environment variable is empty: {environment_name}"
             )
-        return token
+        return validate_auth_token(token)
     if token_path is not None:
         return _read_auth_token_file(token_path)
     return None

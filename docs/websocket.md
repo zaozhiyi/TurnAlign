@@ -310,6 +310,11 @@ text. Use `--realtime` for soak tests; omit it for burst tests. Authentication i
 accepted through `--auth-token-file` or `--auth-token-env`, and credentials or
 query strings in the URI are rejected.
 
+Both credential sources enforce the same boundary: one non-empty UTF-8 token,
+at most 8 KiB, without CR, LF, or NUL characters. Authentication compares the
+UTF-8 bytes in constant time, so non-ASCII tokens behave consistently rather
+than failing inside the comparison routine.
+
 ```bash
 turnalign websocket-gate wss://asr.example/ws --sessions 8 \
   --audio-seconds 60 --realtime --max-ready-seconds 10 \
