@@ -1695,15 +1695,16 @@ class WebSocketTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(audio_ack["acknowledged_sequence"], 1)
 
                 await asyncio.sleep(0.05)
-                async with connect(f"ws://127.0.0.1:{port}") as websocket:
-                    await websocket.send(json.dumps({
-                        "type": "start",
-                        "backend": "fake",
-                        "resume_session_id": session_id,
-                        "resume_token": "wrong-token",
-                    }))
-                    rejected = json.loads(await websocket.recv())
-                    self.assertEqual(rejected["code"], "unauthorized")
+                for invalid_token in ("wrong-token", "错误令牌🔒"):
+                    async with connect(f"ws://127.0.0.1:{port}") as websocket:
+                        await websocket.send(json.dumps({
+                            "type": "start",
+                            "backend": "fake",
+                            "resume_session_id": session_id,
+                            "resume_token": invalid_token,
+                        }))
+                        rejected = json.loads(await websocket.recv())
+                        self.assertEqual(rejected["code"], "unauthorized")
 
                 async with connect(f"ws://127.0.0.1:{port}") as websocket:
                     await websocket.send(json.dumps({

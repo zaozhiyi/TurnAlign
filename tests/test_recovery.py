@@ -59,7 +59,7 @@ class RecoveryStoreTests(unittest.TestCase):
             store.release(session)
             self.assertGreaterEqual(len(session.resume_token), 32)
             self.assertNotIn(session.resume_token, repr(session))
-            for token in (None, "", "wrong-token"):
+            for token in (None, "", "wrong-token", "错误令牌🔒"):
                 with self.subTest(token=token), self.assertRaisesRegex(
                     PermissionError, "authentication"
                 ):

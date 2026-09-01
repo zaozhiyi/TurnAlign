@@ -279,7 +279,8 @@ preserves the same session ID. An open partial is recovery-committed before new
 segments begin, avoiding duplicate IDs or revision rollback.
 The opaque `session_id` is not sufficient authorization: a missing or incorrect
 `resume_token` returns `unauthorized`, including after the recovery entry has
-expired, so session existence isn't exposed to an unauthenticated resume probe.
+expired and for arbitrary Unicode input, so session existence and token encoding
+aren't exposed to an unauthenticated resume probe.
 
 Recovery is scoped to the lifetime of the server process and a bounded
 32-session store. Each session retains the newest 2,048 events by default;

@@ -103,7 +103,10 @@ class RecoveryStore:
                 if (
                     not isinstance(resume_token, str)
                     or not resume_token
-                    or not compare_digest(resume_token, session.resume_token)
+                    or not compare_digest(
+                        resume_token.encode("utf-8"),
+                        session.resume_token.encode("ascii"),
+                    )
                 ):
                     raise PermissionError("recovery authentication failed")
                 if session.config_key != config_key:
