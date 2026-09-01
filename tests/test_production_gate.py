@@ -28,10 +28,12 @@ class ProductionGateTests(unittest.TestCase):
         *,
         corrupt_record: bool = False,
         invalid_entry_point: bool = False,
+        source_commit: str = "b" * 40,
     ) -> None:
         dist_info = "turnalign-0.1.0.dist-info"
         files = {
             "turnalign/__init__.py": b'__version__ = "0.1.0"\n',
+            "turnalign/_source_commit.txt": f"{source_commit}\n".encode("ascii"),
             f"{dist_info}/METADATA": (
                 b"Metadata-Version: 2.4\nName: turnalign\nVersion: 0.1.0\n\n"
             ),
@@ -513,6 +515,13 @@ class ProductionGateTests(unittest.TestCase):
                         path, invalid_entry_point=True
                     ),
                     "does not expose the TurnAlign console entry point",
+                ),
+                (
+                    lambda path: self._write_test_wheel(
+                        path,
+                        source_commit="c" * 40,
+                    ),
+                    "source commit does not match",
                 ),
             ):
                 artifacts = self._artifacts(root)

@@ -92,6 +92,8 @@ class DeploymentArtifactTests(unittest.TestCase):
         self.assertNotRegex(service, r"sk-[A-Za-z0-9_-]{16,}")
         pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
         self.assertIn('"/deploy"', pyproject)
+        self.assertIn('"/hatch_build.py"', pyproject)
+        self.assertIn("[tool.hatch.build.targets.wheel.hooks.custom]", pyproject)
 
 
 if __name__ == "__main__":

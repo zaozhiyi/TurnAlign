@@ -25,6 +25,10 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   `websockets` 14.0 and on Python 3.12 with `websockets` 17.1. The Python 3.12
   run also passes under `python -O`, so production invariants do not depend on
   removable `assert` statements.
+- CI embeds the exact checked-out source commit in the Wheel as a `RECORD`-
+  protected file. The aggregate gate rejects an unbound, stale, missing or
+  mismatched identity instead of allowing a Wheel from another commit to be
+  combined with otherwise current reports.
 - The package job creates a validated CycloneDX 1.6 SBOM from an isolated
   wheel-installed server environment, requires two byte-identical reproducible
   generations, and includes its digest in `SHA256SUMS`. The production gate
@@ -195,7 +199,9 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
 - A dependency-free `py3-none-any` wheel and source distribution build
   successfully, and both pass `twine check`. The pinned Hatchling backend and a
   commit-derived `SOURCE_DATE_EPOCH` produce byte-identical wheel and sdist
-  hashes across two independent builds. CI enforces that comparison, emits a
+  hashes across two independent builds. The Wheel also embeds the CI checkout's
+  exact source commit through a deterministic custom build hook. CI enforces
+  that comparison and identity, emits a
   SHA-256 manifest, and retains the checked artifacts for 14 days. Build tools
   are version-pinned, while first-party GitHub Actions are pinned to immutable
   commit hashes with checkout credential persistence disabled.

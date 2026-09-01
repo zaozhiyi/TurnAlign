@@ -1065,7 +1065,11 @@ def _validate_model_manifest(
         failures.append("model manifest does not match the retained model artifacts")
 
 
-def _validate_wheel(snapshot: _EvidenceSnapshot, failures: list[str]) -> None:
+def _validate_wheel(
+    snapshot: _EvidenceSnapshot,
+    source_commit: str,
+    failures: list[str],
+) -> None:
     if snapshot.content is None:
         failures.append(f"wheel exceeds {_MAX_WHEEL_BYTES} bytes")
         return
@@ -1123,6 +1127,9 @@ def _validate_wheel(snapshot: _EvidenceSnapshot, failures: list[str]) -> None:
         return
     if "turnalign/__init__.py" not in contents:
         failures.append("wheel does not contain the TurnAlign package")
+    source_identity = contents.get("turnalign/_source_commit.txt")
+    if source_identity != f"{source_commit}\n".encode("ascii"):
+        failures.append("wheel source commit does not match the production source commit")
 
     try:
         metadata = BytesParser(policy=email_policy).parsebytes(contents[metadata_paths[0]])
@@ -1378,7 +1385,7 @@ def run_production_gate(
 
     wheel_snapshots = artifact_snapshots.get("wheel", [])
     if len(wheel_snapshots) == 1:
-        _validate_wheel(wheel_snapshots[0], failures)
+        _validate_wheel(wheel_snapshots[0], source_commit, failures)
 
     model_manifest_snapshots = artifact_snapshots.get("model-manifest", [])
     if len(model_manifest_snapshots) == 1:

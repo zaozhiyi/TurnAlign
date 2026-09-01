@@ -14,11 +14,15 @@ macOS because Linux containers and services cannot expose Metal/MPS.
 
 ## 1. Prepare an immutable installation
 
-Build the wheel in CI, retain its `SHA256SUMS` and generated CycloneDX SBOM, and
+Build the wheel in CI with `TURNALIGN_SOURCE_COMMIT` set to the exact checked-out
+40-character commit, retain its `SHA256SUMS` and generated CycloneDX SBOM, and
 install the exact reviewed artifact with a deployment-owned dependency lock.
 Regenerate the SBOM from the final model-specific environment before the
 production gate. Do not install the current Git branch or download an
 unreviewed wheel during service startup.
+
+Development builds without that environment variable remain installable but
+carry an `unbound` marker and cannot pass `production-gate`.
 
 For the reference CPU profile, create a target-specific, hash-locked dependency
 set and install it before the wheel:

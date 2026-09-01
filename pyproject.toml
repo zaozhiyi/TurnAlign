@@ -26,6 +26,9 @@ turnalign = "turnalign.cli:main"
 [tool.hatch.build.targets.wheel]
 packages = ["src/turnalign"]
 
+[tool.hatch.build.targets.wheel.hooks.custom]
+path = "hatch_build.py"
+
 [tool.hatch.build.targets.sdist]
 include = [
   "/ACKNOWLEDGEMENTS.md",
@@ -35,6 +38,7 @@ include = [
   "/SECURITY.md",
   "/docs",
   "/examples",
+  "/hatch_build.py",
   "/pyproject.toml",
   "/src",
   "/tests",
