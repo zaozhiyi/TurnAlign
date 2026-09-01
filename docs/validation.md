@@ -21,7 +21,7 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   materialization limit before constructing the float model input.
 - All source and test modules pass `compileall`.
 - Ruff is enforced in CI and passes over `src` and `tests`.
-- The built wheel passes all 261 tests from site-packages on Python 3.10 with
+- The built wheel passes all 262 tests from site-packages on Python 3.10 with
   `websockets` 14.0 and on Python 3.12 with `websockets` 17.1. The Python 3.12
   run also passes under `python -O`, so production invariants do not depend on
   removable `assert` statements.
@@ -69,6 +69,9 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   SHA-256 into one final pass/fail record. Each component gate must name the same
   source commit; release-audio and labelled-quality input digests are checked
   against retained artifacts, and release/quality model revisions must agree.
+- The aggregate production gate independently rejects WebSocket report URIs
+  containing userinfo, query strings, fragments or invalid ports, even if a
+  child report is forged instead of produced by the stricter deployment gate.
 - Gate reports and bounded lock/SBOM inputs are validated from the exact bytes
   that are hashed. Evidence is opened without following symlinks and is rejected
   if its file identity, size, modification time or change time moves during the

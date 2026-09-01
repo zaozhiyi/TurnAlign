@@ -349,8 +349,15 @@ class ServerConfigurationTests(unittest.IsolatedAsyncioTestCase):
                 await serve(default_backend="fake", **{name: float("nan")})
 
     async def test_websocket_gate_rejects_credentials_in_uri(self):
-        with self.assertRaisesRegex(ValueError, "auth-token-env"):
-            await run_websocket_gate("wss://user:secret@example.test/ws?token=secret")
+        for uri, message in (
+            ("wss://user:secret@example.test/ws", "auth-token-env"),
+            ("wss://@example.test/ws", "auth-token-env"),
+            ("wss://example.test/ws?token=secret", "auth-token-env"),
+            ("wss://example.test/ws#secret", "auth-token-env"),
+            ("wss://example.test:99999/ws", "invalid port"),
+        ):
+            with self.subTest(uri=uri), self.assertRaisesRegex(ValueError, message):
+                await run_websocket_gate(uri)
         with self.assertRaisesRegex(ValueError, "at least two audio frames"):
             await run_websocket_gate(
                 "ws://example.test/ws",

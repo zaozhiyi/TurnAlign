@@ -191,6 +191,34 @@ class ProductionGateTests(unittest.TestCase):
             for kind in REQUIRED_ARTIFACT_KINDS:
                 self.assertIn(f"missing required artifact kind: {kind}", failures)
 
+    def test_independently_rejects_unsafe_websocket_report_uris(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, quality, websocket = self._reports(root)
+            artifacts = self._artifacts(root)
+            for uri, expected in (
+                (
+                    "wss://user:secret@asr.example.com/ws",
+                    "must not contain credentials",
+                ),
+                ("wss://asr.example.com/ws?token=secret", "must not contain"),
+                ("wss://asr.example.com/ws#secret", "must not contain"),
+                ("wss://asr.example.com:99999/ws", "invalid port"),
+            ):
+                payload = json.loads(websocket.read_text(encoding="utf-8"))
+                payload["uri"] = uri
+                write_json_report(websocket, payload)
+                report = run_production_gate(
+                    release,
+                    quality,
+                    websocket,
+                    source_commit="b" * 40,
+                    artifacts=artifacts,
+                )
+                with self.subTest(uri=uri):
+                    self.assertFalse(report.passed)
+                    self.assertIn(expected, "\n".join(report.failures))
+
     def test_rejects_ambiguous_or_mutable_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

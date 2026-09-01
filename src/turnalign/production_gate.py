@@ -437,6 +437,21 @@ def _validate_websocket(report: dict[str, object], failures: list[str]) -> None:
     parsed = urlsplit(uri) if isinstance(uri, str) else None
     if parsed is None or parsed.scheme != "wss" or not _public_hostname(parsed.hostname):
         failures.append("websocket report was not run against a public wss:// endpoint")
+    if parsed is not None:
+        try:
+            _ = parsed.port
+        except ValueError:
+            failures.append("websocket report URI contains an invalid port")
+        if (
+            parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            failures.append(
+                "websocket report URI must not contain credentials, query strings "
+                "or fragments"
+            )
     if report.get("recovery_probe_required") is not True:
         failures.append("websocket report did not require recovery verification")
     recovery = report.get("recovery_probe")

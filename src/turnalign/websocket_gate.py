@@ -162,7 +162,16 @@ def _validate_uri(uri: str) -> None:
     parsed = urlsplit(uri)
     if parsed.scheme not in {"ws", "wss"} or not parsed.hostname:
         raise ValueError("uri must be an absolute ws:// or wss:// endpoint")
-    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+    try:
+        _ = parsed.port
+    except ValueError as error:
+        raise ValueError("uri contains an invalid port") from error
+    if (
+        parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
         raise ValueError(
             "uri credentials, query strings and fragments are forbidden; "
             "use --auth-token-file or --auth-token-env"
