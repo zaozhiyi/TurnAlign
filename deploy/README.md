@@ -325,7 +325,7 @@ command holds the root-only deployment lock for the complete capture and reads
 the commit embedded in the installed Wheel, so the production
 host does not need a Git checkout. It refuses non-Linux hosts, source checkouts,
 unbound Wheels, mismatched explicitly supplied commits, and non-versioned Python
-environments. Its schema 6 evidence also proves that the root-owned canonical
+environments. Its schema 7 evidence also proves that the root-owned canonical
 `current` link selects the candidate and hashes the complete active `turnalign/`
 tree; the aggregate gate requires that tree to match the retained Wheel exactly.
 Installed dependency content is hashed file by file into bounded deterministic

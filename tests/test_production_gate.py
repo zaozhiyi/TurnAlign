@@ -2403,6 +2403,23 @@ class ProductionGateTests(unittest.TestCase):
             )
             self.assertEqual(list(output.parent.glob("*.tmp")), [])
 
+    def test_atomic_writer_requires_directory_durability_after_replace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "report.json"
+            with patch.object(
+                production_gate_module,
+                "_fsync_directory",
+                side_effect=OSError("injected directory fsync failure"),
+            ) as sync, self.assertRaisesRegex(OSError, "injected"):
+                write_json_report(output, {"status": "passed"})
+
+            sync.assert_called_once_with(output.parent)
+            self.assertEqual(
+                json.loads(output.read_text(encoding="utf-8")),
+                {"status": "passed"},
+            )
+            self.assertEqual(list(output.parent.glob("*.tmp")), [])
+
 
 if __name__ == "__main__":
     unittest.main()

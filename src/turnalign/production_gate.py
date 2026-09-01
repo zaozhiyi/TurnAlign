@@ -175,7 +175,7 @@ class ProductionGateReport:
 
 
 def write_json_report(path: Path, payload: dict[str, object]) -> None:
-    """Atomically persist a gate report without leaving a partial success file."""
+    """Atomically and durably persist a gate report on production POSIX hosts."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_name: str | None = None
@@ -200,6 +200,7 @@ def write_json_report(path: Path, payload: dict[str, object]) -> None:
             destination.flush()
             os.fsync(destination.fileno())
         os.replace(temporary_name, path)
+        _fsync_directory(path.parent)
         temporary_name = None
     finally:
         if temporary_name is not None:
@@ -207,6 +208,23 @@ def write_json_report(path: Path, payload: dict[str, object]) -> None:
                 Path(temporary_name).unlink()
             except FileNotFoundError:
                 pass
+
+
+def _fsync_directory(path: Path) -> None:
+    """Persist a replaced directory entry before deployment state can advance."""
+
+    if os.name != "posix":
+        return
+    descriptor = os.open(
+        path,
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0),
+    )
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _metadata_signature(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
