@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import base64
+import configparser
+import csv
 import hashlib
+import io
 import ipaddress
 import json
 import math
@@ -8,7 +12,10 @@ import os
 import re
 import stat
 import tempfile
+import zipfile
 from dataclasses import asdict, dataclass
+from email.parser import BytesParser
+from email.policy import default as email_policy
 from pathlib import Path
 from typing import cast
 from urllib.parse import unquote, urlsplit
@@ -22,6 +29,9 @@ _MAX_REPORT_BYTES = 2 * 1024 * 1024
 _MAX_SBOM_BYTES = 16 * 1024 * 1024
 _MAX_LOCK_BYTES = 4 * 1024 * 1024
 _MAX_MODEL_MANIFEST_BYTES = 2 * 1024 * 1024
+_MAX_WHEEL_BYTES = 64 * 1024 * 1024
+_MAX_WHEEL_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
+_MAX_WHEEL_ENTRIES = 4_096
 _LOCK_REQUIREMENT_PATTERN = re.compile(
     r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([A-Za-z0-9][A-Za-z0-9.!+_-]*)(?:\s|;|$)"
 )
@@ -992,6 +1002,147 @@ def _validate_model_manifest(
         failures.append("model manifest does not match the retained model artifacts")
 
 
+def _validate_wheel(snapshot: _EvidenceSnapshot, failures: list[str]) -> None:
+    if snapshot.content is None:
+        failures.append(f"wheel exceeds {_MAX_WHEEL_BYTES} bytes")
+        return
+    try:
+        with zipfile.ZipFile(io.BytesIO(snapshot.content)) as archive:
+            infos = archive.infolist()
+            if not infos or len(infos) > _MAX_WHEEL_ENTRIES:
+                failures.append("wheel has an invalid number of archive entries")
+                return
+            names = [item.filename for item in infos]
+            if len(set(names)) != len(names):
+                failures.append("wheel contains duplicate archive entries")
+                return
+            total_size = 0
+            contents: dict[str, bytes] = {}
+            for info in infos:
+                parts = info.filename.rstrip("/").split("/")
+                mode = (info.external_attr >> 16) & 0o170000
+                if (
+                    not info.filename
+                    or info.filename.startswith("/")
+                    or "\\" in info.filename
+                    or "\x00" in info.filename
+                    or any(part in {"", ".", ".."} for part in parts)
+                    or info.flag_bits & 0x1
+                    or stat.S_ISLNK(mode)
+                ):
+                    failures.append("wheel contains an unsafe archive entry")
+                    return
+                if info.is_dir():
+                    continue
+                total_size += info.file_size
+                if total_size > _MAX_WHEEL_UNCOMPRESSED_BYTES:
+                    failures.append(
+                        "wheel exceeds the uncompressed release-artifact limit"
+                    )
+                    return
+                contents[info.filename] = archive.read(info)
+    except Exception as error:  # noqa: BLE001 - untrusted wheel is an evidence boundary
+        failures.append(
+            f"wheel is not a valid readable ZIP archive: {type(error).__name__}"
+        )
+        return
+
+    metadata_paths = [name for name in contents if name.endswith(".dist-info/METADATA")]
+    wheel_paths = [name for name in contents if name.endswith(".dist-info/WHEEL")]
+    record_paths = [name for name in contents if name.endswith(".dist-info/RECORD")]
+    if not (
+        len(metadata_paths) == len(wheel_paths) == len(record_paths) == 1
+        and metadata_paths[0].rsplit("/", 1)[0]
+        == wheel_paths[0].rsplit("/", 1)[0]
+        == record_paths[0].rsplit("/", 1)[0]
+    ):
+        failures.append("wheel does not contain one coherent dist-info directory")
+        return
+    if "turnalign/__init__.py" not in contents:
+        failures.append("wheel does not contain the TurnAlign package")
+
+    try:
+        metadata = BytesParser(policy=email_policy).parsebytes(contents[metadata_paths[0]])
+        names = metadata.get_all("Name", [])
+        versions = metadata.get_all("Version", [])
+        if (
+            len(names) != 1
+            or _package_name(str(names[0])) != "turnalign"
+            or len(versions) != 1
+            or not str(versions[0]).strip()
+        ):
+            failures.append("wheel metadata does not identify one TurnAlign release")
+
+        wheel_metadata = BytesParser(policy=email_policy).parsebytes(
+            contents[wheel_paths[0]]
+        )
+        if (
+            wheel_metadata.get_all("Wheel-Version", []) != ["1.0"]
+            or wheel_metadata.get_all("Root-Is-Purelib", []) != ["true"]
+            or "py3-none-any" not in wheel_metadata.get_all("Tag", [])
+        ):
+            failures.append("wheel metadata is not the expected pure Python wheel")
+    except (UnicodeError, ValueError, TypeError):
+        failures.append("wheel contains invalid package metadata")
+
+    entry_points = next(
+        (
+            payload
+            for name, payload in contents.items()
+            if name.endswith(".dist-info/entry_points.txt")
+        ),
+        None,
+    )
+    try:
+        entry_point_config = configparser.ConfigParser(
+            interpolation=None,
+            strict=True,
+        )
+        if entry_points is None:
+            raise ValueError("missing entry_points.txt")
+        entry_point_config.read_string(entry_points.decode("utf-8"))
+        valid_entry_point = (
+            entry_point_config.get(
+                "console_scripts",
+                "turnalign",
+                fallback=None,
+            )
+            == "turnalign.cli:main"
+        )
+    except (UnicodeDecodeError, configparser.Error, ValueError):
+        valid_entry_point = False
+    if not valid_entry_point:
+        failures.append("wheel does not expose the TurnAlign console entry point")
+
+    try:
+        record_text = contents[record_paths[0]].decode("utf-8")
+        rows = list(csv.reader(io.StringIO(record_text, newline="")))
+    except (UnicodeDecodeError, csv.Error):
+        failures.append("wheel RECORD is not valid UTF-8 CSV")
+        return
+    recorded: dict[str, tuple[str, str]] = {}
+    for row in rows:
+        if len(row) != 3 or row[0] in recorded:
+            failures.append("wheel RECORD contains malformed or duplicate entries")
+            return
+        recorded[row[0]] = (row[1], row[2])
+    if set(recorded) != set(contents):
+        failures.append("wheel RECORD does not enumerate every archive file exactly once")
+        return
+    for name, content in contents.items():
+        digest, size = recorded[name]
+        if name == record_paths[0]:
+            if digest or size:
+                failures.append("wheel RECORD must leave its own hash and size empty")
+            continue
+        expected_digest = base64.urlsafe_b64encode(hashlib.sha256(content).digest()).rstrip(
+            b"="
+        ).decode("ascii")
+        if digest != f"sha256={expected_digest}" or size != str(len(content)):
+            failures.append(f"wheel RECORD hash or size does not match: {name}")
+            return
+
+
 def run_production_gate(
     release_path: Path,
     quality_path: Path,
@@ -1024,6 +1175,7 @@ def run_production_gate(
             "dependency-lock": _MAX_LOCK_BYTES,
             "model-manifest": _MAX_MODEL_MANIFEST_BYTES,
             "sbom": _MAX_SBOM_BYTES,
+            "wheel": _MAX_WHEEL_BYTES,
         }.get(kind)
         snapshot = _snapshot_evidence(path, capture_limit=capture_limit)
         evidence = ArtifactEvidence(kind, path.name, snapshot.sha256, snapshot.size)
@@ -1056,6 +1208,10 @@ def run_production_gate(
             failures.append(
                 f"SBOM does not match locked runtime requirement: {name}=={version}"
             )
+
+    wheel_snapshots = artifact_snapshots.get("wheel", [])
+    if len(wheel_snapshots) == 1:
+        _validate_wheel(wheel_snapshots[0], failures)
 
     model_manifest_snapshots = artifact_snapshots.get("model-manifest", [])
     if len(model_manifest_snapshots) == 1:

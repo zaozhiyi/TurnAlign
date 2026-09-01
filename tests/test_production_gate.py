@@ -1,7 +1,11 @@
+import base64
+import csv
 import hashlib
+import io
 import json
 import tempfile
 import unittest
+import zipfile
 from os import fstat as real_fstat
 from pathlib import Path
 from unittest.mock import patch
@@ -15,6 +19,48 @@ from turnalign.production_gate import (
 
 
 class ProductionGateTests(unittest.TestCase):
+    @staticmethod
+    def _write_test_wheel(
+        path: Path,
+        *,
+        corrupt_record: bool = False,
+        invalid_entry_point: bool = False,
+    ) -> None:
+        dist_info = "turnalign-0.1.0.dist-info"
+        files = {
+            "turnalign/__init__.py": b'__version__ = "0.1.0"\n',
+            f"{dist_info}/METADATA": (
+                b"Metadata-Version: 2.4\nName: turnalign\nVersion: 0.1.0\n\n"
+            ),
+            f"{dist_info}/WHEEL": (
+                b"Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n\n"
+            ),
+            f"{dist_info}/entry_points.txt": (
+                b"[console_scripts]\n"
+                + (
+                    b"# turnalign = turnalign.cli:main\n"
+                    if invalid_entry_point
+                    else b"turnalign = turnalign.cli:main\n"
+                )
+            ),
+        }
+        rows = []
+        for name, content in sorted(files.items()):
+            digest = base64.urlsafe_b64encode(hashlib.sha256(content).digest()).rstrip(
+                b"="
+            ).decode("ascii")
+            if corrupt_record and name == "turnalign/__init__.py":
+                digest = "a" * 43
+            rows.append((name, f"sha256={digest}", str(len(content))))
+        record_name = f"{dist_info}/RECORD"
+        rows.append((record_name, "", ""))
+        record = io.StringIO(newline="")
+        csv.writer(record, lineterminator="\n").writerows(rows)
+        files[record_name] = record.getvalue().encode("utf-8")
+        with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for name, content in sorted(files.items()):
+                archive.writestr(name, content)
+
     @staticmethod
     def _reports(root: Path) -> tuple[Path, Path, Path]:
         release = root / "release.json"
@@ -176,6 +222,8 @@ class ProductionGateTests(unittest.TestCase):
                 })
             elif kind == "model-manifest":
                 path.write_text("pending\n", encoding="utf-8")
+            elif kind == "wheel":
+                ProductionGateTests._write_test_wheel(path)
             else:
                 path.write_bytes(f"immutable {kind}\n".encode())
             artifacts.append((kind, path))
@@ -414,6 +462,41 @@ class ProductionGateTests(unittest.TestCase):
                 mutate(payload)
                 write_json_report(manifest, payload)
 
+                report = run_production_gate(
+                    release,
+                    quality,
+                    websocket,
+                    source_commit="b" * 40,
+                    artifacts=artifacts,
+                )
+
+                with self.subTest(expected=expected):
+                    self.assertFalse(report.passed)
+                    self.assertIn(expected, "\n".join(report.failures))
+
+    def test_rejects_invalid_or_record_tampered_wheel(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, quality, websocket = self._reports(root)
+            for mutate, expected in (
+                (
+                    lambda path: path.write_bytes(b"not a wheel\n"),
+                    "not a valid readable ZIP archive",
+                ),
+                (
+                    lambda path: self._write_test_wheel(path, corrupt_record=True),
+                    "RECORD hash or size does not match",
+                ),
+                (
+                    lambda path: self._write_test_wheel(
+                        path, invalid_entry_point=True
+                    ),
+                    "does not expose the TurnAlign console entry point",
+                ),
+            ):
+                artifacts = self._artifacts(root)
+                wheel = next(path for kind, path in artifacts if kind == "wheel")
+                mutate(wheel)
                 report = run_production_gate(
                     release,
                     quality,
