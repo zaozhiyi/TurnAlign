@@ -956,6 +956,28 @@ class CliIntegrationTests(unittest.TestCase):
                 if kind == "nginx-config"
             )
 
+            def effective_configuration(**kwargs):
+                service_snapshot = kwargs["service_snapshot"]
+                nginx_snapshot = kwargs["nginx_snapshot"]
+                return {
+                    "systemd": {
+                        "fragment_path": str(service_path),
+                        "drop_in_paths": [],
+                        "need_daemon_reload": False,
+                        "active_state": "active",
+                        "sub_state": "running",
+                        "sha256": service_snapshot.sha256,
+                        "bytes": service_snapshot.size,
+                    },
+                    "nginx": {
+                        "configuration_path": str(nginx_path),
+                        "loaded_occurrences": 1,
+                        "warning_free": True,
+                        "sha256": nginx_snapshot.sha256,
+                        "bytes": nginx_snapshot.size,
+                    },
+                }
+
             with patch(
                 "turnalign.production_gate._installed_runtime_identity",
                 return_value=runtime,
@@ -983,11 +1005,16 @@ class CliIntegrationTests(unittest.TestCase):
             ), patch(
                 "turnalign.production_gate._acquire_deployment_lock",
                 side_effect=lambda: os.open(os.devnull, os.O_RDONLY),
+            ), patch(
+                "turnalign.production_gate._require_root_owned_production_config",
+            ), patch(
+                "turnalign.production_gate._capture_effective_configuration",
+                side_effect=effective_configuration,
             ), patch("sys.argv", arguments), patch("builtins.print"):
                 self.assertEqual(cli.main(), 0)
 
             payload = json.loads(output.read_text(encoding="utf-8"))
-            self.assertEqual(payload["schema_version"], 6)
+            self.assertEqual(payload["schema_version"], 7)
             self.assertEqual(payload["source_commit"], "a" * 40)
             self.assertEqual(payload["active_commit"], "a" * 40)
             self.assertEqual(payload["runtime"], runtime)

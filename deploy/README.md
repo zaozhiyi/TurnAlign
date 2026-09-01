@@ -162,7 +162,11 @@ session duration on the deployment host.
 
 Gate reports are accepted for at most 24 hours, tolerate at most five minutes
 of forward clock skew, and the live deployment-state snapshot is capped at five
-minutes. Keep target-host time synchronized and regenerate expired evidence.
+minutes. Both `host-profile` and `deployment-status` require the canonical
+systemd unit to be active with `NeedDaemonReload=no` and no drop-ins. They also
+run `/usr/sbin/nginx -T` and require the root-owned canonical TurnAlign config to
+be loaded exactly once with no warnings. Keep target-host time synchronized and
+regenerate expired evidence after any service or proxy configuration change.
 
 `/metrics` exposes label-free Prometheus counters for active/admitted/rejected
 sessions, incomplete or failed work, recovery, audio volume, flow control and
@@ -275,7 +279,9 @@ Before routing users, retain all of the following with the release artifact:
    ```
 
    After both live phases pass, capture a fresh target-host state snapshot that
-   `production-gate` uses as the live deployment check:
+   `production-gate` uses as the live deployment check. This also recaptures the
+   effective systemd and Nginx configuration, so run `systemctl daemon-reload`
+   and reload Nginx before this command:
 
    ```bash
    sudo /opt/turnalign/current/venv/bin/python -I -B -u -m turnalign.cli \

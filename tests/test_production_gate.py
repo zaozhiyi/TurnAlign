@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import os
+import stat
 import tempfile
 import unittest
 import zipfile
@@ -16,6 +17,7 @@ from unittest.mock import patch
 from turnalign import production_gate as production_gate_module
 from turnalign.production_gate import (
     REQUIRED_ARTIFACT_KINDS,
+    create_deployment_state,
     create_host_profile,
     run_production_gate,
     write_json_report,
@@ -31,6 +33,32 @@ class ProductionGateTests(unittest.TestCase):
         .isoformat(timespec="milliseconds")
         .replace("+00:00", "Z")
     )
+
+    @staticmethod
+    def _effective_configuration(
+        service_sha256: str,
+        service_bytes: int,
+        nginx_sha256: str,
+        nginx_bytes: int,
+    ) -> dict[str, object]:
+        return {
+            "systemd": {
+                "fragment_path": "/etc/systemd/system/turnalign.service",
+                "drop_in_paths": [],
+                "need_daemon_reload": False,
+                "active_state": "active",
+                "sub_state": "running",
+                "sha256": service_sha256,
+                "bytes": service_bytes,
+            },
+            "nginx": {
+                "configuration_path": "/etc/nginx/conf.d/turnalign.conf",
+                "loaded_occurrences": 1,
+                "warning_free": True,
+                "sha256": nginx_sha256,
+                "bytes": nginx_bytes,
+            },
+        }
 
     @staticmethod
     def _write_test_wheel(
@@ -444,14 +472,7 @@ class ProductionGateTests(unittest.TestCase):
                     ProductionGateTests._deployment_activation(websocket_path),
                 )
             elif kind == "deployment-state":
-                write_json_report(path, {
-                    "schema_version": 1,
-                    "active_commit": "b" * 40,
-                    "pending_transaction_id": None,
-                    "boot_id": ProductionGateTests.BOOT_ID,
-                    "created_at": ProductionGateTests.NOW,
-                    "validity_seconds": 300.0,
-                })
+                path.write_bytes(b"pending deployment state\n")
             elif kind == "dependency-lock":
                 path.write_text(
                     "websockets==17.1 \\\n"
@@ -520,6 +541,29 @@ class ProductionGateTests(unittest.TestCase):
                 "bytes": model.stat().st_size,
             }],
         })
+        service_path = next(
+            path for kind, path in artifacts if kind == "service-unit"
+        )
+        nginx_path = next(
+            path for kind, path in artifacts if kind == "nginx-config"
+        )
+        deployment_state = next(
+            path for kind, path in artifacts if kind == "deployment-state"
+        )
+        write_json_report(deployment_state, {
+            "schema_version": 2,
+            "active_commit": "b" * 40,
+            "pending_transaction_id": None,
+            "boot_id": ProductionGateTests.BOOT_ID,
+            "effective_configuration": ProductionGateTests._effective_configuration(
+                hashlib.sha256(service_path.read_bytes()).hexdigest(),
+                service_path.stat().st_size,
+                hashlib.sha256(nginx_path.read_bytes()).hexdigest(),
+                nginx_path.stat().st_size,
+            ),
+            "created_at": ProductionGateTests.NOW,
+            "validity_seconds": 300.0,
+        })
         host_profile = next(
             path for kind, path in artifacts if kind == "host-profile"
         )
@@ -531,12 +575,6 @@ class ProductionGateTests(unittest.TestCase):
             production_gate_module.platform.python_version().split(".")[:2]
         )
         wheel = next(path for kind, path in artifacts if kind == "wheel")
-        service_path = next(
-            path for kind, path in artifacts if kind == "service-unit"
-        )
-        nginx_path = next(
-            path for kind, path in artifacts if kind == "nginx-config"
-        )
         with patch.object(
             production_gate_module,
             "_installed_runtime_identity",
@@ -590,6 +628,18 @@ class ProductionGateTests(unittest.TestCase):
             production_gate_module,
             "_acquire_deployment_lock",
             side_effect=lambda: os.open(os.devnull, os.O_RDONLY),
+        ), patch.object(
+            production_gate_module,
+            "_require_root_owned_production_config",
+        ), patch.object(
+            production_gate_module,
+            "_capture_effective_configuration",
+            side_effect=lambda **kwargs: ProductionGateTests._effective_configuration(
+                kwargs["service_snapshot"].sha256,
+                kwargs["service_snapshot"].size,
+                kwargs["nginx_snapshot"].sha256,
+                kwargs["nginx_snapshot"].size,
+            ),
         ):
             write_json_report(
                 host_profile,
@@ -727,6 +777,120 @@ class ProductionGateTests(unittest.TestCase):
             self.assertTrue(
                 any("does not match the lock" in failure for failure in report.failures)
             )
+
+    def test_effective_configuration_evidence_cannot_be_weakened(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, quality, websocket = self._reports(root)
+            for kind, expected in (
+                ("host-profile", "canonical active systemd unit without drop-ins"),
+                ("deployment-state", "canonical active systemd unit without drop-ins"),
+            ):
+                artifacts = self._artifacts(root)
+                evidence = next(path for item, path in artifacts if item == kind)
+                payload = json.loads(evidence.read_text(encoding="utf-8"))
+                payload["effective_configuration"]["systemd"]["drop_in_paths"] = [
+                    "/etc/systemd/system/turnalign.service.d/override.conf"
+                ]
+                write_json_report(evidence, payload)
+
+                report = run_production_gate(
+                    release,
+                    quality,
+                    websocket,
+                    source_commit="b" * 40,
+                    artifacts=artifacts,
+                )
+
+                with self.subTest(kind=kind):
+                    self.assertFalse(report.passed)
+                    self.assertIn(expected, "\n".join(report.failures))
+
+    def test_systemd_effective_capture_requires_loaded_active_unit(self):
+        snapshot = production_gate_module._EvidenceSnapshot("a" * 64, 123, b"unit")
+        valid = (
+            b"FragmentPath=/etc/systemd/system/turnalign.service\n"
+            b"DropInPaths=\n"
+            b"NeedDaemonReload=no\n"
+            b"ActiveState=active\n"
+            b"SubState=running\n"
+        )
+        with patch.object(
+            production_gate_module,
+            "_run_effective_config_command",
+            return_value=(valid, b""),
+        ):
+            identity = production_gate_module._capture_systemd_effective_configuration(
+                snapshot
+            )
+        self.assertEqual(identity["sha256"], "a" * 64)
+        self.assertEqual(identity["drop_in_paths"], [])
+
+        unsafe = valid.replace(
+            b"DropInPaths=\n",
+            b"DropInPaths=/etc/systemd/system/turnalign.service.d/override.conf\n",
+        )
+        with patch.object(
+            production_gate_module,
+            "_run_effective_config_command",
+            return_value=(unsafe, b""),
+        ), self.assertRaisesRegex(RuntimeError, "without drop-ins"):
+            production_gate_module._capture_systemd_effective_configuration(snapshot)
+
+    def test_nginx_effective_capture_requires_one_exact_loaded_file(self):
+        content = b"server { listen 443 ssl; }\n"
+        snapshot = production_gate_module._EvidenceSnapshot(
+            hashlib.sha256(content).hexdigest(),
+            len(content),
+            content,
+        )
+        marker = b"# configuration file /etc/nginx/conf.d/turnalign.conf:\n"
+        dump = (
+            b"# configuration file /etc/nginx/nginx.conf:\nhttp {}\n\n"
+            + marker
+            + content
+            + b"\n# configuration file /etc/nginx/mime.types:\ntypes {}\n"
+        )
+        with patch.object(
+            production_gate_module,
+            "_run_effective_config_command",
+            return_value=(dump, b"syntax is ok\n"),
+        ):
+            identity = production_gate_module._capture_nginx_effective_configuration(
+                snapshot
+            )
+        self.assertEqual(identity["loaded_occurrences"], 1)
+        self.assertEqual(identity["sha256"], hashlib.sha256(content).hexdigest())
+
+        with patch.object(
+            production_gate_module,
+            "_run_effective_config_command",
+            return_value=(dump + marker + content, b""),
+        ), self.assertRaisesRegex(RuntimeError, "load the canonical.*once"):
+            production_gate_module._capture_nginx_effective_configuration(snapshot)
+
+        with patch.object(
+            production_gate_module,
+            "_run_effective_config_command",
+            return_value=(dump, b"nginx: [warn] conflicting server name\n"),
+        ), self.assertRaisesRegex(RuntimeError, "contains warnings"):
+            production_gate_module._capture_nginx_effective_configuration(snapshot)
+
+    def test_production_configuration_rejects_a_writable_ancestor(self):
+        path = Path("/etc/nginx/conf.d/turnalign.conf")
+
+        def metadata(item):
+            if Path(item) == path:
+                return SimpleNamespace(st_mode=stat.S_IFREG | 0o644, st_uid=0)
+            mode = 0o775 if Path(item) == Path("/etc/nginx") else 0o755
+            return SimpleNamespace(st_mode=stat.S_IFDIR | mode, st_uid=0)
+
+        with patch.object(
+            production_gate_module.os,
+            "lstat",
+            side_effect=metadata,
+        ), self.assertRaisesRegex(ValueError, "all ancestors"):
+            production_gate_module._require_root_owned_production_config(path)
 
     def test_http_dependency_index_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1609,6 +1773,47 @@ class ProductionGateTests(unittest.TestCase):
         ), self.assertRaisesRegex(RuntimeError, "Linux production host"):
             create_host_profile(None, [])
 
+    def test_deployment_state_recaptures_effective_configuration(self):
+        effective = {
+            "systemd": {"active_state": "active"},
+            "nginx": {"loaded_occurrences": 1},
+        }
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            production_gate_module.platform,
+            "system",
+            return_value="Linux",
+        ), patch.object(
+            production_gate_module.os,
+            "geteuid",
+            return_value=0,
+        ), patch.object(
+            production_gate_module,
+            "_active_release_commit",
+            return_value="b" * 40,
+        ), patch.object(
+            production_gate_module,
+            "_read_linux_boot_id",
+            return_value=self.BOOT_ID,
+        ), patch.object(
+            production_gate_module,
+            "_capture_effective_configuration",
+            return_value=effective,
+        ), patch.object(
+            production_gate_module,
+            "_DEPLOYMENT_TRANSACTION_PATH",
+            Path(directory) / "missing.json",
+        ), patch.object(
+            production_gate_module,
+            "_acquire_deployment_lock",
+            side_effect=lambda: os.open(os.devnull, os.O_RDONLY),
+        ):
+            payload = create_deployment_state(120.0)
+
+        self.assertEqual(payload["schema_version"], 2)
+        self.assertEqual(payload["effective_configuration"], effective)
+        self.assertEqual(payload["active_commit"], "b" * 40)
+        self.assertEqual(payload["validity_seconds"], 120.0)
+
     def test_host_profile_refuses_pending_deployment_transaction(self):
         with tempfile.TemporaryDirectory() as directory:
             pending = Path(directory) / "pending-activation.json"
@@ -1642,7 +1847,7 @@ class ProductionGateTests(unittest.TestCase):
             self.assertEqual(system, "Linux")
             os.fstat(descriptor)
             events.append("captured")
-            return {"schema_version": 6}
+            return {"schema_version": 7}
 
         with patch.object(
             production_gate_module.platform,
@@ -1663,7 +1868,7 @@ class ProductionGateTests(unittest.TestCase):
         ):
             self.assertEqual(
                 create_host_profile("b" * 40, []),
-                {"schema_version": 6},
+                {"schema_version": 7},
             )
         self.assertEqual(events, ["checked", "captured"])
         with self.assertRaises(OSError):

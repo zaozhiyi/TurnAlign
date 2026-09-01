@@ -14,6 +14,7 @@ import os
 import platform
 import re
 import stat
+import subprocess
 import sys
 import tempfile
 import zipfile
@@ -65,6 +66,10 @@ _CURRENT_RELEASE_LINK = Path("/opt/turnalign/current")
 _MODEL_EVIDENCE_ROOT = Path("/var/lib/turnalign/models")
 _SERVICE_UNIT_PATH = Path("/etc/systemd/system/turnalign.service")
 _NGINX_CONFIG_PATH = Path("/etc/nginx/conf.d/turnalign.conf")
+_SYSTEMCTL_PATH = Path("/usr/bin/systemctl")
+_NGINX_PATH = Path("/usr/sbin/nginx")
+_EFFECTIVE_CONFIG_TIMEOUT_SECONDS = 15.0
+_MAX_EFFECTIVE_CONFIG_OUTPUT_BYTES = 8 * 1024 * 1024
 _LOCK_REQUIREMENT_PATTERN = re.compile(
     r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([A-Za-z0-9][A-Za-z0-9.!+_-]*)(?:\s|;|$)"
 )
@@ -459,6 +464,7 @@ def create_deployment_state(validity_seconds: float = 300.0) -> dict[str, object
     try:
         active_commit = _active_release_commit()
         boot_id = _read_linux_boot_id()
+        effective_configuration = _capture_effective_configuration()
         pending_transaction_id: str | None = None
         try:
             os.lstat(_DEPLOYMENT_TRANSACTION_PATH)
@@ -476,10 +482,11 @@ def create_deployment_state(validity_seconds: float = 300.0) -> dict[str, object
                 raise RuntimeError("pending deployment transaction is invalid")
             pending_transaction_id = raw_transaction_id
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "active_commit": active_commit,
             "pending_transaction_id": pending_transaction_id,
             "boot_id": boot_id,
+            "effective_configuration": effective_configuration,
             "created_at": (
                 datetime.now(timezone.utc)
                 .isoformat(timespec="milliseconds")
@@ -564,6 +571,7 @@ def _create_host_profile_locked(
     evidence = []
     kinds = set()
     identities = set()
+    configuration_snapshots: dict[str, _EvidenceSnapshot] = {}
     for kind, path in artifacts:
         if kind not in expected_kinds:
             raise ValueError(f"unsupported host-profile artifact kind: {kind}")
@@ -575,7 +583,16 @@ def _create_host_profile_locked(
             raise ValueError(
                 "host-profile nginx-config must use the active canonical Nginx config"
             )
-        snapshot = _snapshot_evidence(path)
+        if kind in {"service-unit", "nginx-config"}:
+            _require_root_owned_production_config(path)
+            snapshot = _snapshot_evidence(
+                path,
+                capture_limit=_MAX_DEPLOYMENT_CONFIG_BYTES,
+                hard_limit=_MAX_DEPLOYMENT_CONFIG_BYTES,
+            )
+            configuration_snapshots[kind] = snapshot
+        else:
+            snapshot = _snapshot_evidence(path)
         identity = (kind, path.name)
         if identity in identities:
             raise ValueError(
@@ -602,7 +619,7 @@ def _create_host_profile_locked(
     if logical_cpu_count is None or logical_cpu_count <= 0:
         raise RuntimeError("cannot determine the host logical CPU count")
     return {
-        "schema_version": 6,
+        "schema_version": 7,
         "source_commit": bound_commit,
         "active_commit": active_commit,
         "runtime": runtime,
@@ -617,10 +634,181 @@ def _create_host_profile_locked(
             "python_version": platform.python_version(),
             "logical_cpu_count": logical_cpu_count,
         },
+        "effective_configuration": _capture_effective_configuration(
+            service_snapshot=configuration_snapshots["service-unit"],
+            nginx_snapshot=configuration_snapshots["nginx-config"],
+        ),
         "artifacts": sorted(
             evidence,
             key=lambda item: (cast(str, item["kind"]), cast(str, item["name"])),
         ),
+    }
+
+
+def _require_root_owned_production_config(path: Path) -> None:
+    ancestors = tuple(reversed(path.parents)) + (path,)
+    for item in ancestors:
+        try:
+            metadata = os.lstat(item)
+        except OSError as error:
+            raise ValueError(
+                f"production configuration is unavailable: {path}"
+            ) from error
+        expected_type = stat.S_ISREG if item == path else stat.S_ISDIR
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not expected_type(metadata.st_mode)
+            or metadata.st_uid != 0
+            or stat.S_IMODE(metadata.st_mode) & 0o022
+        ):
+            raise ValueError(
+                "production configuration and all ancestors must be root-owned, "
+                "non-symlink, correctly typed, and not writable by group/others: "
+                f"{item}"
+            )
+
+
+def _run_effective_config_command(command: list[str]) -> tuple[bytes, bytes]:
+    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+        try:
+            completed = subprocess.run(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout,
+                stderr=stderr,
+                check=False,
+                timeout=_EFFECTIVE_CONFIG_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError(
+                f"effective configuration command timed out: {command[0]}"
+            ) from error
+        stdout_size = stdout.tell()
+        stderr_size = stderr.tell()
+        if (
+            stdout_size > _MAX_EFFECTIVE_CONFIG_OUTPUT_BYTES
+            or stderr_size > _MAX_EFFECTIVE_CONFIG_OUTPUT_BYTES
+        ):
+            raise RuntimeError(
+                f"effective configuration command output is too large: {command[0]}"
+            )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                f"effective configuration command failed: {command[0]}"
+            )
+        stdout.seek(0)
+        stderr.seek(0)
+        return stdout.read(), stderr.read()
+
+
+def _capture_systemd_effective_configuration(
+    service_snapshot: _EvidenceSnapshot,
+) -> dict[str, object]:
+    stdout, _stderr = _run_effective_config_command([
+        str(_SYSTEMCTL_PATH),
+        "show",
+        "turnalign.service",
+        "--no-pager",
+        "--property=FragmentPath",
+        "--property=DropInPaths",
+        "--property=NeedDaemonReload",
+        "--property=ActiveState",
+        "--property=SubState",
+    ])
+    try:
+        lines = stdout.decode("utf-8").splitlines()
+    except UnicodeDecodeError as error:
+        raise RuntimeError("systemd effective configuration is not UTF-8") from error
+    fields: dict[str, str] = {}
+    for line in lines:
+        key, separator, value = line.partition("=")
+        if not separator or key in fields:
+            raise RuntimeError("systemd effective configuration is malformed")
+        fields[key] = value
+    expected = {
+        "FragmentPath": str(_SERVICE_UNIT_PATH),
+        "DropInPaths": "",
+        "NeedDaemonReload": "no",
+        "ActiveState": "active",
+        "SubState": "running",
+    }
+    if fields != expected:
+        raise RuntimeError(
+            "systemd has not loaded the canonical active TurnAlign unit without drop-ins"
+        )
+    return {
+        "fragment_path": fields["FragmentPath"],
+        "drop_in_paths": [],
+        "need_daemon_reload": False,
+        "active_state": fields["ActiveState"],
+        "sub_state": fields["SubState"],
+        "sha256": service_snapshot.sha256,
+        "bytes": service_snapshot.size,
+    }
+
+
+def _capture_nginx_effective_configuration(
+    nginx_snapshot: _EvidenceSnapshot,
+) -> dict[str, object]:
+    if nginx_snapshot.content is None:
+        raise RuntimeError("canonical Nginx configuration was not retained for capture")
+    stdout, stderr = _run_effective_config_command([str(_NGINX_PATH), "-T"])
+    if b"[warn]" in stderr.lower():
+        raise RuntimeError("Nginx effective configuration contains warnings")
+    marker = f"# configuration file {_NGINX_CONFIG_PATH}:\n".encode()
+    starts: list[int] = []
+    cursor = 0
+    while True:
+        found = stdout.find(marker, cursor)
+        if found < 0:
+            break
+        starts.append(found)
+        cursor = found + len(marker)
+    if len(starts) != 1:
+        raise RuntimeError(
+            "Nginx effective configuration must load the canonical TurnAlign file once"
+        )
+    content_start = starts[0] + len(marker)
+    next_marker = stdout.find(b"\n# configuration file ", content_start)
+    content_end = len(stdout) if next_marker < 0 else next_marker
+    loaded_content = stdout[content_start:content_end]
+    if (
+        loaded_content != nginx_snapshot.content
+        and loaded_content + b"\n" != nginx_snapshot.content
+    ):
+        raise RuntimeError(
+            "Nginx effective configuration does not match the canonical TurnAlign file"
+        )
+    return {
+        "configuration_path": str(_NGINX_CONFIG_PATH),
+        "loaded_occurrences": 1,
+        "warning_free": True,
+        "sha256": nginx_snapshot.sha256,
+        "bytes": nginx_snapshot.size,
+    }
+
+
+def _capture_effective_configuration(
+    *,
+    service_snapshot: _EvidenceSnapshot | None = None,
+    nginx_snapshot: _EvidenceSnapshot | None = None,
+) -> dict[str, object]:
+    if service_snapshot is None or nginx_snapshot is None:
+        _require_root_owned_production_config(_SERVICE_UNIT_PATH)
+        _require_root_owned_production_config(_NGINX_CONFIG_PATH)
+        service_snapshot = _snapshot_evidence(
+            _SERVICE_UNIT_PATH,
+            capture_limit=_MAX_DEPLOYMENT_CONFIG_BYTES,
+            hard_limit=_MAX_DEPLOYMENT_CONFIG_BYTES,
+        )
+        nginx_snapshot = _snapshot_evidence(
+            _NGINX_CONFIG_PATH,
+            capture_limit=_MAX_DEPLOYMENT_CONFIG_BYTES,
+            hard_limit=_MAX_DEPLOYMENT_CONFIG_BYTES,
+        )
+    return {
+        "systemd": _capture_systemd_effective_configuration(service_snapshot),
+        "nginx": _capture_nginx_effective_configuration(nginx_snapshot),
     }
 
 
@@ -2098,13 +2286,14 @@ def _validate_host_profile(
         "installed_distribution",
         "installed_dependencies",
         "platform",
+        "effective_configuration",
         "artifacts",
     }:
         failures.append("host profile has an invalid top-level schema")
         return None
     if (
         isinstance(payload.get("schema_version"), bool)
-        or payload.get("schema_version") != 6
+        or payload.get("schema_version") != 7
     ):
         failures.append("host profile has an unsupported schema version")
     if payload.get("source_commit") != source_commit:
@@ -2305,6 +2494,12 @@ def _validate_host_profile(
     ]
     if sorted(reported) != sorted(actual):
         failures.append("host profile does not match the retained deployment artifacts")
+    _validate_effective_configuration(
+        "host profile",
+        payload.get("effective_configuration"),
+        artifacts,
+        failures,
+    )
     if (
         isinstance(platform_data, dict)
         and isinstance(platform_data.get("boot_id"), str)
@@ -2315,6 +2510,68 @@ def _validate_host_profile(
             installed_dependencies=installed_dependency_versions,
         )
     return None
+
+
+def _validate_effective_configuration(
+    label: str,
+    payload: object,
+    artifacts: list[ArtifactEvidence],
+    failures: list[str],
+) -> None:
+    service_artifacts = [item for item in artifacts if item.kind == "service-unit"]
+    nginx_artifacts = [item for item in artifacts if item.kind == "nginx-config"]
+    if len(service_artifacts) != 1 or len(nginx_artifacts) != 1:
+        failures.append(f"{label} cannot bind effective production configuration")
+        return
+    if not isinstance(payload, dict) or set(payload) != {"systemd", "nginx"}:
+        failures.append(f"{label} has invalid effective configuration evidence")
+        return
+    systemd = payload.get("systemd")
+    service = service_artifacts[0]
+    if not (
+        isinstance(systemd, dict)
+        and set(systemd)
+        == {
+            "fragment_path",
+            "drop_in_paths",
+            "need_daemon_reload",
+            "active_state",
+            "sub_state",
+            "sha256",
+            "bytes",
+        }
+        and systemd.get("fragment_path") == str(_SERVICE_UNIT_PATH)
+        and systemd.get("drop_in_paths") == []
+        and systemd.get("need_daemon_reload") is False
+        and systemd.get("active_state") == "active"
+        and systemd.get("sub_state") == "running"
+        and systemd.get("sha256") == service.sha256
+        and systemd.get("bytes") == service.bytes
+    ):
+        failures.append(
+            f"{label} does not prove the canonical active systemd unit without drop-ins"
+        )
+    nginx = payload.get("nginx")
+    nginx_artifact = nginx_artifacts[0]
+    if not (
+        isinstance(nginx, dict)
+        and set(nginx)
+        == {
+            "configuration_path",
+            "loaded_occurrences",
+            "warning_free",
+            "sha256",
+            "bytes",
+        }
+        and nginx.get("configuration_path") == str(_NGINX_CONFIG_PATH)
+        and nginx.get("loaded_occurrences") == 1
+        and nginx.get("warning_free") is True
+        and nginx.get("sha256") == nginx_artifact.sha256
+        and nginx.get("bytes") == nginx_artifact.bytes
+    ):
+        failures.append(
+            f"{label} does not prove Nginx loaded the canonical configuration once"
+        )
 
 
 def _utc_timestamp(value: object) -> datetime | None:
@@ -2477,6 +2734,7 @@ def _validate_rehearsal_phase(
 def _validate_deployment_state(
     snapshot: _EvidenceSnapshot,
     source_commit: str,
+    artifacts: list[ArtifactEvidence],
     failures: list[str],
 ) -> _DeploymentStateIdentity | None:
     if snapshot.content is None:
@@ -2492,6 +2750,7 @@ def _validate_deployment_state(
         "active_commit",
         "pending_transaction_id",
         "boot_id",
+        "effective_configuration",
         "created_at",
         "validity_seconds",
     }
@@ -2500,7 +2759,7 @@ def _validate_deployment_state(
         return None
     if (
         isinstance(payload.get("schema_version"), bool)
-        or payload.get("schema_version") != 1
+        or payload.get("schema_version") != 2
     ):
         failures.append("deployment state has an unsupported schema version")
     active_commit = payload.get("active_commit")
@@ -2521,6 +2780,12 @@ def _validate_deployment_state(
         payload,
         failures,
         max_validity_seconds=_MAX_DEPLOYMENT_STATE_VALIDITY_SECONDS,
+    )
+    _validate_effective_configuration(
+        "deployment state",
+        payload.get("effective_configuration"),
+        artifacts,
+        failures,
     )
     if isinstance(boot_id, str):
         return _DeploymentStateIdentity(boot_id, str(active_commit), None)
@@ -2940,6 +3205,7 @@ def run_production_gate(
         deployment_state_identity = _validate_deployment_state(
             deployment_state_snapshots[0],
             source_commit,
+            artifact_evidence,
             failures,
         )
     activation_identity: _DeploymentIdentity | None = None

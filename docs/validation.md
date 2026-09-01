@@ -114,10 +114,14 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   the Wheel version, versioned Python
   executable/prefix, final source commit, the complete active `turnalign/`
   package file set, deterministic installed-dependency tree digests, and the exact name, size and SHA-256 identity of the other
-  twelve retained artifacts. Schema 6 also binds the root-owned canonical
+  fourteen retained artifacts. Schema 7 also binds the root-owned canonical
   `current` link to the candidate and rejects a source checkout shadowing the
   installed package, non-root-owned or writable package files, symlinks, and any missing,
   modified or extra file (including bytecode) relative to the retained Wheel.
+  It additionally requires systemd to have loaded the active canonical unit
+  without drop-ins or a pending daemon reload, and requires `nginx -T` to load
+  the byte-identical canonical config once without warnings. The fresh
+  deployment-state snapshot repeats these checks within its five-minute window.
   Production service and administrative commands use the exact versioned
   `python -I -B -u -m turnalign.cli` prefix, which isolates environment/user
   import paths, disables bytecode creation, keeps logs unbuffered, and removes
