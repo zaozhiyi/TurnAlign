@@ -24,6 +24,7 @@ from .audio import (
 from .backends.jsonl import JsonlBackend
 from .deployment_rehearsal import (
     RehearsalProbeConfig,
+    run_deployment_activation,
     run_deployment_rehearsal,
 )
 from .devices import runtime_report
@@ -388,9 +389,8 @@ def production_gate(args) -> int:
     return 0 if report.passed else 1
 
 
-def deployment_rehearsal(args) -> int:
-    auth_token = _authentication_token(args)
-    probe = RehearsalProbeConfig(
+def _deployment_probe(args) -> RehearsalProbeConfig:
+    return RehearsalProbeConfig(
         sessions=args.sessions,
         audio_seconds=args.audio_seconds,
         sample_rate=args.sample_rate,
@@ -409,6 +409,10 @@ def deployment_rehearsal(args) -> int:
         language=args.language,
         compute_type=args.compute_type,
     )
+
+
+def deployment_rehearsal(args) -> int:
+    auth_token = _authentication_token(args)
     report = asyncio.run(run_deployment_rehearsal(
         args.previous_commit,
         args.candidate_commit,
@@ -416,7 +420,23 @@ def deployment_rehearsal(args) -> int:
         restart_timeout=args.restart_timeout,
         readiness_timeout=args.readiness_timeout,
         readiness_interval=args.readiness_interval,
-        probe=probe,
+        probe=_deployment_probe(args),
+        auth_token=auth_token,
+    ))
+    _emit_gate_report(report, args.report)
+    return 0 if report.passed else 1
+
+
+def deployment_activation(args) -> int:
+    auth_token = _authentication_token(args)
+    report = asyncio.run(run_deployment_activation(
+        args.previous_commit,
+        args.candidate_commit,
+        args.uri,
+        restart_timeout=args.restart_timeout,
+        readiness_timeout=args.readiness_timeout,
+        readiness_interval=args.readiness_interval,
+        probe=_deployment_probe(args),
         auth_token=auth_token,
     ))
     _emit_gate_report(report, args.report)
@@ -800,6 +820,51 @@ def _add_postprocess_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_deployment_operation_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("uri", help="Public wss:// production endpoint")
+    parser.add_argument(
+        "--previous-commit",
+        type=_source_commit_argument,
+        required=True,
+    )
+    parser.add_argument(
+        "--candidate-commit",
+        type=_source_commit_argument,
+        required=True,
+    )
+    parser.add_argument("--report", type=Path, required=True)
+    parser.add_argument("--sessions", type=int, default=2)
+    parser.add_argument("--audio-seconds", type=float, default=10.0)
+    parser.add_argument("--sample-rate", type=int, default=16_000)
+    parser.add_argument("--channels", type=int, default=1)
+    parser.add_argument("--frame-ms", type=int, default=100)
+    parser.add_argument("--timeout", type=float, default=120.0)
+    parser.add_argument("--min-commits", type=int, default=0)
+    parser.add_argument("--min-audio-acks", type=int, default=1)
+    parser.add_argument("--max-dropped-partials", type=int, default=0)
+    parser.add_argument("--max-backpressure-pauses", type=int, default=0)
+    parser.add_argument("--max-ready-seconds", type=float, default=30.0)
+    parser.add_argument("--max-total-seconds", type=float, default=180.0)
+    parser.add_argument("--recovery-resume-timeout", type=float, default=10.0)
+    parser.add_argument("--restart-timeout", type=float, default=120.0)
+    parser.add_argument("--readiness-timeout", type=float, default=300.0)
+    parser.add_argument("--readiness-interval", type=float, default=1.0)
+    parser.add_argument("--backend", required=True)
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--language")
+    parser.add_argument("--compute-type")
+    authentication = parser.add_mutually_exclusive_group()
+    authentication.add_argument(
+        "--auth-token-env",
+        help="Environment variable containing the start-message auth token",
+    )
+    authentication.add_argument(
+        "--auth-token-file",
+        type=Path,
+        help="Restricted file containing the start-message auth token",
+    )
+
+
 def _input_device(value: str | None) -> int | str | None:
     if value is None:
         return None
@@ -954,56 +1019,15 @@ def main() -> int:
             "retaining readiness and public WebSocket evidence"
         ),
     )
-    rehearsal_parser.add_argument("uri", help="Public wss:// production endpoint")
-    rehearsal_parser.add_argument(
-        "--previous-commit",
-        type=_source_commit_argument,
-        required=True,
+    _add_deployment_operation_arguments(rehearsal_parser)
+    activation_parser = commands.add_parser(
+        "deployment-activate",
+        help=(
+            "Atomically activate and probe a Linux production release, restoring "
+            "the preceding release on failure"
+        ),
     )
-    rehearsal_parser.add_argument(
-        "--candidate-commit",
-        type=_source_commit_argument,
-        required=True,
-    )
-    rehearsal_parser.add_argument("--report", type=Path, required=True)
-    rehearsal_parser.add_argument("--sessions", type=int, default=2)
-    rehearsal_parser.add_argument("--audio-seconds", type=float, default=10.0)
-    rehearsal_parser.add_argument("--sample-rate", type=int, default=16_000)
-    rehearsal_parser.add_argument("--channels", type=int, default=1)
-    rehearsal_parser.add_argument("--frame-ms", type=int, default=100)
-    rehearsal_parser.add_argument("--timeout", type=float, default=120.0)
-    rehearsal_parser.add_argument("--min-commits", type=int, default=0)
-    rehearsal_parser.add_argument("--min-audio-acks", type=int, default=1)
-    rehearsal_parser.add_argument("--max-dropped-partials", type=int, default=0)
-    rehearsal_parser.add_argument(
-        "--max-backpressure-pauses",
-        type=int,
-        default=0,
-    )
-    rehearsal_parser.add_argument("--max-ready-seconds", type=float, default=30.0)
-    rehearsal_parser.add_argument("--max-total-seconds", type=float, default=180.0)
-    rehearsal_parser.add_argument(
-        "--recovery-resume-timeout",
-        type=float,
-        default=10.0,
-    )
-    rehearsal_parser.add_argument("--restart-timeout", type=float, default=120.0)
-    rehearsal_parser.add_argument("--readiness-timeout", type=float, default=300.0)
-    rehearsal_parser.add_argument("--readiness-interval", type=float, default=1.0)
-    rehearsal_parser.add_argument("--backend", required=True)
-    rehearsal_parser.add_argument("--model", required=True)
-    rehearsal_parser.add_argument("--language")
-    rehearsal_parser.add_argument("--compute-type")
-    rehearsal_auth = rehearsal_parser.add_mutually_exclusive_group()
-    rehearsal_auth.add_argument(
-        "--auth-token-env",
-        help="Environment variable containing the start-message auth token",
-    )
-    rehearsal_auth.add_argument(
-        "--auth-token-file",
-        type=Path,
-        help="Restricted file containing the start-message auth token",
-    )
+    _add_deployment_operation_arguments(activation_parser)
     production_gate_parser = commands.add_parser(
         "production-gate",
         help="Bind production gate reports and immutable artifacts into one verdict",
@@ -1344,6 +1368,8 @@ def main() -> int:
         return websocket_gate(args)
     if args.command == "deployment-rehearsal":
         return deployment_rehearsal(args)
+    if args.command == "deployment-activate":
+        return deployment_activation(args)
     if args.command == "production-gate":
         return production_gate(args)
     if args.command == "model-manifest":

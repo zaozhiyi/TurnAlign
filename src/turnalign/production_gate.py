@@ -44,6 +44,7 @@ _MAX_SBOM_BYTES = 16 * 1024 * 1024
 _MAX_LOCK_BYTES = 4 * 1024 * 1024
 _MAX_MODEL_MANIFEST_BYTES = 2 * 1024 * 1024
 _MAX_HOST_PROFILE_BYTES = 2 * 1024 * 1024
+_MAX_DEPLOYMENT_ACTIVATION_BYTES = 8 * 1024 * 1024
 _MAX_ROLLBACK_REHEARSAL_BYTES = 8 * 1024 * 1024
 _MAX_DEPLOYMENT_CONFIG_BYTES = 2 * 1024 * 1024
 _MAX_WHEEL_BYTES = 64 * 1024 * 1024
@@ -67,6 +68,7 @@ _BUILD_ONLY_SBOM_COMPONENTS = frozenset({
     "twine",
 })
 REQUIRED_ARTIFACT_KINDS = frozenset({
+    "deployment-activation",
     "dependency-lock",
     "host-profile",
     "model",
@@ -108,6 +110,12 @@ class _EvidenceSnapshot:
 class _WheelIdentity:
     version: str
     package_files: tuple[EvidenceFile, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _DeploymentIdentity:
+    boot_id: str
+    previous_commit: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -1759,7 +1767,7 @@ def _utc_timestamp(value: object) -> datetime | None:
 
 def _validate_rehearsal_restart(
     payload: object,
-    phase: str,
+    label: str,
     failures: list[str],
 ) -> None:
     if not isinstance(payload, dict) or set(payload) != {
@@ -1768,7 +1776,7 @@ def _validate_rehearsal_restart(
         "seconds",
         "failure",
     }:
-        failures.append(f"rollback rehearsal {phase} has invalid restart evidence")
+        failures.append(f"{label} has invalid restart evidence")
         return
     if (
         payload.get("restart_exit_code") != 0
@@ -1778,12 +1786,12 @@ def _validate_rehearsal_restart(
         or not _nonnegative_number(payload.get("seconds"))
         or payload.get("failure") is not None
     ):
-        failures.append(f"rollback rehearsal {phase} did not restart an active service")
+        failures.append(f"{label} did not restart an active service")
 
 
 def _validate_rehearsal_readiness(
     payload: object,
-    phase: str,
+    label: str,
     ready_uri: str,
     failures: list[str],
 ) -> None:
@@ -1796,7 +1804,7 @@ def _validate_rehearsal_readiness(
         "seconds",
         "failure",
     }:
-        failures.append(f"rollback rehearsal {phase} has invalid readiness evidence")
+        failures.append(f"{label} has invalid readiness evidence")
         return
     if (
         payload.get("uri") != ready_uri
@@ -1809,7 +1817,7 @@ def _validate_rehearsal_readiness(
         or payload.get("failure") is not None
     ):
         failures.append(
-            f"rollback rehearsal {phase} did not prove preloaded readiness"
+            f"{label} did not prove preloaded readiness"
         )
 
 
@@ -1823,7 +1831,9 @@ def _validate_rehearsal_phase(
     websocket_uri: str,
     release_root: str,
     failures: list[str],
+    report_label: str = "rollback rehearsal",
 ) -> tuple[datetime | None, datetime | None, dict[str, object] | None]:
+    label = f"{report_label} {phase}"
     if not isinstance(payload, dict) or set(payload) != {
         "name",
         "status",
@@ -1839,16 +1849,16 @@ def _validate_rehearsal_phase(
         "websocket_report",
         "failures",
     }:
-        failures.append(f"rollback rehearsal {phase} has an invalid phase schema")
+        failures.append(f"{label} has an invalid phase schema")
         return None, None, None
-    _passed_report(f"rollback rehearsal {phase}", payload, failures)
+    _passed_report(label, payload, failures)
     if (
         payload.get("name") != phase
         or payload.get("from_commit") != from_commit
         or payload.get("target_commit") != target_commit
         or payload.get("target_path") != f"{release_root}/{target_commit}"
     ):
-        failures.append(f"rollback rehearsal {phase} has an invalid transition")
+        failures.append(f"{label} has an invalid transition")
     started = _utc_timestamp(payload.get("started_at"))
     activated = _utc_timestamp(payload.get("activated_at"))
     completed = _utc_timestamp(payload.get("completed_at"))
@@ -1859,17 +1869,17 @@ def _validate_rehearsal_phase(
         or not started <= activated <= completed
         or not _nonnegative_number(payload.get("activation_seconds"))
     ):
-        failures.append(f"rollback rehearsal {phase} has invalid activation timing")
-    _validate_rehearsal_restart(payload.get("restart"), phase, failures)
+        failures.append(f"{label} has invalid activation timing")
+    _validate_rehearsal_restart(payload.get("restart"), label, failures)
     _validate_rehearsal_readiness(
         payload.get("readiness"),
-        phase,
+        label,
         ready_uri,
         failures,
     )
     websocket = payload.get("websocket_report")
     if not isinstance(websocket, dict):
-        failures.append(f"rollback rehearsal {phase} has no WebSocket gate report")
+        failures.append(f"{label} has no WebSocket gate report")
         websocket = None
     else:
         phase_failures: list[str] = []
@@ -1878,10 +1888,139 @@ def _validate_rehearsal_phase(
         if websocket.get("uri") != websocket_uri:
             phase_failures.append("WebSocket report URI changed")
         failures.extend(
-            f"rollback rehearsal {phase}: {failure}"
+            f"{label}: {failure}"
             for failure in phase_failures
         )
     return started, completed, websocket
+
+
+def _validate_deployment_activation(
+    snapshot: _EvidenceSnapshot,
+    source_commit: str,
+    candidate_websocket: dict[str, object],
+    failures: list[str],
+) -> _DeploymentIdentity | None:
+    if snapshot.content is None:
+        failures.append(
+            "deployment activation exceeds "
+            f"{_MAX_DEPLOYMENT_ACTIVATION_BYTES} bytes"
+        )
+        return None
+    try:
+        payload = strict_json_loads(snapshot.content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        failures.append(f"deployment activation is not strict JSON: {error}")
+        return None
+    expected_fields = {
+        "schema_version",
+        "status",
+        "candidate_commit",
+        "previous_commit",
+        "boot_id",
+        "release_root",
+        "current_link",
+        "lock_path",
+        "service",
+        "systemctl",
+        "ready_uri",
+        "websocket_uri",
+        "started_at",
+        "completed_at",
+        "initial_active_commit",
+        "final_active_commit",
+        "activation",
+        "rollback",
+        "failures",
+    }
+    if not isinstance(payload, dict) or set(payload) != expected_fields:
+        failures.append("deployment activation has an invalid top-level schema")
+        return None
+    _passed_report("deployment activation", payload, failures)
+    if (
+        isinstance(payload.get("schema_version"), bool)
+        or payload.get("schema_version") != 1
+    ):
+        failures.append("deployment activation has an unsupported schema version")
+    previous_commit = payload.get("previous_commit")
+    if (
+        payload.get("candidate_commit") != source_commit
+        or payload.get("final_active_commit") != source_commit
+        or not isinstance(previous_commit, str)
+        or _COMMIT_PATTERN.fullmatch(previous_commit) is None
+        or previous_commit == source_commit
+        or payload.get("initial_active_commit") != previous_commit
+    ):
+        failures.append(
+            "deployment activation is not bound to one prior and candidate release"
+        )
+        previous_commit = ""
+    boot_id = payload.get("boot_id")
+    if not isinstance(boot_id, str) or _BOOT_ID_PATTERN.fullmatch(boot_id) is None:
+        failures.append("deployment activation has no valid Linux boot identity")
+        boot_id = None
+    if (
+        payload.get("release_root") != "/opt/turnalign/releases"
+        or payload.get("current_link") != "/opt/turnalign/current"
+        or payload.get("lock_path") != "/run/lock/turnalign-deployment.lock"
+        or payload.get("service") != "turnalign.service"
+        or payload.get("systemctl") != "/usr/bin/systemctl"
+        or payload.get("ready_uri") != "http://127.0.0.1:8765/readyz"
+    ):
+        failures.append("deployment activation did not use the production layout")
+    websocket_uri = candidate_websocket.get("uri")
+    if not isinstance(websocket_uri, str) or payload.get("websocket_uri") != websocket_uri:
+        failures.append("deployment activation did not probe the production WebSocket URI")
+        websocket_uri = ""
+    started = _utc_timestamp(payload.get("started_at"))
+    completed = _utc_timestamp(payload.get("completed_at"))
+    if started is None or completed is None or started > completed:
+        failures.append("deployment activation has invalid overall timing")
+    activation_started, activation_completed, deployed_websocket = (
+        _validate_rehearsal_phase(
+            payload.get("activation"),
+            phase="activate",
+            from_commit=previous_commit,
+            target_commit=source_commit,
+            ready_uri="http://127.0.0.1:8765/readyz",
+            websocket_uri=websocket_uri,
+            release_root="/opt/turnalign/releases",
+            failures=failures,
+            report_label="deployment activation",
+        )
+    )
+    if payload.get("rollback") is not None:
+        failures.append("passed deployment activation unexpectedly contains rollback evidence")
+    if (
+        started is not None
+        and completed is not None
+        and activation_started is not None
+        and activation_completed is not None
+        and not (
+            started
+            <= activation_started
+            <= activation_completed
+            <= completed
+        )
+    ):
+        failures.append("deployment activation timestamps are out of order")
+    if deployed_websocket is not None:
+        identity_fields = (
+            "backend",
+            "backend_implementation",
+            "model",
+            "model_revision",
+            "device",
+            "language",
+            "compute_type",
+        )
+        if any(
+            deployed_websocket.get(field) != candidate_websocket.get(field)
+            for field in identity_fields
+        ):
+            failures.append("deployment activation selected a different model identity")
+    if isinstance(boot_id, str) and previous_commit:
+        return _DeploymentIdentity(boot_id, previous_commit)
+    return None
 
 
 def _validate_rollback_rehearsal(
@@ -1889,7 +2028,7 @@ def _validate_rollback_rehearsal(
     source_commit: str,
     candidate_websocket: dict[str, object],
     failures: list[str],
-) -> str | None:
+) -> _DeploymentIdentity | None:
     if snapshot.content is None:
         failures.append(
             "rollback rehearsal exceeds "
@@ -2021,7 +2160,9 @@ def _validate_rollback_rehearsal(
             failures.append(
                 "rollback rehearsal restored a different deployed model identity"
             )
-    return cast(str, boot_id) if isinstance(boot_id, str) else None
+    if isinstance(boot_id, str) and previous_commit:
+        return _DeploymentIdentity(boot_id, previous_commit)
+    return None
 
 
 def run_production_gate(
@@ -2053,6 +2194,7 @@ def run_production_gate(
         if kind not in REQUIRED_ARTIFACT_KINDS:
             raise ValueError(f"unsupported artifact kind: {kind}")
         capture_limit = {
+            "deployment-activation": _MAX_DEPLOYMENT_ACTIVATION_BYTES,
             "dependency-lock": _MAX_LOCK_BYTES,
             "host-profile": _MAX_HOST_PROFILE_BYTES,
             "model-manifest": _MAX_MODEL_MANIFEST_BYTES,
@@ -2125,10 +2267,19 @@ def run_production_gate(
             artifact_evidence,
             failures,
         )
-    rehearsal_boot_id: str | None = None
+    activation_identity: _DeploymentIdentity | None = None
+    activation_snapshots = artifact_snapshots.get("deployment-activation", [])
+    if len(activation_snapshots) == 1:
+        activation_identity = _validate_deployment_activation(
+            activation_snapshots[0],
+            source_commit,
+            websocket,
+            failures,
+        )
+    rehearsal_identity: _DeploymentIdentity | None = None
     rehearsal_snapshots = artifact_snapshots.get("rollback-rehearsal", [])
     if len(rehearsal_snapshots) == 1:
-        rehearsal_boot_id = _validate_rollback_rehearsal(
+        rehearsal_identity = _validate_rollback_rehearsal(
             rehearsal_snapshots[0],
             source_commit,
             websocket,
@@ -2136,11 +2287,28 @@ def run_production_gate(
         )
     if (
         host_boot_id is not None
-        and rehearsal_boot_id is not None
-        and host_boot_id != rehearsal_boot_id
+        and activation_identity is not None
+        and host_boot_id != activation_identity.boot_id
+    ):
+        failures.append(
+            "host profile and deployment activation identify different Linux boots"
+        )
+    if (
+        host_boot_id is not None
+        and rehearsal_identity is not None
+        and host_boot_id != rehearsal_identity.boot_id
     ):
         failures.append(
             "host profile and rollback rehearsal identify different Linux boots"
+        )
+    if (
+        activation_identity is not None
+        and rehearsal_identity is not None
+        and activation_identity != rehearsal_identity
+    ):
+        failures.append(
+            "deployment activation and rollback rehearsal identify different "
+            "release pairs or Linux boots"
         )
     service_content: bytes | None = None
     service_snapshots = artifact_snapshots.get("service-unit", [])

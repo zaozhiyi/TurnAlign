@@ -135,6 +135,36 @@ class DeploymentRehearsalReport:
         return asdict(self)
 
 
+@dataclass(frozen=True, slots=True)
+class DeploymentActivationReport:
+    schema_version: int
+    status: str
+    candidate_commit: str
+    previous_commit: str
+    boot_id: str
+    release_root: str
+    current_link: str
+    lock_path: str
+    service: str
+    systemctl: str
+    ready_uri: str
+    websocket_uri: str
+    started_at: str
+    completed_at: str
+    initial_active_commit: str
+    final_active_commit: str | None
+    activation: RehearsalPhaseReport
+    rollback: RehearsalPhaseReport | None
+    failures: tuple[str, ...]
+
+    @property
+    def passed(self) -> bool:
+        return self.status == "passed" and not self.failures
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
 def _utc_timestamp() -> str:
     return (
         datetime.now(timezone.utc)
@@ -224,7 +254,7 @@ def _validate_websocket_uri(uri: str) -> None:
         or parsed.fragment
     ):
         raise ValueError(
-            "rollback rehearsal requires a credential-free public wss:// endpoint"
+            "deployment operations require a credential-free public wss:// endpoint"
         )
 
 
@@ -423,7 +453,7 @@ def _wait_readiness(
             break
         request = urllib.request.Request(
             uri,
-            headers={"Connection": "close", "User-Agent": "turnalign-rehearsal/1"},
+            headers={"Connection": "close", "User-Agent": "turnalign-deployment/1"},
         )
         try:
             with opener.open(
@@ -736,6 +766,187 @@ async def _run_deployment_rehearsal_locked(
     )
 
 
+async def _run_deployment_activation_locked(
+    previous_commit: str,
+    candidate_commit: str,
+    websocket_uri: str,
+    *,
+    release_root: Path = Path("/opt/turnalign/releases"),
+    current_link: Path = Path("/opt/turnalign/current"),
+    service: str = "turnalign.service",
+    systemctl: Path = Path("/usr/bin/systemctl"),
+    ready_uri: str = "http://127.0.0.1:8765/readyz",
+    restart_timeout: float = 120.0,
+    readiness_timeout: float = 300.0,
+    readiness_interval: float = 1.0,
+    probe: RehearsalProbeConfig | None = None,
+    auth_token: str | None = None,
+) -> DeploymentActivationReport:
+    """Activate and probe a candidate, restoring the previous release on failure."""
+
+    if platform.system() != "Linux":
+        raise RuntimeError("deployment activation must run on the Linux production host")
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        raise PermissionError("deployment activation must run as root")
+    for label, commit in (
+        ("previous", previous_commit),
+        ("candidate", candidate_commit),
+    ):
+        if _COMMIT_PATTERN.fullmatch(commit) is None:
+            raise ValueError(f"{label} commit must be a lowercase 40-character hash")
+    if previous_commit == candidate_commit:
+        raise ValueError("previous and candidate commits must be different")
+    _validate_layout(release_root, current_link)
+    _validate_ready_uri(ready_uri)
+    _validate_websocket_uri(websocket_uri)
+    if _SERVICE_PATTERN.fullmatch(service) is None:
+        raise ValueError("service must be a bounded systemd .service unit name")
+    if systemctl != Path("/usr/bin/systemctl"):
+        raise ValueError("deployment activation requires /usr/bin/systemctl")
+    for label, value in (
+        ("restart_timeout", restart_timeout),
+        ("readiness_timeout", readiness_timeout),
+        ("readiness_interval", readiness_interval),
+    ):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            raise ValueError(f"{label} must be positive")
+    selected_probe = probe or RehearsalProbeConfig()
+    if selected_probe.backend is None or selected_probe.model is None:
+        raise ValueError("deployment activation requires an explicit backend and model")
+
+    runtime = _installed_runtime_identity(candidate_commit)
+    if runtime["turnalign_source_commit"] != candidate_commit:
+        raise RuntimeError("candidate runtime identity changed during preflight")
+    _validate_release_directory(release_root, previous_commit)
+    _validate_release_directory(release_root, candidate_commit)
+    initial_active_commit = _active_commit(release_root, current_link)
+    if initial_active_commit != previous_commit:
+        raise ValueError("preceding release must be active before candidate activation")
+    boot_id = _read_linux_boot_id()
+    started_at = _utc_timestamp()
+
+    activation: RehearsalPhaseReport | None = None
+    rollback: RehearsalPhaseReport | None = None
+    activation_failures: list[str] = []
+    rollback_required = False
+    try:
+        activation = await _exercise_phase(
+            "activate",
+            candidate_commit,
+            release_root=release_root,
+            current_link=current_link,
+            systemctl=systemctl,
+            service=service,
+            ready_uri=ready_uri,
+            websocket_uri=websocket_uri,
+            restart_timeout=restart_timeout,
+            readiness_timeout=readiness_timeout,
+            readiness_interval=readiness_interval,
+            probe=selected_probe,
+            auth_token=auth_token,
+        )
+        if activation.passed:
+            try:
+                if _active_commit(release_root, current_link) != candidate_commit:
+                    activation_failures.append(
+                        "candidate is not active after successful activation"
+                    )
+            except ValueError as error:
+                activation_failures.append(_failure_text(error))
+            try:
+                if _read_linux_boot_id() != boot_id:
+                    activation_failures.append(
+                        "host rebooted during candidate activation"
+                    )
+            except RuntimeError as error:
+                activation_failures.append(_failure_text(error))
+    finally:
+        rollback_required = (
+            activation is None or not activation.passed or bool(activation_failures)
+        )
+        if rollback_required:
+            try:
+                rollback = await _exercise_phase(
+                    "activation-rollback",
+                    previous_commit,
+                    release_root=release_root,
+                    current_link=current_link,
+                    systemctl=systemctl,
+                    service=service,
+                    ready_uri=ready_uri,
+                    websocket_uri=websocket_uri,
+                    restart_timeout=restart_timeout,
+                    readiness_timeout=readiness_timeout,
+                    readiness_interval=readiness_interval,
+                    probe=selected_probe,
+                    auth_token=auth_token,
+                )
+            finally:
+                try:
+                    previous_active = (
+                        _active_commit(release_root, current_link) == previous_commit
+                    )
+                except ValueError:
+                    previous_active = False
+                restart_incomplete = (
+                    rollback is None
+                    or rollback.restart is None
+                    or rollback.restart.failure is not None
+                )
+                if not previous_active or restart_incomplete:
+                    if not previous_active:
+                        _activate_release(release_root, current_link, previous_commit)
+                    _restart_service(systemctl, service, timeout=restart_timeout)
+    if activation is None:
+        raise RuntimeError("candidate activation did not produce deployment evidence")
+
+    failures: list[str] = []
+    if not activation.passed:
+        failures.append("candidate activation phase did not pass")
+    failures.extend(activation_failures)
+    if activation.from_commit != previous_commit:
+        failures.append("candidate activation did not start from the preceding release")
+    if rollback_required:
+        if rollback is None or not rollback.passed:
+            failures.append("failed activation did not complete a verified rollback")
+        elif rollback.from_commit != candidate_commit:
+            failures.append("activation rollback did not start from the candidate")
+    try:
+        final_active_commit = _active_commit(release_root, current_link)
+    except ValueError as error:
+        final_active_commit = None
+        failures.append(_failure_text(error))
+    expected_final = previous_commit if rollback_required else candidate_commit
+    if final_active_commit != expected_final:
+        failures.append("deployment activation ended on the wrong release")
+    try:
+        if _read_linux_boot_id() != boot_id:
+            failures.append("host rebooted during deployment activation")
+    except RuntimeError as error:
+        failures.append(_failure_text(error))
+    return DeploymentActivationReport(
+        schema_version=1,
+        status="failed" if failures else "passed",
+        candidate_commit=candidate_commit,
+        previous_commit=previous_commit,
+        boot_id=boot_id,
+        release_root=str(release_root),
+        current_link=str(current_link),
+        lock_path=str(_DEPLOYMENT_LOCK_PATH),
+        service=service,
+        systemctl=str(systemctl),
+        ready_uri=ready_uri,
+        websocket_uri=websocket_uri,
+        started_at=started_at,
+        completed_at=_utc_timestamp(),
+        initial_active_commit=initial_active_commit,
+        final_active_commit=final_active_commit,
+        activation=activation,
+        rollback=rollback,
+        failures=tuple(failures),
+    )
+
+
 def _acquire_deployment_lock() -> int:
     import fcntl
 
@@ -795,6 +1006,49 @@ async def run_deployment_rehearsal(
     lock_descriptor = _acquire_deployment_lock()
     try:
         return await _run_deployment_rehearsal_locked(
+            previous_commit,
+            candidate_commit,
+            websocket_uri,
+            release_root=release_root,
+            current_link=current_link,
+            service=service,
+            systemctl=systemctl,
+            ready_uri=ready_uri,
+            restart_timeout=restart_timeout,
+            readiness_timeout=readiness_timeout,
+            readiness_interval=readiness_interval,
+            probe=probe,
+            auth_token=auth_token,
+        )
+    finally:
+        os.close(lock_descriptor)
+
+
+async def run_deployment_activation(
+    previous_commit: str,
+    candidate_commit: str,
+    websocket_uri: str,
+    *,
+    release_root: Path = Path("/opt/turnalign/releases"),
+    current_link: Path = Path("/opt/turnalign/current"),
+    service: str = "turnalign.service",
+    systemctl: Path = Path("/usr/bin/systemctl"),
+    ready_uri: str = "http://127.0.0.1:8765/readyz",
+    restart_timeout: float = 120.0,
+    readiness_timeout: float = 300.0,
+    readiness_interval: float = 1.0,
+    probe: RehearsalProbeConfig | None = None,
+    auth_token: str | None = None,
+) -> DeploymentActivationReport:
+    """Serialize and transactionally activate one candidate release."""
+
+    if platform.system() != "Linux":
+        raise RuntimeError("deployment activation must run on the Linux production host")
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        raise PermissionError("deployment activation must run as root")
+    lock_descriptor = _acquire_deployment_lock()
+    try:
+        return await _run_deployment_activation_locked(
             previous_commit,
             candidate_commit,
             websocket_uri,

@@ -88,8 +88,12 @@ open Internet connections. Complete every download and cache validation before
 starting the service. A backend that genuinely requires remote inference is not
 compatible with this reference profile and needs a separately reviewed unit.
 
-Activate a fully prepared release by atomically replacing the `current`
-symlink. The systemd unit and production validator require this exact layout:
+The systemd unit and production validator require `current` to be an absolute
+symlink to one immutable commit directory. Do not use ad-hoc `ln`/`mv` during a
+normal rollout: step 6 runs the serialized `deployment-activate` transaction.
+For a brand-new host with no `current` link, bootstrap a reviewed preceding
+release before any user traffic so the first candidate has a real rollback
+target:
 
 ```bash
 sudo ln -s /opt/turnalign/releases/<source-commit> \
@@ -97,10 +101,10 @@ sudo ln -s /opt/turnalign/releases/<source-commit> \
 sudo mv -Tf /opt/turnalign/.current-<source-commit> /opt/turnalign/current
 ```
 
-Do not remove the preceding release directory until the new release has passed
-all gates and the rollback rehearsal. A failed activation is reversed by the
-same atomic link replacement; no package is installed into or removed from the
-running release.
+This manual operation is bootstrap-only. Do not remove the preceding release
+directory until the candidate has passed activation, every gate, and the
+rollback rehearsal. No package is installed into or removed from a running
+release.
 
 ## 2. Install the service
 
@@ -175,12 +179,32 @@ Before routing users, retain all of the following with the release artifact:
    artifacts, and the quality/release/public-WebSocket reports identify the same
    backend implementation and immutable model revision.
 5. The exact wheel hash, dependency lock, validated CycloneDX SBOM, model
-   commit, model-file checksums, Nginx configuration, service unit, rollback
-   rehearsal, host profile, and gate reports are saved. Treat labelled
+   commit, model-file checksums, Nginx configuration, service unit, deployment
+   activation, rollback rehearsal, host profile, and gate reports are saved. Treat labelled
    references and hypotheses as potentially sensitive data and restrict their
    storage.
-6. Run the candidate-installed command as root to exercise the actual atomic
-   symlink and systemd path:
+6. While the preceding release is active, run the command from the inactive
+   candidate as root. It owns the actual atomic switch, restart, and probes:
+
+   ```bash
+   sudo /opt/turnalign/releases/<candidate-source-commit>/venv/bin/python \
+     -I -B -u -m turnalign.cli deployment-activate \
+     wss://asr.example.com/ws \
+     --previous-commit <preceding-source-commit> \
+     --candidate-commit <candidate-source-commit> \
+     --backend funasr-streaming --model paraformer-zh-streaming \
+     --auth-token-file /etc/turnalign/auth-token \
+     --report deployment-activation.json
+   ```
+
+   The command refuses an already-active candidate. It takes the root-only
+   non-blocking lock at `/run/lock/turnalign-deployment.lock`, switches and
+   restarts exactly once, then requires preloaded readiness and a real-time
+   concurrent public recovery probe. Failure or cancellation switches back to
+   the preceding release, restarts it, and repeats both probes before returning
+   control. Retain the report; only a successful activation report can pass the
+   aggregate production gate.
+7. With the candidate now active, exercise the rollback and restore path:
 
    ```bash
    sudo /opt/turnalign/current/venv/bin/python -I -B -u -m turnalign.cli \
@@ -193,7 +217,7 @@ Before routing users, retain all of the following with the release artifact:
      --report rollback-rehearsal.json
    ```
 
-   Keep the exact `-I -B -u -m turnalign.cli` prefix: it ignores environment/user
+   Keep the exact `-I -B -u -m turnalign.cli` prefix for both commands: it ignores environment/user
    import paths, bypasses the installer-generated console launcher, disables
    bytecode generation, and keeps journal output unbuffered. The final gate
    requires the installed package tree to
@@ -202,36 +226,37 @@ Before routing users, retain all of the following with the release artifact:
    non-Linux/non-root execution, an unbound candidate
    runtime, mutable or non-root-owned release directories, a non-public probe,
    and any initial active release other than the candidate. A root-only
-   non-blocking lock at `/run/lock/turnalign-deployment.lock` prevents a second
-   deploy or rehearsal from racing the symlink transition. It switches to the
+   same non-blocking lock prevents a second activation or rehearsal from racing
+   the symlink transition. The rehearsal switches to the
    preceding release, restarts and checks `systemctl is-active`, requires
    preloaded readiness plus a real-time concurrent public recovery probe, then
    restores and reprobes the candidate. Probe failure or cancellation still
    triggers candidate restoration, and the command fails unless both exact
    transitions pass. Retain its report rather than writing a success summary.
-7. For tagged upstream distributions,
+8. For tagged upstream distributions,
    `gh attestation verify FILE --repo GuanZhengPM/TurnAlign` verifies the signed
    GitHub/Sigstore build provenance.
-   This supplements rather than replaces the final twelve-artifact deployment
+   This supplements rather than replaces the final thirteen-artifact deployment
    gate, whose model, host and production-corpus evidence is environment-specific.
 
 Persist each gate with `--report`, generate retained-model provenance with
 `turnalign model-manifest`, and run
 `/opt/turnalign/current/venv/bin/python -I -B -u -m turnalign.cli host-profile` on the
 target host after
-activating the candidate and finalizing the other eleven artifact classes. The
+activating the candidate and finalizing the other twelve artifact classes. The
 command reads the commit embedded in the installed Wheel, so the production
 host does not need a Git checkout. It refuses non-Linux hosts, source checkouts,
 unbound Wheels, mismatched explicitly supplied commits, and non-versioned Python
 environments. Its schema 4 evidence hashes the complete active `turnalign/`
 tree; the aggregate gate requires that tree to match the retained Wheel exactly.
 Then run `turnalign
-production-gate` with the source commit and all twelve required artifact kinds
+production-gate` with the source commit and all thirteen required artifact kinds
 shown in the root README. Keep
 the resulting aggregate report beside the release artifact; it rejects local
 `ws://`, missing recovery/latency controls, mutable model revisions, undersized
-quality evidence, incomplete artifact sets, a rollback report with forged or
-out-of-order transitions, a different Linux boot or restored model identity,
+quality evidence, incomplete artifact sets, activation or rollback reports with
+forged or out-of-order transitions, mismatched release pairs, a different Linux
+boot or restored model identity,
 an active package loaded outside the versioned environment, installed files
 that are missing, modified, symlinked, writable or absent from the retained
 Wheel, a retained Nginx file containing

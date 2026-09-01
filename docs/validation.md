@@ -72,24 +72,28 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   dropped partials fail by default; pause and latency limits are configurable.
   Generated silence intentionally
   keeps transport/load evidence separate from speech-quality evidence.
-- All executable gates and `turnalign deployment-rehearsal` can atomically
-  persist their JSON verdict with `--report`. The rehearsal runs from the
-  candidate Wheel as root on the Linux target, atomically activates the prior
-  immutable release under a root-only non-blocking deployment lock, restarts
-  systemd, proves preloaded readiness and a public concurrent recovery probe,
-  then restores and reprobes the candidate even after a failed rollback probe.
+- All executable gates, `turnalign deployment-activate`, and
+  `turnalign deployment-rehearsal` can atomically persist their JSON verdict
+  with `--report`. Activation runs from the inactive candidate Wheel as root on
+  the Linux target. Under a root-only non-blocking deployment lock it atomically
+  activates the candidate, restarts systemd, and proves preloaded readiness plus
+  a public concurrent recovery probe. Failure or cancellation restores and
+  reprobes the preceding immutable release. After successful activation, the
+  rehearsal uses the same lock to switch to the preceding release, repeat those
+  checks, then restore and reprobe the candidate even after a failed rollback
+  probe.
   `turnalign production-gate` independently rechecks the critical
   thresholds, requires a public `wss://` concurrent recovery/soak result, and
-  binds the source commit plus twelve required artifact classes and all reports by
-  SHA-256 into one final pass/fail record. Each component gate must name the same
+  binds the source commit plus thirteen required artifact classes and all reports
+  by SHA-256 into one final pass/fail record. Each component gate must name the same
   source commit; release-audio and labelled-quality input digests are checked
   against retained artifacts; every normal and recovery WebSocket session must
   observe one backend/model/device/revision identity; the observed backend
   implementation and immutable revision must match release/quality evidence; and a
   strict model manifest must bind that revision to the exact retained model file
-  names, sizes and SHA-256 digests. It also revalidates both rehearsal
-  transitions, systemd/readiness exit evidence, complete per-phase WebSocket
-  reports, candidate restoration, and restored backend/model identity.
+  names, sizes and SHA-256 digests. It also revalidates the activation transition,
+  both rehearsal transitions, systemd/readiness exit evidence, complete per-phase
+  WebSocket reports, candidate restoration, and restored backend/model identity.
 - `/opt/turnalign/current/venv/bin/python -I -B -u -m turnalign.cli host-profile` must
   run from the
   active candidate on the Linux target host. It derives the source commit from
@@ -97,18 +101,18 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   bounded platform inventory plus the current Linux boot identity, and binds
   the Wheel version, versioned Python
   executable/prefix, final source commit, the complete active `turnalign/`
-  package file set, and the exact name, size and SHA-256 identity of every other
-  retained artifact. Schema 4 rejects a source checkout shadowing the installed
-  package, non-root-owned or writable package files, symlinks, and any missing,
+  package file set, and the exact name, size and SHA-256 identity of the other
+  twelve retained artifacts. Schema 4 rejects a source checkout shadowing the
+  installed package, non-root-owned or writable package files, symlinks, and any missing,
   modified or extra file (including bytecode) relative to the retained Wheel.
   Production service and administrative commands use the exact versioned
   `python -I -B -u -m turnalign.cli` prefix, which isolates environment/user
   import paths, disables bytecode creation, keeps logs unbuffered, and removes
   the generated console launcher from the trust boundary. The
   aggregate gate independently revalidates that complete set and requires the
-  host profile and rollback
-  rehearsal to come from the same boot, so another installation, host run or
-  release cannot be mixed in.
+  host profile, activation, and rollback rehearsal to come from the same boot.
+  Activation and rehearsal must also bind the same preceding/candidate release
+  pair, so another installation, host run, or release cannot be mixed in.
 - The aggregate gate parses the retained systemd unit with continuation and
   full-line comment semantics. It independently requires loopback-only serving,
   credential-file authentication, preload, immutable model revisions, positive

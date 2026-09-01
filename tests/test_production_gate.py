@@ -326,11 +326,56 @@ class ProductionGateTests(unittest.TestCase):
         }
 
     @staticmethod
+    def _deployment_activation(websocket: Path) -> dict[str, object]:
+        rehearsal = ProductionGateTests._rollback_rehearsal(websocket)
+        activation = json.loads(json.dumps(rehearsal["restore"]))
+        activation.update({
+            "name": "activate",
+            "from_commit": "c" * 40,
+            "target_commit": "b" * 40,
+            "target_path": f"/opt/turnalign/releases/{'b' * 40}",
+            "started_at": "2026-09-01T07:59:00.000Z",
+            "activated_at": "2026-09-01T07:59:01.000Z",
+            "completed_at": "2026-09-01T07:59:03.000Z",
+        })
+        return {
+            "schema_version": 1,
+            "status": "passed",
+            "candidate_commit": "b" * 40,
+            "previous_commit": "c" * 40,
+            "boot_id": ProductionGateTests.BOOT_ID,
+            "release_root": "/opt/turnalign/releases",
+            "current_link": "/opt/turnalign/current",
+            "lock_path": "/run/lock/turnalign-deployment.lock",
+            "service": "turnalign.service",
+            "systemctl": "/usr/bin/systemctl",
+            "ready_uri": "http://127.0.0.1:8765/readyz",
+            "websocket_uri": "wss://asr.example.com/ws",
+            "started_at": "2026-09-01T07:59:00.000Z",
+            "completed_at": "2026-09-01T07:59:04.000Z",
+            "initial_active_commit": "c" * 40,
+            "final_active_commit": "b" * 40,
+            "activation": activation,
+            "rollback": None,
+            "failures": [],
+        }
+
+    @staticmethod
     def _artifacts(root: Path) -> list[tuple[str, Path]]:
         artifacts = []
         for kind in REQUIRED_ARTIFACT_KINDS:
             path = root / f"{kind}.evidence"
-            if kind == "dependency-lock":
+            if kind == "deployment-activation":
+                websocket_path = root / "websocket.json"
+                if not websocket_path.exists():
+                    _release, _quality, websocket_path = ProductionGateTests._reports(
+                        root
+                    )
+                write_json_report(
+                    path,
+                    ProductionGateTests._deployment_activation(websocket_path),
+                )
+            elif kind == "dependency-lock":
                 path.write_text(
                     "websockets==17.1 \\\n"
                     f"    --hash=sha256:{'c' * 64}\n",
@@ -888,6 +933,97 @@ class ProductionGateTests(unittest.TestCase):
                 with self.subTest(expected=expected):
                     self.assertFalse(report.passed)
                     self.assertIn(expected, "\n".join(report.failures))
+
+    def test_rejects_forged_or_inconsistent_deployment_activation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, quality, websocket = self._reports(root)
+            for mutate, expected in (
+                (
+                    lambda payload: payload.update(status="failed"),
+                    "deployment activation report did not pass",
+                ),
+                (
+                    lambda payload: payload.update(initial_active_commit="b" * 40),
+                    "not bound to one prior and candidate release",
+                ),
+                (
+                    lambda payload: payload.update(final_active_commit="c" * 40),
+                    "not bound to one prior and candidate release",
+                ),
+                (
+                    lambda payload: payload["activation"].update(
+                        from_commit="b" * 40
+                    ),
+                    "activate has an invalid transition",
+                ),
+                (
+                    lambda payload: payload.update(rollback={}),
+                    "unexpectedly contains rollback evidence",
+                ),
+                (
+                    lambda payload: payload["activation"][
+                        "websocket_report"
+                    ].update(model_revision="d" * 40),
+                    "selected a different model identity",
+                ),
+                (
+                    lambda payload: payload.update(
+                        boot_id="87654321-4321-4321-8321-cba987654321"
+                    ),
+                    "host profile and deployment activation identify different",
+                ),
+            ):
+                artifacts = self._artifacts(root)
+                activation_path = next(
+                    path
+                    for kind, path in artifacts
+                    if kind == "deployment-activation"
+                )
+                payload = json.loads(activation_path.read_text(encoding="utf-8"))
+                mutate(payload)
+                write_json_report(activation_path, payload)
+                report = run_production_gate(
+                    release,
+                    quality,
+                    websocket,
+                    source_commit="b" * 40,
+                    artifacts=artifacts,
+                )
+
+                with self.subTest(expected=expected):
+                    self.assertFalse(report.passed)
+                    self.assertIn(expected, "\n".join(report.failures))
+
+    def test_rejects_activation_and_rehearsal_for_different_release_pairs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, quality, websocket = self._reports(root)
+            artifacts = self._artifacts(root)
+            activation_path = next(
+                path for kind, path in artifacts if kind == "deployment-activation"
+            )
+            payload = json.loads(activation_path.read_text(encoding="utf-8"))
+            different_previous = "d" * 40
+            payload["previous_commit"] = different_previous
+            payload["initial_active_commit"] = different_previous
+            payload["activation"]["from_commit"] = different_previous
+            write_json_report(activation_path, payload)
+
+            report = run_production_gate(
+                release,
+                quality,
+                websocket,
+                source_commit="b" * 40,
+                artifacts=artifacts,
+            )
+
+            self.assertFalse(report.passed)
+            self.assertIn(
+                "deployment activation and rollback rehearsal identify different "
+                "release pairs or Linux boots",
+                report.failures,
+            )
 
     def test_runtime_identity_requires_the_bound_versioned_wheel(self):
         source_commit = "b" * 40

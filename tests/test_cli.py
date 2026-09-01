@@ -736,6 +736,57 @@ class CliIntegrationTests(unittest.TestCase):
             self.assertEqual(probe.sessions, 2)
             self.assertEqual(json.loads(output.read_text())["status"], "passed")
 
+    def test_deployment_activation_maps_transactional_production_options(self):
+        captured = {}
+
+        class Report:
+            passed = True
+
+            @staticmethod
+            def to_dict():
+                return {"schema_version": 1, "status": "passed", "failures": []}
+
+        async def fake_activation(previous, candidate, uri, **options):
+            captured.update({
+                "previous": previous,
+                "candidate": candidate,
+                "uri": uri,
+                **options,
+            })
+            return Report()
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "activation.json"
+            with patch.object(
+                cli,
+                "run_deployment_activation",
+                side_effect=fake_activation,
+            ), patch(
+                "sys.argv",
+                [
+                    "turnalign",
+                    "deployment-activate",
+                    "wss://asr.example.com/ws",
+                    "--previous-commit",
+                    "a" * 40,
+                    "--candidate-commit",
+                    "b" * 40,
+                    "--backend",
+                    "funasr-streaming",
+                    "--model",
+                    "paraformer-zh-streaming",
+                    "--report",
+                    str(output),
+                ],
+            ), patch("builtins.print"):
+                self.assertEqual(cli.main(), 0)
+
+            self.assertEqual(captured["previous"], "a" * 40)
+            self.assertEqual(captured["candidate"], "b" * 40)
+            self.assertEqual(captured["uri"], "wss://asr.example.com/ws")
+            self.assertEqual(captured["probe"].backend, "funasr-streaming")
+            self.assertEqual(json.loads(output.read_text())["status"], "passed")
+
     def test_model_manifest_hashes_files_and_persists_provenance(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -10,6 +10,7 @@ from turnalign.deployment_rehearsal import (
     ReadinessEvidence,
     RehearsalProbeConfig,
     ServiceRestartEvidence,
+    run_deployment_activation,
     run_deployment_rehearsal,
 )
 
@@ -79,6 +80,170 @@ class DeploymentRehearsalTests(unittest.IsolatedAsyncioTestCase):
                     os.close(first)
                 second = rehearsal._acquire_deployment_lock()
                 os.close(second)
+
+    async def test_activation_switches_from_previous_to_candidate(self):
+        observed_commits = []
+
+        async def websocket_gate(_uri, **options):
+            observed_commits.append(options["source_commit"])
+            return FakeWebSocketReport(options["source_commit"])
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            releases = root / "releases"
+            current = root / "current"
+            (releases / self.previous).mkdir(parents=True)
+            (releases / self.candidate).mkdir()
+            current.symlink_to(releases / self.previous)
+            patches = self._patches()
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7], patch.object(
+                rehearsal,
+                "run_websocket_gate",
+                side_effect=websocket_gate,
+            ):
+                report = await run_deployment_activation(
+                    self.previous,
+                    self.candidate,
+                    "wss://asr.example.com/ws",
+                    release_root=releases,
+                    current_link=current,
+                    probe=RehearsalProbeConfig(
+                        backend="fake",
+                        model="model-a",
+                    ),
+                )
+
+            self.assertTrue(report.passed)
+            self.assertEqual(report.activation.from_commit, self.previous)
+            self.assertIsNone(report.rollback)
+            self.assertEqual(report.final_active_commit, self.candidate)
+            self.assertEqual(os.readlink(current), str(releases / self.candidate))
+            self.assertEqual(observed_commits, [self.candidate])
+
+    async def test_failed_activation_is_probed_after_verified_rollback(self):
+        calls = 0
+
+        async def websocket_gate(_uri, **options):
+            nonlocal calls
+            calls += 1
+            return FakeWebSocketReport(
+                options["source_commit"],
+                passed=calls != 1,
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            releases = root / "releases"
+            current = root / "current"
+            (releases / self.previous).mkdir(parents=True)
+            (releases / self.candidate).mkdir()
+            current.symlink_to(releases / self.previous)
+            patches = self._patches()
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7], patch.object(
+                rehearsal,
+                "run_websocket_gate",
+                side_effect=websocket_gate,
+            ):
+                report = await run_deployment_activation(
+                    self.previous,
+                    self.candidate,
+                    "wss://asr.example.com/ws",
+                    release_root=releases,
+                    current_link=current,
+                    probe=RehearsalProbeConfig(
+                        backend="fake",
+                        model="model-a",
+                    ),
+                )
+
+            self.assertFalse(report.passed)
+            self.assertIsNotNone(report.rollback)
+            self.assertTrue(report.rollback.passed)
+            self.assertEqual(report.final_active_commit, self.previous)
+            self.assertEqual(os.readlink(current), str(releases / self.previous))
+            self.assertEqual(calls, 2)
+
+    async def test_cancelled_activation_still_restores_previous_release(self):
+        calls = 0
+
+        async def websocket_gate(_uri, **options):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise asyncio.CancelledError
+            return FakeWebSocketReport(options["source_commit"])
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            releases = root / "releases"
+            current = root / "current"
+            (releases / self.previous).mkdir(parents=True)
+            (releases / self.candidate).mkdir()
+            current.symlink_to(releases / self.previous)
+            patches = self._patches()
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7], patch.object(
+                rehearsal,
+                "run_websocket_gate",
+                side_effect=websocket_gate,
+            ), self.assertRaises(asyncio.CancelledError):
+                await run_deployment_activation(
+                    self.previous,
+                    self.candidate,
+                    "wss://asr.example.com/ws",
+                    release_root=releases,
+                    current_link=current,
+                    probe=RehearsalProbeConfig(
+                        backend="fake",
+                        model="model-a",
+                    ),
+                )
+
+            self.assertEqual(calls, 2)
+            self.assertEqual(os.readlink(current), str(releases / self.previous))
+
+    async def test_boot_change_after_candidate_probe_triggers_verified_rollback(self):
+        observed_commits = []
+
+        async def websocket_gate(_uri, **options):
+            observed_commits.append(options["source_commit"])
+            return FakeWebSocketReport(options["source_commit"])
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            releases = root / "releases"
+            current = root / "current"
+            (releases / self.previous).mkdir(parents=True)
+            (releases / self.candidate).mkdir()
+            current.symlink_to(releases / self.previous)
+            changed_boot = "87654321-4321-4321-8321-cba987654321"
+            patches = self._patches()
+            with patches[0], patches[1], patches[2], patches[3], patch.object(
+                rehearsal,
+                "_read_linux_boot_id",
+                side_effect=[self.boot_id, changed_boot, changed_boot],
+            ), patches[5], patches[6], patches[7], patch.object(
+                rehearsal,
+                "run_websocket_gate",
+                side_effect=websocket_gate,
+            ):
+                report = await run_deployment_activation(
+                    self.previous,
+                    self.candidate,
+                    "wss://asr.example.com/ws",
+                    release_root=releases,
+                    current_link=current,
+                    probe=RehearsalProbeConfig(
+                        backend="fake",
+                        model="model-a",
+                    ),
+                )
+
+            self.assertFalse(report.passed)
+            self.assertIsNotNone(report.rollback)
+            self.assertTrue(report.rollback.passed)
+            self.assertEqual(report.final_active_commit, self.previous)
+            self.assertEqual(os.readlink(current), str(releases / self.previous))
+            self.assertEqual(observed_commits, [self.candidate, self.previous])
 
     async def test_atomically_rolls_back_and_restores_candidate(self):
         observed_commits = []
