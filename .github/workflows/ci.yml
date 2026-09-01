@@ -35,6 +35,18 @@ jobs:
           sudo install -m 0755 /usr/bin/true /opt/turnalign/venv/bin/turnalign
           sudo touch /etc/turnalign/turnalign.env /var/lib/turnalign/warmup.wav
           systemd-analyze verify deploy/systemd/turnalign.service
+      - name: Verify Nginx deployment configuration
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes nginx-light
+          sudo install -d /etc/letsencrypt/live/asr.example.com
+          sudo openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+            -subj /CN=asr.example.com \
+            -keyout /etc/letsencrypt/live/asr.example.com/privkey.pem \
+            -out /etc/letsencrypt/live/asr.example.com/fullchain.pem
+          sudo install -m 0644 deploy/nginx/turnalign.conf.example \
+            /etc/nginx/conf.d/turnalign.conf
+          sudo nginx -t
 
   test:
     if: github.event_name != 'schedule'

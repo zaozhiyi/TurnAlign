@@ -130,6 +130,9 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   bounded recovery capacity, an unprivileged systemd security profile, TLS
   WebSocket upgrade headers, proxy rate/connection limits, disabled retry, and
   proxy timeouts longer than the application's idle timeout.
+  Ubuntu CI also parses the real unit with `systemd-analyze verify` and the
+  proxy configuration with `nginx -t` using an ephemeral self-signed test
+  certificate.
 - CodeQL runs the extended Python security query suite on pull requests and
   uploads trusted main/scheduled results to code scanning. Fork pull requests
   analyze without upload because their token is intentionally read-only. All
