@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import stat
 from contextlib import suppress
 from dataclasses import replace
 from itertools import chain
@@ -42,6 +43,62 @@ from .server import serve
 from .session import transcribe_events
 from .validation import EventStreamValidator
 from .websocket_gate import run_websocket_gate
+
+_MAX_AUTH_TOKEN_BYTES = 8 * 1024
+
+
+def _read_auth_token_file(path: Path) -> str:
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if not nofollow and path.is_symlink():
+        raise ValueError(f"cannot securely open authentication token file: {path}")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ValueError(f"cannot securely open authentication token file: {path}") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError(f"authentication token path is not a regular file: {path}")
+        if os.name == "posix" and stat.S_IMODE(metadata.st_mode) & 0o077:
+            raise ValueError(
+                "authentication token file must not be accessible by group or others"
+            )
+        with os.fdopen(descriptor, "rb") as source:
+            descriptor = -1
+            raw_token = source.read(_MAX_AUTH_TOKEN_BYTES + 1)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if len(raw_token) > _MAX_AUTH_TOKEN_BYTES:
+        raise ValueError(
+            f"authentication token file exceeds {_MAX_AUTH_TOKEN_BYTES} bytes"
+        )
+    if raw_token.endswith(b"\r\n"):
+        raw_token = raw_token[:-2]
+    elif raw_token.endswith((b"\r", b"\n")):
+        raw_token = raw_token[:-1]
+    if not raw_token or b"\r" in raw_token or b"\n" in raw_token or b"\x00" in raw_token:
+        raise ValueError("authentication token file must contain one non-empty token")
+    try:
+        return raw_token.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("authentication token file must contain UTF-8 text") from error
+
+
+def _authentication_token(args) -> str | None:
+    environment_name = getattr(args, "auth_token_env", None)
+    token_path = getattr(args, "auth_token_file", None)
+    if environment_name:
+        token = os.environ.get(environment_name)
+        if not token:
+            raise ValueError(
+                f"authentication token environment variable is empty: {environment_name}"
+            )
+        return token
+    if token_path is not None:
+        return _read_auth_token_file(token_path)
+    return None
 
 
 def _emit_gate_report(report, path: Path | None) -> None:
@@ -228,13 +285,7 @@ def release_gate(args) -> int:
 
 
 def websocket_gate(args) -> int:
-    auth_token = None
-    if args.auth_token_env:
-        auth_token = os.environ.get(args.auth_token_env)
-        if not auth_token:
-            raise ValueError(
-                f"authentication token environment variable is empty: {args.auth_token_env}"
-            )
+    auth_token = _authentication_token(args)
     report = asyncio.run(run_websocket_gate(
         args.uri,
         sessions=args.sessions,
@@ -763,9 +814,15 @@ def main() -> int:
     websocket_gate_parser.add_argument("--model")
     websocket_gate_parser.add_argument("--language")
     websocket_gate_parser.add_argument("--compute-type")
-    websocket_gate_parser.add_argument(
+    websocket_gate_auth = websocket_gate_parser.add_mutually_exclusive_group()
+    websocket_gate_auth.add_argument(
         "--auth-token-env",
         help="Environment variable containing the start-message auth token",
+    )
+    websocket_gate_auth.add_argument(
+        "--auth-token-file",
+        type=Path,
+        help="Restricted file containing the start-message auth token",
     )
     production_gate_parser = commands.add_parser(
         "production-gate",
@@ -935,9 +992,15 @@ def main() -> int:
         action="store_true",
         help="Allow binding beyond localhost; deploy TLS/auth in front",
     )
-    serve_parser.add_argument(
+    serve_auth = serve_parser.add_mutually_exclusive_group()
+    serve_auth.add_argument(
         "--auth-token-env",
         help="Environment variable containing the required start-message auth token",
+    )
+    serve_auth.add_argument(
+        "--auth-token-file",
+        type=Path,
+        help="Restricted file containing the required start-message auth token",
     )
     serve_parser.add_argument(
         "--allow-origin",
@@ -1107,13 +1170,7 @@ def main() -> int:
             level=getattr(logging, args.log_level),
             format="%(asctime)s %(levelname)s %(name)s %(message)s",
         )
-        auth_token = None
-        if args.auth_token_env:
-            auth_token = os.environ.get(args.auth_token_env)
-            if not auth_token:
-                raise ValueError(
-                    f"authentication token environment variable is empty: {args.auth_token_env}"
-                )
+        auth_token = _authentication_token(args)
         policy = ServerPolicy(
             allowed_backends=frozenset({args.backend, *args.allow_backend}),
             allowed_models=frozenset(

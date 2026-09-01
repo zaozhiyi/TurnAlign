@@ -48,7 +48,7 @@ The example paths assume:
 - executable: `/opt/turnalign/venv/bin/turnalign`
 - service account: `turnalign`
 - state/model cache: `/var/lib/turnalign`
-- configuration: `/etc/turnalign/turnalign.env`
+- root-only authentication credential: `/etc/turnalign/auth-token`
 - normalized warm-up audio: `/var/lib/turnalign/warmup.wav`
 
 Install the `server` and `funasr` extras in the image or virtual environment.
@@ -60,23 +60,25 @@ unreadable warm-up file therefore fail before the socket is ready.
 
 ## 2. Install the service
 
-Copy `systemd/turnalign.service` to `/etc/systemd/system/`. Copy
-`systemd/turnalign.env.example` to `/etc/turnalign/turnalign.env`, replace the
-placeholder with a random secret, and restrict the file to root and the service
-group:
+Copy `systemd/turnalign.service` to `/etc/systemd/system/`. Create a random
+credential readable only by root; systemd copies it into a protected per-service
+credentials directory instead of exposing it through the service environment:
 
 ```bash
-sudo install -d -m 0750 -o root -g turnalign /etc/turnalign
-sudo install -m 0640 -o root -g turnalign \
-  deploy/systemd/turnalign.env.example /etc/turnalign/turnalign.env
-openssl rand -hex 32
+sudo install -d -m 0700 -o root -g root /etc/turnalign
+sudo install -m 0600 -o root -g root /dev/null /etc/turnalign/auth-token
+openssl rand -hex 32 | sudo tee /etc/turnalign/auth-token >/dev/null
 sudo systemctl daemon-reload
 sudo systemctl enable --now turnalign
 curl --fail --silent http://127.0.0.1:8765/readyz
 curl --fail --silent http://127.0.0.1:8765/metrics
 ```
 
-Write the generated value into `TURNALIGN_AUTH_TOKEN` without committing it.
+Do not commit, print, or pass the generated token on a command line. The unit
+uses `LoadCredential=` and `--auth-token-file`; TurnAlign rejects symlinks,
+non-regular files, files readable by group/others, embedded newlines, NUL bytes,
+and credentials larger than 8 KiB. Rotate the token by atomically replacing the
+root-owned source file and restarting the service.
 Keep `TimeoutStopSec` greater than TurnAlign's `--shutdown-grace-timeout`.
 Capacity values in the unit are conservative starting points, not measured
 production targets. Size model memory, temporary disk, concurrency, and

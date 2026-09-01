@@ -348,6 +348,47 @@ class CliIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(captured["output_backpressure_timeout"], 2.5)
 
+    def test_authentication_token_file_is_restricted_and_bounded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            token_path = Path(directory) / "auth-token"
+            token_path.write_text("private-token\n", encoding="utf-8")
+            token_path.chmod(0o600)
+            args = SimpleNamespace(auth_token_env=None, auth_token_file=token_path)
+
+            self.assertEqual(cli._authentication_token(args), "private-token")
+
+            token_path.write_text("first\nsecond\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "one non-empty token"):
+                cli._authentication_token(args)
+
+            token_path.write_text("private-token\n\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "one non-empty token"):
+                cli._authentication_token(args)
+
+            token_path.write_bytes(b"x" * (8 * 1024 + 1))
+            with self.assertRaisesRegex(ValueError, "exceeds 8192 bytes"):
+                cli._authentication_token(args)
+
+            if os.name == "posix":
+                token_path.write_text("private-token\n", encoding="utf-8")
+                token_path.chmod(0o640)
+                with self.assertRaisesRegex(ValueError, "group or others"):
+                    cli._authentication_token(args)
+
+    @unittest.skipUnless(os.name == "posix", "secure symlink rejection is POSIX-only")
+    def test_authentication_token_file_rejects_symlinks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            token_path = root / "token"
+            token_path.write_text("private-token\n", encoding="utf-8")
+            token_path.chmod(0o600)
+            link_path = root / "link"
+            link_path.symlink_to(token_path)
+            args = SimpleNamespace(auth_token_env=None, auth_token_file=link_path)
+
+            with self.assertRaisesRegex(ValueError, "securely open"):
+                cli._authentication_token(args)
+
     def test_serve_exposes_lifecycle_timeouts(self):
         captured = {}
 
@@ -510,6 +551,38 @@ class CliIntegrationTests(unittest.TestCase):
         self.assertTrue(captured["verify_recovery"])
         self.assertEqual(captured["recovery_resume_timeout"], 7.0)
         self.assertEqual(captured["auth_token"], "private-token")
+
+    def test_websocket_gate_reads_restricted_auth_token_file(self):
+        captured = {}
+
+        class Report:
+            passed = True
+
+            @staticmethod
+            def to_dict():
+                return {"status": "passed"}
+
+        async def fake_gate(_uri, **options):
+            captured.update(options)
+            return Report()
+
+        with tempfile.TemporaryDirectory() as directory:
+            token_path = Path(directory) / "auth-token"
+            token_path.write_text("file-token\n", encoding="utf-8")
+            token_path.chmod(0o600)
+            with patch.object(cli, "run_websocket_gate", fake_gate), patch(
+                "sys.argv",
+                [
+                    "turnalign",
+                    "websocket-gate",
+                    "wss://asr.example/ws",
+                    "--auth-token-file",
+                    str(token_path),
+                ],
+            ):
+                self.assertEqual(cli.main(), 0)
+
+        self.assertEqual(captured["auth_token"], "file-token")
 
     def test_production_gate_maps_evidence_and_persists_verdict(self):
         captured = {}

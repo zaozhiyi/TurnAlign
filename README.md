@@ -185,15 +185,15 @@ turnalign quality-gate reference.jsonl release-events.jsonl \
 turnalign audio-devices
 turnalign record sample.wav --duration 10
 turnalign serve --backend glm-asr --device auto --language zh
-# 非本机部署必须显式 --allow-remote，并建议配置反向代理 TLS 与认证：
-TURNALIGN_AUTH_TOKEN=replace-me turnalign serve --backend glm-asr \
-  --language zh --allow-remote --auth-token-env TURNALIGN_AUTH_TOKEN --preload \
+# 非本机部署必须显式 --allow-remote，并建议配置反向代理 TLS 与文件型认证：
+turnalign serve --backend glm-asr --language zh --allow-remote \
+  --auth-token-file /path/to/restricted/auth-token --preload \
   --require-immutable-model-revision --allow-origin https://app.example
 turnalign websocket-gate wss://asr.example/ws --sessions 8 \
   --audio-seconds 60 --realtime --max-ready-seconds 10 \
   --max-total-seconds 75 --min-audio-acks 600 \
   --max-dropped-partials 0 --max-backpressure-pauses 0 --verify-recovery \
-  --auth-token-env TURNALIGN_AUTH_TOKEN --report websocket-report.json
+  --auth-token-file /path/to/restricted/auth-token --report websocket-report.json
 turnalign production-gate release-report.json quality-report.json websocket-report.json \
   --source-commit "$(git rev-parse HEAD)" \
   --artifact wheel=dist/turnalign.whl --artifact dependency-lock=requirements.lock \
@@ -424,7 +424,7 @@ turnalign websocket-gate wss://asr.example/ws --sessions 8 \
   --audio-seconds 60 --realtime --max-ready-seconds 10 \
   --max-total-seconds 75 --min-audio-acks 600 \
   --max-dropped-partials 0 --max-backpressure-pauses 0 --verify-recovery \
-  --auth-token-env TURNALIGN_AUTH_TOKEN --report websocket-report.json
+  --auth-token-file /path/to/restricted/auth-token --report websocket-report.json
 turnalign production-gate release-report.json quality-report.json websocket-report.json \
   --source-commit "$(git rev-parse HEAD)" \
   --artifact wheel=dist/turnalign.whl --artifact dependency-lock=requirements.lock \

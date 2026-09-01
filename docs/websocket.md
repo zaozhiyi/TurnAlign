@@ -15,15 +15,17 @@ clients from bypassing preloaded replicas with unbounded configuration variants.
 
 For a non-local deployment, terminate TLS and enforce rate limits at a trusted
 reverse proxy. TurnAlign can additionally require a start-message token loaded
-from an environment variable:
+from a restricted regular file or, for interactive use, an environment variable:
 
 ```bash
-export TURNALIGN_AUTH_TOKEN='replace-me'
-turnalign serve --allow-remote --auth-token-env TURNALIGN_AUTH_TOKEN \
+turnalign serve --allow-remote --auth-token-file /path/to/restricted/auth-token \
   --language zh --preload
 ```
 
-Do not put a literal token in shell history.
+The file must not be a symlink or be accessible by group or others. A single
+trailing line ending is accepted; embedded line endings, NUL bytes, empty files,
+and files larger than 8 KiB are rejected. Do not put a literal token in shell
+history. The reference systemd unit provisions this file with `LoadCredential=`.
 
 Connections without an `Origin` header are accepted by default. Browser
 connections are rejected unless their exact Origin is listed with repeated
@@ -300,15 +302,15 @@ sends generated silence as PCM16, honors pause/resume flow control, validates
 every event stream, and reports ready/total p95 latency, failures, audio
 acknowledgements, backpressure, and dropped partials. It never retains transcript
 text. Use `--realtime` for soak tests; omit it for burst tests. Authentication is
-accepted only through an environment variable, and credentials or query strings
-in the URI are rejected.
+accepted through `--auth-token-file` or `--auth-token-env`, and credentials or
+query strings in the URI are rejected.
 
 ```bash
 turnalign websocket-gate wss://asr.example/ws --sessions 8 \
   --audio-seconds 60 --realtime --max-ready-seconds 10 \
   --max-total-seconds 75 --min-audio-acks 600 \
   --max-dropped-partials 0 --verify-recovery \
-  --auth-token-env TURNALIGN_AUTH_TOKEN
+  --auth-token-file /path/to/restricted/auth-token
 ```
 
 The gate requires at least one audio acknowledgement per session and permits no

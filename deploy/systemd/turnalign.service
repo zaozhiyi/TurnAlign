@@ -16,8 +16,9 @@ CacheDirectory=turnalign
 Environment=HOME=/var/lib/turnalign
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
-EnvironmentFile=/etc/turnalign/turnalign.env
+LoadCredential=auth-token:/etc/turnalign/auth-token
 ExecStartPre=/usr/bin/test -r /var/lib/turnalign/warmup.wav
+ExecStartPre=/usr/bin/test -s ${CREDENTIALS_DIRECTORY}/auth-token
 ExecStart=/opt/turnalign/venv/bin/turnalign serve \
   --host 127.0.0.1 \
   --port 8765 \
@@ -26,7 +27,7 @@ ExecStart=/opt/turnalign/venv/bin/turnalign serve \
   --preload \
   --warmup-file /var/lib/turnalign/warmup.wav \
   --require-immutable-model-revision \
-  --auth-token-env TURNALIGN_AUTH_TOKEN \
+  --auth-token-file ${CREDENTIALS_DIRECTORY}/auth-token \
   --backend-replicas 1 \
   --max-concurrent-sessions 1 \
   --max-session-seconds 7200 \

@@ -5,7 +5,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SERVICE = ROOT / "deploy" / "systemd" / "turnalign.service"
 NGINX = ROOT / "deploy" / "nginx" / "turnalign.conf.example"
-ENVIRONMENT = ROOT / "deploy" / "systemd" / "turnalign.env.example"
+LEGACY_ENVIRONMENT = ROOT / "deploy" / "systemd" / "turnalign.env.example"
 
 
 def option_number(content: str, option: str) -> float:
@@ -23,8 +23,10 @@ class DeploymentArtifactTests(unittest.TestCase):
             "--preload",
             "--warmup-file /var/lib/turnalign/warmup.wav",
             "--require-immutable-model-revision",
-            "--auth-token-env TURNALIGN_AUTH_TOKEN",
+            "LoadCredential=auth-token:/etc/turnalign/auth-token",
+            "--auth-token-file ${CREDENTIALS_DIRECTORY}/auth-token",
             "ExecStartPre=/usr/bin/test -r /var/lib/turnalign/warmup.wav",
+            "ExecStartPre=/usr/bin/test -s ${CREDENTIALS_DIRECTORY}/auth-token",
         ):
             self.assertIn(setting, content)
         self.assertNotIn("--allow-remote", content)
@@ -80,10 +82,10 @@ class DeploymentArtifactTests(unittest.TestCase):
         self.assertRegex(nginx, r"location = /metrics\s*\{[^}]*return 404;")
         self.assertNotIn("proxy_pass http://turnalign_backend/metrics", nginx)
 
-    def test_secret_example_is_a_placeholder_and_deploy_is_packaged(self):
-        environment = ENVIRONMENT.read_text(encoding="utf-8")
-        self.assertIn("TURNALIGN_AUTH_TOKEN=replace-", environment)
-        self.assertNotRegex(environment, r"sk-[A-Za-z0-9_-]{16,}")
+    def test_secret_is_not_stored_in_the_deployment_bundle(self):
+        self.assertFalse(LEGACY_ENVIRONMENT.exists())
+        service = SERVICE.read_text(encoding="utf-8")
+        self.assertNotRegex(service, r"sk-[A-Za-z0-9_-]{16,}")
         pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
         self.assertIn('"/deploy"', pyproject)
 
