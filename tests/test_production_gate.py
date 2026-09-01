@@ -1786,6 +1786,7 @@ class ProductionGateTests(unittest.TestCase):
             production_gate_module.os,
             "geteuid",
             return_value=0,
+            create=True,
         ), patch.object(
             production_gate_module,
             "_active_release_commit",
