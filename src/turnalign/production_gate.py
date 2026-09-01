@@ -32,6 +32,7 @@ from .jsonutil import strict_json_loads
 _COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
 _MODEL_REVISION_PATTERN = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})")
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+_TRANSACTION_ID_PATTERN = re.compile(r"[0-9a-f]{64}")
 _BOOT_ID_PATTERN = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 )
@@ -50,6 +51,9 @@ _MAX_DEPLOYMENT_CONFIG_BYTES = 2 * 1024 * 1024
 _MAX_WHEEL_BYTES = 64 * 1024 * 1024
 _MAX_WHEEL_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
 _MAX_WHEEL_ENTRIES = 4_096
+_DEPLOYMENT_TRANSACTION_PATH = Path(
+    "/var/lib/turnalign-deployment/pending-activation.json"
+)
 _LOCK_REQUIREMENT_PATTERN = re.compile(
     r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([A-Za-z0-9][A-Za-z0-9.!+_-]*)(?:\s|;|$)"
 )
@@ -399,6 +403,16 @@ def create_host_profile(
     system = platform.system()
     if system != "Linux":
         raise RuntimeError("host-profile must run on the Linux production host")
+    try:
+        os.lstat(_DEPLOYMENT_TRANSACTION_PATH)
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        raise RuntimeError("cannot inspect pending deployment state") from error
+    else:
+        raise RuntimeError(
+            "host-profile refuses a pending deployment transaction; recover it first"
+        )
     runtime = _installed_runtime_identity(source_commit)
     bound_commit = runtime["turnalign_source_commit"]
     installed_distribution = _installed_distribution_identity(runtime)
@@ -1928,6 +1942,8 @@ def _validate_deployment_activation(
         "completed_at",
         "initial_active_commit",
         "final_active_commit",
+        "transaction_id",
+        "transaction_path",
         "activation",
         "rollback",
         "failures",
@@ -1938,9 +1954,17 @@ def _validate_deployment_activation(
     _passed_report("deployment activation", payload, failures)
     if (
         isinstance(payload.get("schema_version"), bool)
-        or payload.get("schema_version") != 1
+        or payload.get("schema_version") != 2
     ):
         failures.append("deployment activation has an unsupported schema version")
+    transaction_id = payload.get("transaction_id")
+    if (
+        not isinstance(transaction_id, str)
+        or _TRANSACTION_ID_PATTERN.fullmatch(transaction_id) is None
+        or payload.get("transaction_path")
+        != "/var/lib/turnalign-deployment/pending-activation.json"
+    ):
+        failures.append("deployment activation has invalid transaction identity")
     previous_commit = payload.get("previous_commit")
     if (
         payload.get("candidate_commit") != source_commit

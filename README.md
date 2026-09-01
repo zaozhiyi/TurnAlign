@@ -205,6 +205,12 @@ sudo /opt/turnalign/releases/$CANDIDATE_COMMIT/venv/bin/python \
   --model paraformer-zh-streaming \
   --auth-token-file /path/to/restricted/auth-token \
   --report deployment-activation.json
+# 仅当激活进程被 SIGKILL、断电或重启打断时执行；成功后重新激活。
+sudo /opt/turnalign/releases/$CANDIDATE_COMMIT/venv/bin/python \
+  -I -B -u -m turnalign.cli deployment-recover \
+  --backend funasr-streaming --model paraformer-zh-streaming \
+  --auth-token-file /path/to/restricted/auth-token \
+  --report deployment-recovery.json
 sudo /opt/turnalign/current/venv/bin/python -I -B -u -m turnalign.cli \
   deployment-rehearsal \
   wss://asr.example.com/ws --previous-commit "$PREVIOUS_COMMIT" \
@@ -247,7 +253,7 @@ python examples/websocket_file_client.py sample.wav --backend glm-asr --language
 
 ready 响应会公开非敏感的后端请求名、后端实现名、模型、设备和不可变模型 revision。`websocket-gate` 要求所有普通及恢复会话观察到完全一致的部署身份，`production-gate` 再把实际后端实现和模型 revision 与 release/quality 证据交叉校验，避免公网探测误测到另一套模型。
 
-各门禁和部署命令都可用 `--report` 原子保存 JSON 结论。`deployment-activate` 必须从尚未激活的候选 Wheel 运行：它在全局部署锁内原子切换、重启 systemd，并验证预加载就绪和公网 WebSocket 恢复；任一失败或取消都会恢复上一版并重做探测。激活成功后，`deployment-rehearsal` 再实际切回上一个不可变发布，并无条件恢复候选版本。`production-gate` 只在真实模型、人工标注质量、公网 WebSocket、正式激活和回滚/恢复报告均通过时放行；它要求 wheel、依赖锁、CycloneDX SBOM、发布音频、质量参考/输出、模型文件、模型清单、Nginx、systemd、正式激活、回滚演练和主机规格十三类制品。激活、演练与 `host-profile` 必须绑定同一 Linux boot 和同一对前序/候选版本；`host-profile` 还会绑定 Wheel 版本、版本化 Python 路径和其余十二类工件的名称、大小与 SHA-256。三份模型/质量/传输报告必须绑定同一源码提交，音频、质量输入和模型清单也会逐项校验。Wheel、systemd、Nginx、依赖锁和 SBOM 仍由聚合门禁独立重新解析；缺项、伪造转换、弱化探测或身份不一致都会返回非零退出码。
+各门禁和部署命令都可用 `--report` 原子保存 JSON 结论。`deployment-activate` 必须从尚未激活的候选 Wheel 运行：它先在 `/var/lib/turnalign-deployment/pending-activation.json` 落盘 root-only 事务标记，再在全局部署锁内原子切换、重启 systemd，并验证预加载就绪和公网 WebSocket 恢复；普通失败或取消会恢复上一版并重做探测。只有报告已安全写盘且最终活动版本正确，CLI 才删除事务标记。若进程遭遇 `SIGKILL`、断电或主机重启，使用候选 Wheel 的 `deployment-recover` 读取该标记、恢复上一版并完成相同探测，然后重新执行激活。未恢复的标记会阻止新激活、回滚演练和 `host-profile`。激活成功后，`deployment-rehearsal` 再实际切回上一个不可变发布，并无条件恢复候选版本。`production-gate` 只在真实模型、人工标注质量、公网 WebSocket、正式激活和回滚/恢复报告均通过时放行；它要求 wheel、依赖锁、CycloneDX SBOM、发布音频、质量参考/输出、模型文件、模型清单、Nginx、systemd、正式激活、回滚演练和主机规格十三类制品。激活、演练与 `host-profile` 必须绑定同一 Linux boot 和同一对前序/候选版本；正式激活报告还必须包含合法的持久事务身份，`host-profile` 会绑定 Wheel 版本、版本化 Python 路径和其余十二类工件的名称、大小与 SHA-256。三份模型/质量/传输报告必须绑定同一源码提交，音频、质量输入和模型清单也会逐项校验。Wheel、systemd、Nginx、依赖锁和 SBOM 仍由聚合门禁独立重新解析；缺项、伪造转换、弱化探测或身份不一致都会返回非零退出码。
 
 `host-profile` 的第 4 版证据还会逐文件哈希目标机上实际运行的 `turnalign/` 包；聚合门禁要求其路径、文件集、大小和 SHA-256 与保留 Wheel 完全一致。源码目录遮蔽、缺失/替换文件、符号链接、可写安装文件和额外 `__pycache__`/`.pyc` 均会失败。生产命令直接使用版本化 Python 的 `-I -B -u -m turnalign.cli`，隔离环境/用户路径、禁止生成字节码并保持日志无缓冲，不信任安装器生成的 console launcher。
 
@@ -479,6 +485,12 @@ sudo /opt/turnalign/releases/$CANDIDATE_COMMIT/venv/bin/python \
   --model paraformer-zh-streaming \
   --auth-token-file /path/to/restricted/auth-token \
   --report deployment-activation.json
+# Run only after SIGKILL, power loss, or reboot interrupts activation; reactivate next.
+sudo /opt/turnalign/releases/$CANDIDATE_COMMIT/venv/bin/python \
+  -I -B -u -m turnalign.cli deployment-recover \
+  --backend funasr-streaming --model paraformer-zh-streaming \
+  --auth-token-file /path/to/restricted/auth-token \
+  --report deployment-recovery.json
 sudo /opt/turnalign/current/venv/bin/python -I -B -u -m turnalign.cli \
   deployment-rehearsal \
   wss://asr.example.com/ws --previous-commit "$PREVIOUS_COMMIT" \
@@ -607,9 +619,16 @@ TTL; the probe will fail if reconnects reach another instance.
 
 The executable gates and deployment commands accept `--report` to atomically
 persist their JSON verdict. Run `deployment-activate` from the inactive candidate
-Wheel: under the global deployment lock it atomically switches the release,
-restarts systemd, and proves preloaded readiness plus public WebSocket recovery.
-Failure or cancellation restores and reprobes the preceding release. After a
+Wheel. It first persists a root-only marker at
+`/var/lib/turnalign-deployment/pending-activation.json`; under the global
+deployment lock it then atomically switches the release, restarts systemd, and
+proves preloaded readiness plus public WebSocket recovery. Ordinary failure or
+cancellation restores and reprobes the preceding release. The CLI removes the
+marker only after its report is durable and the expected release is active. If
+SIGKILL, power loss, or reboot interrupts the command, run `deployment-recover`
+from the candidate Wheel; it reads the bounded marker, restores and reprobes the
+preceding release, then the activation must be rerun. A pending marker blocks
+activation, rehearsal, and `host-profile`. After a
 successful activation, `deployment-rehearsal` switches to the preceding release
 and unconditionally restores and reprobes the candidate. `production-gate`
 releases only when the real-model, labelled-quality, public WebSocket, activation

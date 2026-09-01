@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import json
 import os
 import platform
 import re
@@ -26,8 +27,16 @@ _SERVICE_PATTERN = re.compile(r"[A-Za-z0-9_.@-]{1,128}\.service")
 _MAX_IDENTITY_BYTES = 65
 _MAX_READY_BYTES = 8 * 1024
 _MAX_FAILURE_CHARACTERS = 1_024
+_MAX_TRANSACTION_BYTES = 16 * 1024
 _DEPLOYMENT_LOCK_PATH = Path("/run/lock/turnalign-deployment.lock")
+_DEPLOYMENT_TRANSACTION_PATH = Path(
+    "/var/lib/turnalign-deployment/pending-activation.json"
+)
 _DNS_LABEL_PATTERN = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+_TRANSACTION_ID_PATTERN = re.compile(r"[0-9a-f]{64}")
+_BOOT_ID_PATTERN = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+)
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -153,8 +162,61 @@ class DeploymentActivationReport:
     completed_at: str
     initial_active_commit: str
     final_active_commit: str | None
+    transaction_id: str
+    transaction_path: str
     activation: RehearsalPhaseReport
     rollback: RehearsalPhaseReport | None
+    failures: tuple[str, ...]
+
+    @property
+    def passed(self) -> bool:
+        return self.status == "passed" and not self.failures
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class PendingDeploymentTransaction:
+    schema_version: int
+    transaction_id: str
+    previous_commit: str
+    candidate_commit: str
+    boot_id: str
+    release_root: str
+    current_link: str
+    service: str
+    systemctl: str
+    ready_uri: str
+    websocket_uri: str
+    created_at: str
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class DeploymentRecoveryReport:
+    schema_version: int
+    status: str
+    transaction_id: str
+    transaction_path: str
+    candidate_commit: str
+    previous_commit: str
+    original_boot_id: str
+    recovery_boot_id: str
+    release_root: str
+    current_link: str
+    lock_path: str
+    service: str
+    systemctl: str
+    ready_uri: str
+    websocket_uri: str
+    started_at: str
+    completed_at: str
+    initial_active_commit: str | None
+    final_active_commit: str | None
+    recovery: RehearsalPhaseReport
     failures: tuple[str, ...]
 
     @property
@@ -353,6 +415,266 @@ def _fsync_directory(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _required_transaction_owner() -> int:
+    return 0
+
+
+def _validate_transaction_directory(path: Path) -> None:
+    parent = path.parent
+    if not path.is_absolute() or Path(os.path.normpath(str(path))) != path:
+        raise ValueError("deployment transaction path must be absolute and normalized")
+    try:
+        metadata = os.lstat(parent)
+    except FileNotFoundError:
+        try:
+            os.mkdir(parent, 0o700)
+        except OSError as error:
+            raise RuntimeError(
+                "cannot create the root-only deployment transaction directory"
+            ) from error
+        metadata = os.lstat(parent)
+        _fsync_directory(parent.parent)
+    except OSError as error:
+        raise RuntimeError(
+            "cannot inspect the deployment transaction directory"
+        ) from error
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != _required_transaction_owner()
+        or stat.S_IMODE(metadata.st_mode) & 0o077
+    ):
+        raise RuntimeError(
+            "deployment transaction directory must be a root-only regular directory"
+        )
+
+
+def _transaction_from_payload(payload: object) -> PendingDeploymentTransaction:
+    expected_fields = {
+        "schema_version",
+        "transaction_id",
+        "previous_commit",
+        "candidate_commit",
+        "boot_id",
+        "release_root",
+        "current_link",
+        "service",
+        "systemctl",
+        "ready_uri",
+        "websocket_uri",
+        "created_at",
+    }
+    if not isinstance(payload, dict) or set(payload) != expected_fields:
+        raise ValueError("deployment transaction has an invalid schema")
+    if payload.get("schema_version") != 1 or isinstance(
+        payload.get("schema_version"), bool
+    ):
+        raise ValueError("deployment transaction has an unsupported schema version")
+    transaction_id = payload.get("transaction_id")
+    previous_commit = payload.get("previous_commit")
+    candidate_commit = payload.get("candidate_commit")
+    boot_id = payload.get("boot_id")
+    string_fields = {
+        field: payload.get(field)
+        for field in (
+            "release_root",
+            "current_link",
+            "service",
+            "systemctl",
+            "ready_uri",
+            "websocket_uri",
+            "created_at",
+        )
+    }
+    if (
+        not isinstance(transaction_id, str)
+        or _TRANSACTION_ID_PATTERN.fullmatch(transaction_id) is None
+        or not isinstance(previous_commit, str)
+        or _COMMIT_PATTERN.fullmatch(previous_commit) is None
+        or not isinstance(candidate_commit, str)
+        or _COMMIT_PATTERN.fullmatch(candidate_commit) is None
+        or candidate_commit == previous_commit
+        or not isinstance(boot_id, str)
+        or _BOOT_ID_PATTERN.fullmatch(boot_id) is None
+        or any(not isinstance(value, str) for value in string_fields.values())
+    ):
+        raise ValueError("deployment transaction contains invalid identities")
+    release_root = Path(str(string_fields["release_root"]))
+    current_link = Path(str(string_fields["current_link"]))
+    _validate_layout(release_root, current_link)
+    _validate_ready_uri(str(string_fields["ready_uri"]))
+    _validate_websocket_uri(str(string_fields["websocket_uri"]))
+    service = str(string_fields["service"])
+    if _SERVICE_PATTERN.fullmatch(service) is None:
+        raise ValueError("deployment transaction contains an invalid service")
+    if string_fields["systemctl"] != "/usr/bin/systemctl":
+        raise ValueError("deployment transaction contains an invalid systemctl path")
+    try:
+        created_at = datetime.fromisoformat(
+            str(string_fields["created_at"]).replace("Z", "+00:00")
+        )
+    except ValueError as error:
+        raise ValueError("deployment transaction has an invalid timestamp") from error
+    if created_at.tzinfo is None:
+        raise ValueError("deployment transaction timestamp must include a timezone")
+    return PendingDeploymentTransaction(
+        schema_version=1,
+        transaction_id=transaction_id,
+        previous_commit=previous_commit,
+        candidate_commit=candidate_commit,
+        boot_id=boot_id,
+        release_root=str(release_root),
+        current_link=str(current_link),
+        service=service,
+        systemctl=str(string_fields["systemctl"]),
+        ready_uri=str(string_fields["ready_uri"]),
+        websocket_uri=str(string_fields["websocket_uri"]),
+        created_at=str(string_fields["created_at"]),
+    )
+
+
+def _read_pending_transaction() -> PendingDeploymentTransaction:
+    path = _DEPLOYMENT_TRANSACTION_PATH
+    _validate_transaction_directory(path)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow,
+        )
+    except OSError as error:
+        raise RuntimeError("no recoverable deployment transaction exists") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != _required_transaction_owner()
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) & 0o077
+            or metadata.st_size > _MAX_TRANSACTION_BYTES
+        ):
+            raise RuntimeError(
+                "deployment transaction must be a bounded root-only regular file"
+            )
+        identity = (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+        )
+        chunks = []
+        remaining = _MAX_TRANSACTION_BYTES + 1
+        while remaining:
+            block = os.read(descriptor, min(remaining, 4 * 1024))
+            if not block:
+                break
+            chunks.append(block)
+            remaining -= len(block)
+        raw = b"".join(chunks)
+        final_metadata = os.fstat(descriptor)
+        final_identity = (
+            final_metadata.st_dev,
+            final_metadata.st_ino,
+            final_metadata.st_size,
+            final_metadata.st_mtime_ns,
+            final_metadata.st_ctime_ns,
+        )
+        if (
+            len(raw) > _MAX_TRANSACTION_BYTES
+            or len(raw) != metadata.st_size
+            or final_identity != identity
+        ):
+            raise RuntimeError(
+                "deployment transaction changed while being read or exceeds its limit"
+            )
+    finally:
+        os.close(descriptor)
+    try:
+        payload = strict_json_loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as error:
+        raise RuntimeError("deployment transaction is not strict JSON") from error
+    try:
+        return _transaction_from_payload(payload)
+    except ValueError as error:
+        raise RuntimeError(str(error)) from error
+
+
+def _write_pending_transaction(transaction: PendingDeploymentTransaction) -> None:
+    path = _DEPLOYMENT_TRANSACTION_PATH
+    _validate_transaction_directory(path)
+    _reject_pending_transaction()
+    payload = (
+        json.dumps(
+            transaction.to_dict(),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    if len(payload) > _MAX_TRANSACTION_BYTES:
+        raise RuntimeError("deployment transaction exceeds its size limit")
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    temporary = path.parent / f".{path.name}.{secrets.token_hex(16)}.tmp"
+    try:
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | nofollow,
+            0o600,
+        )
+    except OSError as error:
+        raise RuntimeError("cannot create the deployment transaction") from error
+    installed = False
+    try:
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("deployment transaction write made no progress")
+            view = view[written:]
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(temporary, path)
+        installed = True
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if not installed:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+    _fsync_directory(path.parent)
+
+
+def _remove_pending_transaction(transaction_id: str) -> None:
+    transaction = _read_pending_transaction()
+    if transaction.transaction_id != transaction_id:
+        raise RuntimeError("deployment transaction identity changed")
+    try:
+        _DEPLOYMENT_TRANSACTION_PATH.unlink()
+    except OSError as error:
+        raise RuntimeError("cannot remove the deployment transaction") from error
+    _fsync_directory(_DEPLOYMENT_TRANSACTION_PATH.parent)
+
+
+def _reject_pending_transaction() -> None:
+    try:
+        os.lstat(_DEPLOYMENT_TRANSACTION_PATH)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise RuntimeError("cannot inspect the deployment transaction") from error
+    raise RuntimeError("a pending deployment transaction must be recovered first")
 
 
 def _activate_release(release_root: Path, current_link: Path, commit: str) -> None:
@@ -782,7 +1104,7 @@ async def _run_deployment_activation_locked(
     probe: RehearsalProbeConfig | None = None,
     auth_token: str | None = None,
 ) -> DeploymentActivationReport:
-    """Activate and probe a candidate, restoring the previous release on failure."""
+    """Activate and probe a candidate, leaving its marker for report finalization."""
 
     if platform.system() != "Linux":
         raise RuntimeError("deployment activation must run on the Linux production host")
@@ -824,6 +1146,21 @@ async def _run_deployment_activation_locked(
         raise ValueError("preceding release must be active before candidate activation")
     boot_id = _read_linux_boot_id()
     started_at = _utc_timestamp()
+    transaction = PendingDeploymentTransaction(
+        schema_version=1,
+        transaction_id=secrets.token_hex(32),
+        previous_commit=previous_commit,
+        candidate_commit=candidate_commit,
+        boot_id=boot_id,
+        release_root=str(release_root),
+        current_link=str(current_link),
+        service=service,
+        systemctl=str(systemctl),
+        ready_uri=ready_uri,
+        websocket_uri=websocket_uri,
+        created_at=started_at,
+    )
+    _write_pending_transaction(transaction)
 
     activation: RehearsalPhaseReport | None = None
     rollback: RehearsalPhaseReport | None = None
@@ -925,7 +1262,7 @@ async def _run_deployment_activation_locked(
     except RuntimeError as error:
         failures.append(_failure_text(error))
     return DeploymentActivationReport(
-        schema_version=1,
+        schema_version=2,
         status="failed" if failures else "passed",
         candidate_commit=candidate_commit,
         previous_commit=previous_commit,
@@ -941,8 +1278,114 @@ async def _run_deployment_activation_locked(
         completed_at=_utc_timestamp(),
         initial_active_commit=initial_active_commit,
         final_active_commit=final_active_commit,
+        transaction_id=transaction.transaction_id,
+        transaction_path=str(_DEPLOYMENT_TRANSACTION_PATH),
         activation=activation,
         rollback=rollback,
+        failures=tuple(failures),
+    )
+
+
+async def _run_deployment_recovery_locked(
+    *,
+    restart_timeout: float = 120.0,
+    readiness_timeout: float = 300.0,
+    readiness_interval: float = 1.0,
+    probe: RehearsalProbeConfig | None = None,
+    auth_token: str | None = None,
+) -> DeploymentRecoveryReport:
+    """Restore and probe the prior release from a durable interrupted transaction."""
+
+    if platform.system() != "Linux":
+        raise RuntimeError("deployment recovery must run on the Linux production host")
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        raise PermissionError("deployment recovery must run as root")
+    for label, value in (
+        ("restart_timeout", restart_timeout),
+        ("readiness_timeout", readiness_timeout),
+        ("readiness_interval", readiness_interval),
+    ):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            raise ValueError(f"{label} must be positive")
+    selected_probe = probe or RehearsalProbeConfig()
+    if selected_probe.backend is None or selected_probe.model is None:
+        raise ValueError("deployment recovery requires an explicit backend and model")
+
+    transaction = _read_pending_transaction()
+    runtime = _installed_runtime_identity(transaction.candidate_commit)
+    if runtime["turnalign_source_commit"] != transaction.candidate_commit:
+        raise RuntimeError("candidate runtime identity changed during recovery")
+    release_root = Path(transaction.release_root)
+    current_link = Path(transaction.current_link)
+    systemctl = Path(transaction.systemctl)
+    _validate_release_directory(release_root, transaction.previous_commit)
+    _validate_release_directory(release_root, transaction.candidate_commit)
+    try:
+        initial_active_commit = _active_commit(release_root, current_link)
+    except ValueError:
+        initial_active_commit = None
+    if initial_active_commit not in {
+        transaction.previous_commit,
+        transaction.candidate_commit,
+    }:
+        raise RuntimeError(
+            "pending deployment transaction does not match the active release"
+        )
+    recovery_boot_id = _read_linux_boot_id()
+    started_at = _utc_timestamp()
+    recovery = await _exercise_phase(
+        "crash-recovery",
+        transaction.previous_commit,
+        release_root=release_root,
+        current_link=current_link,
+        systemctl=systemctl,
+        service=transaction.service,
+        ready_uri=transaction.ready_uri,
+        websocket_uri=transaction.websocket_uri,
+        restart_timeout=restart_timeout,
+        readiness_timeout=readiness_timeout,
+        readiness_interval=readiness_interval,
+        probe=selected_probe,
+        auth_token=auth_token,
+    )
+    failures: list[str] = []
+    if not recovery.passed:
+        failures.append("interrupted deployment recovery phase did not pass")
+    if recovery.from_commit != initial_active_commit:
+        failures.append("deployment recovery observed an inconsistent active release")
+    try:
+        final_active_commit = _active_commit(release_root, current_link)
+    except ValueError as error:
+        final_active_commit = None
+        failures.append(_failure_text(error))
+    if final_active_commit != transaction.previous_commit:
+        failures.append("deployment recovery did not restore the preceding release")
+    try:
+        if _read_linux_boot_id() != recovery_boot_id:
+            failures.append("host rebooted during deployment recovery")
+    except RuntimeError as error:
+        failures.append(_failure_text(error))
+    return DeploymentRecoveryReport(
+        schema_version=1,
+        status="failed" if failures else "passed",
+        transaction_id=transaction.transaction_id,
+        transaction_path=str(_DEPLOYMENT_TRANSACTION_PATH),
+        candidate_commit=transaction.candidate_commit,
+        previous_commit=transaction.previous_commit,
+        original_boot_id=transaction.boot_id,
+        recovery_boot_id=recovery_boot_id,
+        release_root=transaction.release_root,
+        current_link=transaction.current_link,
+        lock_path=str(_DEPLOYMENT_LOCK_PATH),
+        service=transaction.service,
+        systemctl=transaction.systemctl,
+        ready_uri=transaction.ready_uri,
+        websocket_uri=transaction.websocket_uri,
+        started_at=started_at,
+        completed_at=_utc_timestamp(),
+        initial_active_commit=initial_active_commit,
+        final_active_commit=final_active_commit,
+        recovery=recovery,
         failures=tuple(failures),
     )
 
@@ -1005,6 +1448,7 @@ async def run_deployment_rehearsal(
         raise PermissionError("deployment rehearsal must run as root")
     lock_descriptor = _acquire_deployment_lock()
     try:
+        _reject_pending_transaction()
         return await _run_deployment_rehearsal_locked(
             previous_commit,
             candidate_commit,
@@ -1063,5 +1507,67 @@ async def run_deployment_activation(
             probe=probe,
             auth_token=auth_token,
         )
+    finally:
+        os.close(lock_descriptor)
+
+
+async def run_deployment_recovery(
+    *,
+    restart_timeout: float = 120.0,
+    readiness_timeout: float = 300.0,
+    readiness_interval: float = 1.0,
+    probe: RehearsalProbeConfig | None = None,
+    auth_token: str | None = None,
+) -> DeploymentRecoveryReport:
+    """Recover an interrupted activation, leaving its marker for finalization."""
+
+    if platform.system() != "Linux":
+        raise RuntimeError("deployment recovery must run on the Linux production host")
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        raise PermissionError("deployment recovery must run as root")
+    lock_descriptor = _acquire_deployment_lock()
+    try:
+        return await _run_deployment_recovery_locked(
+            restart_timeout=restart_timeout,
+            readiness_timeout=readiness_timeout,
+            readiness_interval=readiness_interval,
+            probe=probe,
+            auth_token=auth_token,
+        )
+    finally:
+        os.close(lock_descriptor)
+
+
+def finalize_deployment_transaction(
+    transaction_id: str,
+    expected_active_commit: str,
+) -> None:
+    """Remove a durable marker only after its report is safely persisted."""
+
+    if platform.system() != "Linux":
+        raise RuntimeError("deployment finalization must run on the Linux production host")
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        raise PermissionError("deployment finalization must run as root")
+    if _TRANSACTION_ID_PATTERN.fullmatch(transaction_id) is None:
+        raise ValueError("transaction ID must be a lowercase 64-character hash")
+    if _COMMIT_PATTERN.fullmatch(expected_active_commit) is None:
+        raise ValueError("expected active commit must be a lowercase 40-character hash")
+    lock_descriptor = _acquire_deployment_lock()
+    try:
+        transaction = _read_pending_transaction()
+        if transaction.transaction_id != transaction_id:
+            raise RuntimeError("deployment transaction identity changed")
+        if expected_active_commit not in {
+            transaction.previous_commit,
+            transaction.candidate_commit,
+        }:
+            raise RuntimeError("deployment finalization selected an unrelated release")
+        active_commit = _active_commit(
+            Path(transaction.release_root),
+            Path(transaction.current_link),
+        )
+        if active_commit != expected_active_commit:
+            raise RuntimeError("deployment finalization observed the wrong active release")
+        _remove_pending_transaction(transaction_id)
     finally:
         os.close(lock_descriptor)

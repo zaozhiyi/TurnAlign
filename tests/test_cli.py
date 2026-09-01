@@ -741,10 +741,15 @@ class CliIntegrationTests(unittest.TestCase):
 
         class Report:
             passed = True
+            candidate_commit = "b" * 40
+            previous_commit = "a" * 40
+            final_active_commit = candidate_commit
+            rollback = None
+            transaction_id = "d" * 64
 
             @staticmethod
             def to_dict():
-                return {"schema_version": 1, "status": "passed", "failures": []}
+                return {"schema_version": 2, "status": "passed", "failures": []}
 
         async def fake_activation(previous, candidate, uri, **options):
             captured.update({
@@ -757,10 +762,19 @@ class CliIntegrationTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "activation.json"
+
+            def fake_finalize(transaction_id, active_commit):
+                captured["finalized"] = (transaction_id, active_commit)
+                self.assertTrue(output.exists())
+
             with patch.object(
                 cli,
                 "run_deployment_activation",
                 side_effect=fake_activation,
+            ), patch.object(
+                cli,
+                "finalize_deployment_transaction",
+                side_effect=fake_finalize,
             ), patch(
                 "sys.argv",
                 [
@@ -785,6 +799,57 @@ class CliIntegrationTests(unittest.TestCase):
             self.assertEqual(captured["candidate"], "b" * 40)
             self.assertEqual(captured["uri"], "wss://asr.example.com/ws")
             self.assertEqual(captured["probe"].backend, "funasr-streaming")
+            self.assertEqual(captured["finalized"], ("d" * 64, "b" * 40))
+            self.assertEqual(json.loads(output.read_text())["status"], "passed")
+
+    def test_deployment_recovery_persists_evidence_before_finalizing_marker(self):
+        captured = {}
+
+        class Report:
+            passed = True
+            transaction_id = "d" * 64
+            previous_commit = "a" * 40
+
+            @staticmethod
+            def to_dict():
+                return {"schema_version": 1, "status": "passed", "failures": []}
+
+        async def fake_recovery(**options):
+            captured.update(options)
+            return Report()
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "recovery.json"
+
+            def fake_finalize(transaction_id, active_commit):
+                captured["finalized"] = (transaction_id, active_commit)
+                self.assertTrue(output.exists())
+
+            with patch.object(
+                cli,
+                "run_deployment_recovery",
+                side_effect=fake_recovery,
+            ), patch.object(
+                cli,
+                "finalize_deployment_transaction",
+                side_effect=fake_finalize,
+            ), patch(
+                "sys.argv",
+                [
+                    "turnalign",
+                    "deployment-recover",
+                    "--backend",
+                    "funasr-streaming",
+                    "--model",
+                    "paraformer-zh-streaming",
+                    "--report",
+                    str(output),
+                ],
+            ), patch("builtins.print"):
+                self.assertEqual(cli.main(), 0)
+
+            self.assertEqual(captured["probe"].backend, "funasr-streaming")
+            self.assertEqual(captured["finalized"], ("d" * 64, "a" * 40))
             self.assertEqual(json.loads(output.read_text())["status"], "passed")
 
     def test_model_manifest_hashes_files_and_persists_provenance(self):

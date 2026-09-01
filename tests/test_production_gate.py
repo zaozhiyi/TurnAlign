@@ -339,7 +339,7 @@ class ProductionGateTests(unittest.TestCase):
             "completed_at": "2026-09-01T07:59:03.000Z",
         })
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "status": "passed",
             "candidate_commit": "b" * 40,
             "previous_commit": "c" * 40,
@@ -355,6 +355,10 @@ class ProductionGateTests(unittest.TestCase):
             "completed_at": "2026-09-01T07:59:04.000Z",
             "initial_active_commit": "c" * 40,
             "final_active_commit": "b" * 40,
+            "transaction_id": "e" * 64,
+            "transaction_path": (
+                "/var/lib/turnalign-deployment/pending-activation.json"
+            ),
             "activation": activation,
             "rollback": None,
             "failures": [],
@@ -944,6 +948,14 @@ class ProductionGateTests(unittest.TestCase):
                     "deployment activation report did not pass",
                 ),
                 (
+                    lambda payload: payload.update(transaction_id="e" * 63),
+                    "invalid transaction identity",
+                ),
+                (
+                    lambda payload: payload.update(transaction_path="/tmp/pending"),
+                    "invalid transaction identity",
+                ),
+                (
                     lambda payload: payload.update(initial_active_commit="b" * 40),
                     "not bound to one prior and candidate release",
                 ),
@@ -1197,6 +1209,21 @@ class ProductionGateTests(unittest.TestCase):
             return_value="Darwin",
         ), self.assertRaisesRegex(RuntimeError, "Linux production host"):
             create_host_profile(None, [])
+
+    def test_host_profile_refuses_pending_deployment_transaction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pending = Path(directory) / "pending-activation.json"
+            pending.write_text("{}\n", encoding="utf-8")
+            with patch.object(
+                production_gate_module.platform,
+                "system",
+                return_value="Linux",
+            ), patch.object(
+                production_gate_module,
+                "_DEPLOYMENT_TRANSACTION_PATH",
+                pending,
+            ), self.assertRaisesRegex(RuntimeError, "pending deployment"):
+                create_host_profile(None, [])
 
     def test_rejects_weakened_or_comment_only_systemd_controls(self):
         with tempfile.TemporaryDirectory() as directory:

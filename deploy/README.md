@@ -198,12 +198,34 @@ Before routing users, retain all of the following with the release artifact:
    ```
 
    The command refuses an already-active candidate. It takes the root-only
-   non-blocking lock at `/run/lock/turnalign-deployment.lock`, switches and
+   non-blocking lock at `/run/lock/turnalign-deployment.lock`, first persists a
+   bounded root-only marker at
+   `/var/lib/turnalign-deployment/pending-activation.json`, switches and
    restarts exactly once, then requires preloaded readiness and a real-time
    concurrent public recovery probe. Failure or cancellation switches back to
    the preceding release, restarts it, and repeats both probes before returning
-   control. Retain the report; only a successful activation report can pass the
-   aggregate production gate.
+   control. The marker is removed only after the report is durably written and
+   the expected release is active. Retain the report; only a successful
+   activation report can pass the aggregate production gate.
+
+   `finally` cannot handle SIGKILL, power loss, or a host reboot. If activation
+   ends without a report, do not edit `current` or delete the marker manually.
+   Run the candidate-installed recovery command:
+
+   ```bash
+   sudo /opt/turnalign/releases/<candidate-source-commit>/venv/bin/python \
+     -I -B -u -m turnalign.cli deployment-recover \
+     --backend funasr-streaming --model paraformer-zh-streaming \
+     --auth-token-file /etc/turnalign/auth-token \
+     --report deployment-recovery.json
+   ```
+
+   It accepts only the immutable release pair recorded before activation,
+   restores the preceding release, restarts it, and repeats readiness plus the
+   public recovery probe. A successful recovery report is operational evidence,
+   not one of the thirteen final artifacts; rerun activation to produce a new
+   final report. A pending marker blocks another activation, rehearsal, and
+   `host-profile`.
 7. With the candidate now active, exercise the rollback and restore path:
 
    ```bash
@@ -217,7 +239,8 @@ Before routing users, retain all of the following with the release artifact:
      --report rollback-rehearsal.json
    ```
 
-   Keep the exact `-I -B -u -m turnalign.cli` prefix for both commands: it ignores environment/user
+   Keep the exact `-I -B -u -m turnalign.cli` prefix for all deployment commands:
+   it ignores environment/user
    import paths, bypasses the installer-generated console launcher, disables
    bytecode generation, and keeps journal output unbuffered. The final gate
    requires the installed package tree to
@@ -226,8 +249,8 @@ Before routing users, retain all of the following with the release artifact:
    non-Linux/non-root execution, an unbound candidate
    runtime, mutable or non-root-owned release directories, a non-public probe,
    and any initial active release other than the candidate. A root-only
-   same non-blocking lock prevents a second activation or rehearsal from racing
-   the symlink transition. The rehearsal switches to the
+   same non-blocking lock prevents activation, recovery, or rehearsal from racing
+   a symlink transition. The rehearsal switches to the
    preceding release, restarts and checks `systemctl is-active`, requires
    preloaded readiness plus a real-time concurrent public recovery probe, then
    restores and reprobes the candidate. Probe failure or cancellation still

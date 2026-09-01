@@ -21,7 +21,7 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   materialization limit before constructing the float model input.
 - All source and test modules pass `compileall`.
 - Ruff is enforced in CI and passes over `src` and `tests`.
-- The built wheel passes all 291 tests from site-packages on Python 3.10 with
+- The built wheel passes all 312 tests from site-packages on Python 3.12 with
   `websockets` 14.0 and on Python 3.12 with `websockets` 17.1. The Python 3.12
   run also passes under `python -O`, so production invariants do not depend on
   removable `assert` statements.
@@ -77,8 +77,13 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   with `--report`. Activation runs from the inactive candidate Wheel as root on
   the Linux target. Under a root-only non-blocking deployment lock it atomically
   activates the candidate, restarts systemd, and proves preloaded readiness plus
-  a public concurrent recovery probe. Failure or cancellation restores and
-  reprobes the preceding immutable release. After successful activation, the
+  a public concurrent recovery probe. Before switching, it persists a bounded
+  root-only transaction marker. Failure or cancellation restores and reprobes
+  the preceding immutable release, and the marker is removed only after the
+  report is durable. SIGKILL, power loss, or reboot leaves the marker for
+  `turnalign deployment-recover`, which restores and reprobes the exact recorded
+  preceding release. Pending state blocks activation, rehearsal, and host-profile
+  capture. After successful activation, the
   rehearsal uses the same lock to switch to the preceding release, repeat those
   checks, then restore and reprobe the candidate even after a failed rollback
   probe.

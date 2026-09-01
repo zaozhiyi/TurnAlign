@@ -24,7 +24,9 @@ from .audio import (
 from .backends.jsonl import JsonlBackend
 from .deployment_rehearsal import (
     RehearsalProbeConfig,
+    finalize_deployment_transaction,
     run_deployment_activation,
+    run_deployment_recovery,
     run_deployment_rehearsal,
 )
 from .devices import runtime_report
@@ -440,6 +442,35 @@ def deployment_activation(args) -> int:
         auth_token=auth_token,
     ))
     _emit_gate_report(report, args.report)
+    safely_active = None
+    if report.passed:
+        safely_active = report.candidate_commit
+    elif (
+        report.rollback is not None
+        and report.rollback.passed
+        and report.final_active_commit == report.previous_commit
+    ):
+        safely_active = report.previous_commit
+    if safely_active is not None:
+        finalize_deployment_transaction(report.transaction_id, safely_active)
+    return 0 if report.passed else 1
+
+
+def deployment_recovery(args) -> int:
+    auth_token = _authentication_token(args)
+    report = asyncio.run(run_deployment_recovery(
+        restart_timeout=args.restart_timeout,
+        readiness_timeout=args.readiness_timeout,
+        readiness_interval=args.readiness_interval,
+        probe=_deployment_probe(args),
+        auth_token=auth_token,
+    ))
+    _emit_gate_report(report, args.report)
+    if report.passed:
+        finalize_deployment_transaction(
+            report.transaction_id,
+            report.previous_commit,
+        )
     return 0 if report.passed else 1
 
 
@@ -820,18 +851,7 @@ def _add_postprocess_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _add_deployment_operation_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("uri", help="Public wss:// production endpoint")
-    parser.add_argument(
-        "--previous-commit",
-        type=_source_commit_argument,
-        required=True,
-    )
-    parser.add_argument(
-        "--candidate-commit",
-        type=_source_commit_argument,
-        required=True,
-    )
+def _add_deployment_probe_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--sessions", type=int, default=2)
     parser.add_argument("--audio-seconds", type=float, default=10.0)
@@ -863,6 +883,21 @@ def _add_deployment_operation_arguments(parser: argparse.ArgumentParser) -> None
         type=Path,
         help="Restricted file containing the start-message auth token",
     )
+
+
+def _add_deployment_operation_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("uri", help="Public wss:// production endpoint")
+    parser.add_argument(
+        "--previous-commit",
+        type=_source_commit_argument,
+        required=True,
+    )
+    parser.add_argument(
+        "--candidate-commit",
+        type=_source_commit_argument,
+        required=True,
+    )
+    _add_deployment_probe_arguments(parser)
 
 
 def _input_device(value: str | None) -> int | str | None:
@@ -1028,6 +1063,14 @@ def main() -> int:
         ),
     )
     _add_deployment_operation_arguments(activation_parser)
+    recovery_parser = commands.add_parser(
+        "deployment-recover",
+        help=(
+            "Restore and probe the preceding release after an interrupted "
+            "production activation"
+        ),
+    )
+    _add_deployment_probe_arguments(recovery_parser)
     production_gate_parser = commands.add_parser(
         "production-gate",
         help="Bind production gate reports and immutable artifacts into one verdict",
@@ -1370,6 +1413,8 @@ def main() -> int:
         return deployment_rehearsal(args)
     if args.command == "deployment-activate":
         return deployment_activation(args)
+    if args.command == "deployment-recover":
+        return deployment_recovery(args)
     if args.command == "production-gate":
         return production_gate(args)
     if args.command == "model-manifest":
