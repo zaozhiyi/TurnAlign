@@ -100,14 +100,16 @@ class RecoveryStore:
                 session = self._sessions.get(requested_session_id)
                 if session is None:
                     raise PermissionError("recovery authentication failed")
-                if (
-                    not isinstance(resume_token, str)
-                    or not resume_token
-                    or not compare_digest(
-                        resume_token.encode("utf-8"),
-                        session.resume_token.encode("ascii"),
-                    )
-                ):
+                token_matches = False
+                if isinstance(resume_token, str) and resume_token:
+                    try:
+                        token_matches = compare_digest(
+                            resume_token.encode("utf-8"),
+                            session.resume_token.encode("ascii"),
+                        )
+                    except UnicodeEncodeError:
+                        pass
+                if not token_matches:
                     raise PermissionError("recovery authentication failed")
                 if session.config_key != config_key:
                     raise ValueError("recovery session configuration changed")

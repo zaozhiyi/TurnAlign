@@ -1695,7 +1695,7 @@ class WebSocketTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(audio_ack["acknowledged_sequence"], 1)
 
                 await asyncio.sleep(0.05)
-                for invalid_token in ("wrong-token", "错误令牌🔒"):
+                for invalid_token in ("wrong-token", "错误令牌🔒", "\ud800"):
                     async with connect(f"ws://127.0.0.1:{port}") as websocket:
                         await websocket.send(json.dumps({
                             "type": "start",
