@@ -415,6 +415,7 @@ def _valid_model_id(value: object) -> bool:
 def create_model_manifest(
     model_id: str,
     model_revision: str,
+    model_root: Path,
     files: list[Path],
 ) -> dict[str, object]:
     """Hash immutable model files into the schema consumed by production-gate."""
@@ -425,23 +426,36 @@ def create_model_manifest(
         raise ValueError("model_revision must be an immutable 40- or 64-character hash")
     if not files:
         raise ValueError("at least one model file is required")
+    try:
+        resolved_root = model_root.resolve(strict=True)
+    except OSError as error:
+        raise ValueError(f"model_root is unavailable: {model_root}") from error
+    if not resolved_root.is_dir():
+        raise ValueError(f"model_root must be a directory: {model_root}")
     entries = []
-    names = set()
+    relative_paths = set()
     for path in files:
-        if path.name in names:
-            raise ValueError(f"model files must have unique base names: {path.name}")
-        names.add(path.name)
-        snapshot = _snapshot_evidence(path)
+        try:
+            resolved_path = path.resolve(strict=True)
+            relative_path = resolved_path.relative_to(resolved_root).as_posix()
+        except (OSError, ValueError) as error:
+            raise ValueError(
+                f"model file must be retained under model_root: {path}"
+            ) from error
+        if relative_path in relative_paths:
+            raise ValueError(f"model files must have unique relative paths: {relative_path}")
+        relative_paths.add(relative_path)
+        snapshot = _snapshot_evidence(resolved_path)
         entries.append({
-            "name": path.name,
+            "path": relative_path,
             "sha256": snapshot.sha256,
             "bytes": snapshot.size,
         })
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "model_id": model_id,
         "model_revision": model_revision,
-        "files": sorted(entries, key=lambda item: cast(str, item["name"])),
+        "files": sorted(entries, key=lambda item: cast(str, item["path"])),
     }
 
 
@@ -2017,7 +2031,7 @@ def _validate_model_manifest(
         return
     if (
         isinstance(payload.get("schema_version"), bool)
-        or payload.get("schema_version") != 1
+        or payload.get("schema_version") != 2
     ):
         failures.append("model manifest has an unsupported schema version")
     model_id = payload.get("model_id")
@@ -2046,31 +2060,39 @@ def _validate_model_manifest(
         return
     manifest_files: list[tuple[str, str, int]] = []
     for item in files:
-        if not isinstance(item, dict) or set(item) != {"name", "sha256", "bytes"}:
+        if not isinstance(item, dict) or set(item) != {"path", "sha256", "bytes"}:
             failures.append("model manifest contains an invalid file entry")
             return
-        name = item.get("name")
+        path = item.get("path")
         digest = item.get("sha256")
         size = item.get("bytes")
+        relative_path = PurePosixPath(path) if isinstance(path, str) else None
         if (
-            not isinstance(name, str)
-            or not name
-            or Path(name).name != name
+            not isinstance(path, str)
+            or not path
+            or path.strip() != path
+            or len(path) > 4_096
+            or relative_path is None
+            or relative_path.is_absolute()
+            or relative_path.as_posix() != path
+            or any(part in {"", ".", ".."} for part in relative_path.parts)
+            or any(ord(character) < 32 or ord(character) == 127 for character in path)
             or not isinstance(digest, str)
             or _SHA256_PATTERN.fullmatch(digest) is None
             or not _positive_integer(size)
         ):
             failures.append("model manifest contains an invalid file identity")
             return
-        manifest_files.append((name, digest, cast(int, size)))
-    if len({name for name, _digest, _size in manifest_files}) != len(manifest_files):
-        failures.append("model manifest contains duplicate file names")
+        manifest_files.append((path, digest, cast(int, size)))
+    if len({path for path, _digest, _size in manifest_files}) != len(manifest_files):
+        failures.append("model manifest contains duplicate file paths")
         return
 
-    actual_files = [(item.name, item.sha256, item.bytes) for item in artifacts]
-    if len({name for name, _digest, _size in actual_files}) != len(actual_files):
-        failures.append("model artifacts contain duplicate file names")
-    elif sorted(manifest_files) != sorted(actual_files):
+    manifest_contents = sorted(
+        (digest, size) for _path, digest, size in manifest_files
+    )
+    actual_contents = sorted((item.sha256, item.bytes) for item in artifacts)
+    if manifest_contents != actual_contents:
         failures.append("model manifest does not match the retained model artifacts")
     if not isinstance(expected_loaded_models, list) or not expected_loaded_models:
         failures.append("model manifest is not bound to loaded runtime model evidence")
@@ -2086,17 +2108,23 @@ def _validate_model_manifest(
         if not isinstance(item, dict) or not isinstance(item.get("path"), str):
             loaded_paths_valid = False
             continue
-        loaded_path = PurePosixPath(cast(str, item["path"]))
+        raw_loaded_path = cast(str, item["path"])
+        loaded_path = PurePosixPath(raw_loaded_path)
         if (
             not loaded_path.is_absolute()
+            or loaded_path.as_posix() != raw_loaded_path
+            or any(part in {"", ".", ".."} for part in loaded_path.parts)
             or expected_model_root is None
             or loaded_path == expected_model_root
             or not loaded_path.is_relative_to(expected_model_root)
         ):
             loaded_paths_valid = False
-        loaded_files.append(
-            (loaded_path.name, item.get("sha256"), item.get("bytes"))
-        )
+            continue
+        loaded_files.append((
+            loaded_path.relative_to(expected_model_root).as_posix(),
+            item.get("sha256"),
+            item.get("bytes"),
+        ))
     if (
         not loaded_paths_valid
         or len(loaded_files) != len(expected_loaded_models)

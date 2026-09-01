@@ -492,6 +492,7 @@ def model_manifest(args) -> int:
     payload = create_model_manifest(
         args.model_id,
         args.model_revision,
+        args.model_root,
         args.file,
     )
     write_json_report(args.output, payload)
@@ -1140,6 +1141,12 @@ def main() -> int:
     )
     model_manifest_parser.add_argument("--model-id", required=True)
     model_manifest_parser.add_argument("--model-revision", required=True)
+    model_manifest_parser.add_argument(
+        "--model-root",
+        type=Path,
+        required=True,
+        help="Root directory used to preserve each retained model file's relative path",
+    )
     model_manifest_parser.add_argument(
         "--file",
         action="append",

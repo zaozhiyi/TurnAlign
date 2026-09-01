@@ -882,10 +882,14 @@ class CliIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             first = root / "model.safetensors"
-            second = root / "tokenizer.json"
+            second = root / "tokenizer" / "config.json"
+            duplicate_basename = root / "encoder" / "config.json"
             output = root / "evidence" / "model-manifest.json"
             first.write_bytes(b"weights")
+            second.parent.mkdir()
             second.write_bytes(b"tokenizer")
+            duplicate_basename.parent.mkdir()
+            duplicate_basename.write_bytes(b"encoder")
 
             with patch("sys.argv", [
                 "turnalign",
@@ -894,10 +898,14 @@ class CliIntegrationTests(unittest.TestCase):
                 "huggingface://organization/model",
                 "--model-revision",
                 "a" * 40,
+                "--model-root",
+                str(root),
                 "--file",
                 str(first),
                 "--file",
                 str(second),
+                "--file",
+                str(duplicate_basename),
                 "--output",
                 str(output),
             ]), patch("builtins.print"):
@@ -906,11 +914,11 @@ class CliIntegrationTests(unittest.TestCase):
             payload = json.loads(output.read_text(encoding="utf-8"))
             self.assertEqual(payload["model_revision"], "a" * 40)
             self.assertEqual(
-                [item["name"] for item in payload["files"]],
-                ["model.safetensors", "tokenizer.json"],
+                [item["path"] for item in payload["files"]],
+                ["encoder/config.json", "model.safetensors", "tokenizer/config.json"],
             )
             self.assertEqual(
-                payload["files"][0]["sha256"],
+                payload["files"][1]["sha256"],
                 cli._sha256_file(first),
             )
 

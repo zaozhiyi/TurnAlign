@@ -178,7 +178,7 @@ turnalign release-gate sample-30s.wav --backend funasr-streaming \
   --max-initialization-seconds 120 --max-first-partial-seconds 3 \
   --max-first-commit-seconds "$MAX_FIRST_COMMIT_SECONDS" \
   --require-immutable-model-revision --require-local-model \
-  --model-path /var/lib/turnalign/models/paraformer \
+  --model-path /var/lib/turnalign/models/paraformer-zh-streaming \
   --max-realtime-factor 1
 turnalign quality-gate reference.jsonl release-events.jsonl \
   --max-cer "$MAX_CER" --min-reference-speech-seconds "$MIN_LABELLED_SECONDS" \
@@ -200,7 +200,9 @@ turnalign websocket-gate wss://asr.example/ws --sessions 8 \
   --auth-token-file /path/to/restricted/auth-token \
   --source-commit "$(git rev-parse HEAD)" --report websocket-report.json
 turnalign model-manifest --model-id paraformer-zh-streaming \
-  --model-revision "$MODEL_REVISION" --file /models/model.safetensors \
+  --model-revision "$MODEL_REVISION" \
+  --model-root /var/lib/turnalign/models/paraformer-zh-streaming \
+  --file /var/lib/turnalign/models/paraformer-zh-streaming/model.safetensors \
   --output model-manifest.json
 sudo /opt/turnalign/releases/$CANDIDATE_COMMIT/venv/bin/python \
   -I -B -u -m turnalign.cli deployment-activate \
@@ -477,7 +479,7 @@ turnalign release-gate sample-30s.wav --backend funasr-streaming \
   --max-initialization-seconds 120 --max-first-partial-seconds 3 \
   --max-first-commit-seconds "$MAX_FIRST_COMMIT_SECONDS" \
   --require-immutable-model-revision --require-local-model \
-  --model-path /var/lib/turnalign/models/paraformer \
+  --model-path /var/lib/turnalign/models/paraformer-zh-streaming \
   --max-realtime-factor 1
 turnalign quality-gate reference.jsonl release-events.jsonl \
   --max-cer "$MAX_CER" --min-reference-speech-seconds "$MIN_LABELLED_SECONDS" \
@@ -493,7 +495,9 @@ turnalign websocket-gate wss://asr.example/ws --sessions 8 \
   --auth-token-file /path/to/restricted/auth-token \
   --source-commit "$(git rev-parse HEAD)" --report websocket-report.json
 turnalign model-manifest --model-id paraformer-zh-streaming \
-  --model-revision "$MODEL_REVISION" --file /models/model.safetensors \
+  --model-revision "$MODEL_REVISION" \
+  --model-root /var/lib/turnalign/models/paraformer-zh-streaming \
+  --file /var/lib/turnalign/models/paraformer-zh-streaming/model.safetensors \
   --output model-manifest.json
 sudo /opt/turnalign/releases/$CANDIDATE_COMMIT/venv/bin/python \
   -I -B -u -m turnalign.cli deployment-activate \

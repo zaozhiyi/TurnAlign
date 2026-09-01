@@ -532,11 +532,11 @@ class ProductionGateTests(unittest.TestCase):
             path for kind, path in artifacts if kind == "model-manifest"
         )
         write_json_report(manifest, {
-            "schema_version": 1,
+            "schema_version": 2,
             "model_id": "paraformer-zh-streaming",
             "model_revision": "a" * 40,
             "files": [{
-                "name": model.name,
+                "path": model.name,
                 "sha256": hashlib.sha256(model.read_bytes()).hexdigest(),
                 "bytes": model.stat().st_size,
             }],
@@ -1231,6 +1231,37 @@ class ProductionGateTests(unittest.TestCase):
             self.assertIn(
                 "loaded runtime model evidence does not exactly match",
                 "\n".join(report.failures),
+            )
+
+    def test_model_manifest_binds_full_relative_runtime_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, quality, websocket = self._reports(root)
+            artifacts = self._artifacts(root)
+            manifest = next(
+                path for kind, path in artifacts if kind == "model-manifest"
+            )
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            payload["files"][0]["path"] = f"nested/{payload['files'][0]['path']}"
+            write_json_report(manifest, payload)
+
+            report = run_production_gate(
+                release,
+                quality,
+                websocket,
+                source_commit="b" * 40,
+                artifacts=artifacts,
+            )
+
+            self.assertFalse(report.passed)
+            self.assertNotIn(
+                "model manifest does not match the retained model artifacts",
+                report.failures,
+            )
+            self.assertIn(
+                "loaded runtime model evidence does not exactly match the retained "
+                "model manifest",
+                report.failures,
             )
 
     def test_rejects_invalid_or_record_tampered_wheel(self):
