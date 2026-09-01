@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import ipaddress
 import json
 import logging
 import math
@@ -12,7 +13,7 @@ from dataclasses import asdict, replace
 from http import HTTPStatus
 from pathlib import Path
 from time import monotonic
-from typing import Any, TypeVar
+from typing import Any, ClassVar, TypeVar
 
 from .audio import file_chunks
 from .hints import AsrHints
@@ -37,6 +38,68 @@ from .session import transcribe_events
 
 LOGGER = logging.getLogger(__name__)
 _QueueItem = TypeVar("_QueueItem")
+
+
+class _ServerMetrics:
+    """Thread-safe, label-free counters that never retain transcript data."""
+
+    _HELP: ClassVar[dict[str, str]] = {
+        "connections_total": "WebSocket connections received.",
+        "sessions_admitted_total": "Connections admitted below the session limit.",
+        "sessions_capacity_rejected_total": "Connections rejected at capacity.",
+        "sessions_terminal_total": "Sessions closed by end or explicit cancel.",
+        "sessions_incomplete_total": "Sessions closed without a terminal request.",
+        "request_errors_total": "Session requests ending in a handled error.",
+        "inference_failures_total": "Inference workers ending with an exception.",
+        "recovery_resumes_total": "Sessions successfully resumed.",
+        "audio_frames_total": "Binary audio frames accepted from clients.",
+        "audio_bytes_total": "PCM audio bytes accepted from clients.",
+        "backpressure_pauses_total": "Input flow-control pauses emitted.",
+        "dropped_partials_total": "Partial transcript events dropped under pressure.",
+        "output_backpressure_timeouts_total": "Durable output queue timeouts.",
+    }
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._values = {name: 0 for name in self._HELP}
+
+    def add(self, name: str, value: int = 1) -> None:
+        if name not in self._values:
+            raise KeyError(f"unknown metric: {name}")
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError("metric increments must be non-negative integers")
+        with self._lock:
+            self._values[name] += value
+
+    def render(self, *, active_sessions: int) -> str:
+        with self._lock:
+            snapshot = dict(self._values)
+        lines = [
+            "# HELP turnalign_active_sessions WebSocket sessions currently admitted.",
+            "# TYPE turnalign_active_sessions gauge",
+            f"turnalign_active_sessions {active_sessions}",
+        ]
+        for name, help_text in self._HELP.items():
+            metric = f"turnalign_{name}"
+            lines.extend((
+                f"# HELP {metric} {help_text}",
+                f"# TYPE {metric} counter",
+                f"{metric} {snapshot[name]}",
+            ))
+        lines.append("# EOF")
+        return "\n".join(lines) + "\n"
+
+
+def _is_loopback_peer(remote_address: object) -> bool:
+    if not isinstance(remote_address, tuple) or not remote_address:
+        return False
+    host = remote_address[0]
+    if not isinstance(host, str):
+        return False
+    try:
+        return ipaddress.ip_address(host.split("%", 1)[0]).is_loopback
+    except ValueError:
+        return False
 
 
 class _OutputBackpressureError(TimeoutError):
@@ -372,6 +435,7 @@ async def serve(
     )
     active_session_lock = asyncio.Lock()
     active_sessions = 0
+    metrics = _ServerMetrics()
     handler_tasks: set[asyncio.Task[object]] = set()
     active_connections: set[Any] = set()
     recovery_sweeper: asyncio.Task[None] | None = None
@@ -582,6 +646,8 @@ async def serve(
                 requested_session_id,
                 resume_token,
             )
+            if resumed:
+                metrics.add("recovery_resumes_total")
             replay_audio_start = recovery_session.transcribed_through
             replay_audio_end = recovery_session.timeline.end
             incoming = queue.Queue(maxsize=128)
@@ -758,6 +824,7 @@ async def serve(
                                 transport_stats["backpressure_pauses"],
                             )
                 except Exception as error:  # noqa: BLE001 - plugin boundary
+                    metrics.add("inference_failures_total")
                     if announced:
                         try:
                             emit(policy.public_error(error))
@@ -794,6 +861,24 @@ async def serve(
                     recovery_store.release(
                         recovery_session,
                         completed=session_completed,
+                    )
+                    metrics.add(
+                        "sessions_terminal_total"
+                        if session_completed else "sessions_incomplete_total"
+                    )
+                    metrics.add("audio_frames_total", transport_stats["frames"])
+                    metrics.add("audio_bytes_total", transport_stats["bytes"])
+                    metrics.add(
+                        "backpressure_pauses_total",
+                        transport_stats["backpressure_pauses"],
+                    )
+                    metrics.add(
+                        "dropped_partials_total",
+                        transport_stats["dropped_partials"],
+                    )
+                    metrics.add(
+                        "output_backpressure_timeouts_total",
+                        transport_stats["output_backpressure_timeouts"],
                     )
 
             thread = threading.Thread(
@@ -990,6 +1075,8 @@ async def serve(
         except Exception as error:
             cancel_worker()
             stop_input()
+            if not isinstance(error, ConnectionClosed):
+                metrics.add("request_errors_total")
             if isinstance(error, ConnectionClosed):
                 LOGGER.info("WebSocket client disconnected")
             elif isinstance(error, (
@@ -1024,6 +1111,7 @@ async def serve(
 
     async def handler(websocket) -> None:
         nonlocal active_sessions
+        metrics.add("connections_total")
         task = asyncio.current_task()
         admitted = False
         if task is not None:
@@ -1036,8 +1124,10 @@ async def serve(
                     active_sessions += 1
                     admitted = True
             if at_capacity:
+                metrics.add("sessions_capacity_rejected_total")
                 await websocket.send(_json(policy.public_error(ServerBusyError())))
                 return
+            metrics.add("sessions_admitted_total")
             await session_handler(websocket)
         finally:
             if admitted:
@@ -1049,6 +1139,20 @@ async def serve(
 
     def process_request(connection, request):
         path = request.path.partition("?")[0]
+        if path == "/metrics":
+            if not _is_loopback_peer(connection.remote_address):
+                response = connection.respond(HTTPStatus.NOT_FOUND, "Not Found\n")
+                response.headers["Cache-Control"] = "no-store"
+                return response
+            response = connection.respond(
+                HTTPStatus.OK,
+                metrics.render(active_sessions=active_sessions),
+            )
+            response.headers["Content-Type"] = (
+                "text/plain; version=0.0.4; charset=utf-8"
+            )
+            response.headers["Cache-Control"] = "no-store"
+            return response
         if path in {"/healthz", "/readyz"}:
             payload: dict[str, object] = {"status": "ok"}
             if path == "/readyz":

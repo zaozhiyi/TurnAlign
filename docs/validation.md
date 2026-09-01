@@ -21,7 +21,7 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   materialization limit before constructing the float model input.
 - All source and test modules pass `compileall`.
 - Ruff is enforced in CI and passes over `src` and `tests`.
-- The built wheel passes all 235 tests from site-packages on Python 3.10 with
+- The built wheel passes all 237 tests from site-packages on Python 3.10 with
   `websockets` 14.0 and on Python 3.12 with `websockets` 17.1. The Python 3.12
   run also passes under `python -O`, so production invariants do not depend on
   removable `assert` statements.
@@ -72,6 +72,10 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   performs bounded graceful shutdown. An isolated subprocess test sends a real
   POSIX `SIGTERM` and requires a clean zero exit code; active-connection coverage
   also verifies model-pool closure.
+- A label-free `/metrics` endpoint exposes bounded operational counters without
+  transcript text, session/model labels or credentials. Regression coverage
+  verifies session/audio accounting and the reference Nginx configuration
+  explicitly blocks public metrics proxying.
 - Disk-backed recovery now enforces independent per-session and process-wide
   audio byte ceilings, bounds retained session count, rolls reservations back on
   write failure, and closes completed-session audio immediately. Unit coverage

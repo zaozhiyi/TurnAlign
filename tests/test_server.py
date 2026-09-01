@@ -17,6 +17,7 @@ from turnalign.policy import ServerPolicy
 from turnalign.recovery import RecoveryStore
 from turnalign.server import (
     _control_message,
+    _is_loopback_peer,
     _json,
     _OutputBackpressureError,
     _queue_output,
@@ -43,6 +44,17 @@ class FakeServerBackend:
 
     def close(self):
         return None
+
+
+class MetricsAccessTests(unittest.TestCase):
+    def test_metrics_peer_must_be_an_ip_loopback_address(self):
+        self.assertTrue(_is_loopback_peer(("127.0.0.1", 1234)))
+        self.assertTrue(_is_loopback_peer(("::1", 1234, 0, 0)))
+        self.assertTrue(_is_loopback_peer(("::1%lo0", 1234, 0, 0)))
+        self.assertFalse(_is_loopback_peer(("192.168.1.2", 1234)))
+        self.assertFalse(_is_loopback_peer(("203.0.113.10", 1234)))
+        self.assertFalse(_is_loopback_peer(("localhost", 1234)))
+        self.assertFalse(_is_loopback_peer(None))
 
 
 class RecordingServerBackend(FakeServerBackend):
@@ -521,6 +533,68 @@ class WebSocketTests(unittest.IsolatedAsyncioTestCase):
                 shutdown_event.set()
                 if not server_task.done():
                     await asyncio.wait_for(server_task, timeout=2)
+
+    async def test_metrics_are_label_free_and_track_completed_sessions(self):
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        shutdown_event = asyncio.Event()
+
+        async def scrape() -> tuple[bytes, str]:
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            writer.write(
+                b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            )
+            await writer.drain()
+            response = await asyncio.wait_for(reader.read(), timeout=1)
+            writer.close()
+            await writer.wait_closed()
+            headers, body = response.split(b"\r\n\r\n", 1)
+            return headers, body.decode("utf-8")
+
+        with patch("turnalign.server.create_asr", return_value=FakeServerBackend()):
+            server_task = asyncio.create_task(serve(
+                "127.0.0.1",
+                port,
+                default_backend="fake",
+                shutdown_event=shutdown_event,
+            ))
+            await asyncio.sleep(0.05)
+            try:
+                async with connect(f"ws://127.0.0.1:{port}") as websocket:
+                    await websocket.send(json.dumps({"type": "start", "backend": "fake"}))
+                    self.assertEqual(json.loads(await websocket.recv())["type"], "ready")
+                    audio = array("h", [1500] * 1600).tobytes()
+                    await websocket.send(audio)
+                    self.assertEqual(json.loads(await websocket.recv())["type"], "audio_ack")
+                    await websocket.send(json.dumps({"type": "end"}))
+                    while True:
+                        event = json.loads(await asyncio.wait_for(websocket.recv(), 1))
+                        if event.get("kind") == "end":
+                            break
+
+                for _ in range(20):
+                    headers, body = await scrape()
+                    if "turnalign_sessions_terminal_total 1" in body:
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertIn(b" 200 ", headers)
+                self.assertIn(
+                    b"content-type: text/plain; version=0.0.4; charset=utf-8",
+                    headers.lower(),
+                )
+                self.assertIn("turnalign_active_sessions 0", body)
+                self.assertIn("turnalign_connections_total 1", body)
+                self.assertIn("turnalign_sessions_admitted_total 1", body)
+                self.assertIn("turnalign_sessions_terminal_total 1", body)
+                self.assertIn("turnalign_audio_frames_total 1", body)
+                self.assertIn(f"turnalign_audio_bytes_total {len(audio)}", body)
+                self.assertNotIn("{", body)
+                self.assertNotIn("local test", body)
+            finally:
+                shutdown_event.set()
+                await asyncio.wait_for(server_task, timeout=2)
 
     async def test_segmentation_controls_reject_non_finite_and_unsafe_values(self):
         probe = socket.socket()

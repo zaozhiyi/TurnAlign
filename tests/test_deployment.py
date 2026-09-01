@@ -77,6 +77,8 @@ class DeploymentArtifactTests(unittest.TestCase):
         self.assertGreater(send_timeout, idle)
         self.assertIn("proxy_pass http://turnalign_backend/healthz;", nginx)
         self.assertIn("proxy_pass http://turnalign_backend/readyz;", nginx)
+        self.assertRegex(nginx, r"location = /metrics\s*\{[^}]*return 404;")
+        self.assertNotIn("proxy_pass http://turnalign_backend/metrics", nginx)
 
     def test_secret_example_is_a_placeholder_and_deploy_is_packaged(self):
         environment = ENVIRONMENT.read_text(encoding="utf-8")

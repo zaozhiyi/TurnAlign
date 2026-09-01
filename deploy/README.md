@@ -48,6 +48,7 @@ openssl rand -hex 32
 sudo systemctl daemon-reload
 sudo systemctl enable --now turnalign
 curl --fail --silent http://127.0.0.1:8765/readyz
+curl --fail --silent http://127.0.0.1:8765/metrics
 ```
 
 Write the generated value into `TURNALIGN_AUTH_TOKEN` without committing it.
@@ -55,6 +56,13 @@ Keep `TimeoutStopSec` greater than TurnAlign's `--shutdown-grace-timeout`.
 Capacity values in the unit are conservative starting points, not measured
 production targets. Size model memory, temporary disk, concurrency, and
 session duration on the deployment host.
+
+`/metrics` exposes label-free Prometheus counters for active/admitted/rejected
+sessions, incomplete or failed work, recovery, audio volume, flow control and
+output pressure. It contains no transcript text, session IDs, backend/model
+labels or credentials. Scrape it from a host-local collector on
+`127.0.0.1:8765`; the example Nginx server deliberately returns 404 for the
+public `/metrics` path.
 
 ## 3. Terminate TLS at Nginx
 

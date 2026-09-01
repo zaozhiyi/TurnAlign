@@ -83,6 +83,14 @@ errors. Production readiness probes should use `/readyz`. With `--preload`, the
 port doesn't open until every configured replica loads and optional warmup
 inference succeeds.
 
+`GET /metrics` returns Prometheus text-format, label-free process counters for
+active and admitted sessions, capacity rejection, terminal/incomplete work,
+handled request errors, inference failures, recovery resumes, accepted audio,
+flow-control pauses, dropped partials and output backpressure timeouts. It never
+contains transcript text, session identifiers, model/backend names or secrets.
+Keep it on the loopback listener and scrape it with a host-local collector; the
+reference Nginx configuration intentionally does not publish it.
+
 On POSIX, `SIGTERM` initiates graceful shutdown. The listener stops accepting
 connections, existing WebSockets receive close code 1012, and handlers may clean
 up for 30 seconds by default. `--shutdown-grace-timeout` bounds this interval;

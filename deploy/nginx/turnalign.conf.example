@@ -39,6 +39,13 @@ server {
         proxy_set_header Connection "";
     }
 
+    # Metrics are intentionally available only on the loopback application
+    # listener. Scrape 127.0.0.1:8765 from a host-local collector.
+    location = /metrics {
+        access_log off;
+        return 404;
+    }
+
     location = /ws {
         limit_req zone=turnalign_handshake burst=10 nodelay;
         limit_conn turnalign_connections 4;
