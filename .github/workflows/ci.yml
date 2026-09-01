@@ -147,7 +147,9 @@ jobs:
             --pyproject pyproject.toml --mc-type application --sv 1.6 \
             --output-reproducible --of JSON -o /tmp/turnalign-sbom.cdx.json
           cmp dist-a/sbom.cdx.json /tmp/turnalign-sbom.cdx.json
-      - run: cd dist-a && sha256sum *.whl *.tar.gz sbom.cdx.json > SHA256SUMS
+      - run: >-
+          cd dist-a &&
+          sha256sum -- ./*.whl ./*.tar.gz ./sbom.cdx.json > SHA256SUMS
       - run: python -m pip install --force-reinstall dist-a/*.whl "websockets==17.1"
       - run: >-
           python -c "import pathlib, turnalign;
