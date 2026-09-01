@@ -64,8 +64,10 @@ _DEPLOYMENT_LOCK_PATH = Path("/run/lock/turnalign-deployment.lock")
 _RELEASE_ROOT = Path("/opt/turnalign/releases")
 _CURRENT_RELEASE_LINK = Path("/opt/turnalign/current")
 _MODEL_EVIDENCE_ROOT = Path("/var/lib/turnalign/models")
-_SERVICE_UNIT_PATH = Path("/etc/systemd/system/turnalign.service")
-_NGINX_CONFIG_PATH = Path("/etc/nginx/conf.d/turnalign.conf")
+_SERVICE_UNIT_ID = "/etc/systemd/system/turnalign.service"
+_NGINX_CONFIG_ID = "/etc/nginx/conf.d/turnalign.conf"
+_SERVICE_UNIT_PATH = Path(_SERVICE_UNIT_ID)
+_NGINX_CONFIG_PATH = Path(_NGINX_CONFIG_ID)
 _SYSTEMCTL_PATH = Path("/usr/bin/systemctl")
 _NGINX_PATH = Path("/usr/sbin/nginx")
 _EFFECTIVE_CONFIG_TIMEOUT_SECONDS = 15.0
@@ -726,7 +728,7 @@ def _capture_systemd_effective_configuration(
             raise RuntimeError("systemd effective configuration is malformed")
         fields[key] = value
     expected = {
-        "FragmentPath": str(_SERVICE_UNIT_PATH),
+        "FragmentPath": _SERVICE_UNIT_ID,
         "DropInPaths": "",
         "NeedDaemonReload": "no",
         "ActiveState": "active",
@@ -755,7 +757,7 @@ def _capture_nginx_effective_configuration(
     stdout, stderr = _run_effective_config_command([str(_NGINX_PATH), "-T"])
     if b"[warn]" in stderr.lower():
         raise RuntimeError("Nginx effective configuration contains warnings")
-    marker = f"# configuration file {_NGINX_CONFIG_PATH}:\n".encode()
+    marker = f"# configuration file {_NGINX_CONFIG_ID}:\n".encode()
     starts: list[int] = []
     cursor = 0
     while True:
@@ -780,7 +782,7 @@ def _capture_nginx_effective_configuration(
             "Nginx effective configuration does not match the canonical TurnAlign file"
         )
     return {
-        "configuration_path": str(_NGINX_CONFIG_PATH),
+        "configuration_path": _NGINX_CONFIG_ID,
         "loaded_occurrences": 1,
         "warning_free": True,
         "sha256": nginx_snapshot.sha256,
@@ -2540,7 +2542,7 @@ def _validate_effective_configuration(
             "sha256",
             "bytes",
         }
-        and systemd.get("fragment_path") == str(_SERVICE_UNIT_PATH)
+        and systemd.get("fragment_path") == _SERVICE_UNIT_ID
         and systemd.get("drop_in_paths") == []
         and systemd.get("need_daemon_reload") is False
         and systemd.get("active_state") == "active"
@@ -2563,7 +2565,7 @@ def _validate_effective_configuration(
             "sha256",
             "bytes",
         }
-        and nginx.get("configuration_path") == str(_NGINX_CONFIG_PATH)
+        and nginx.get("configuration_path") == _NGINX_CONFIG_ID
         and nginx.get("loaded_occurrences") == 1
         and nginx.get("warning_free") is True
         and nginx.get("sha256") == nginx_artifact.sha256
