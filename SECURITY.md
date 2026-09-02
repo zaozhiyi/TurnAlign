@@ -8,6 +8,17 @@ deployment is supported only when it uses an immutable TurnAlign artifact,
 locked dependencies, pinned model revisions, and the security controls described
 in `deploy/README.md`.
 
+## Repository governance before release
+
+Green workflow checks are evidence, but GitHub does not enforce them unless the
+upstream owner configures repository rules. Before merging a production-bound
+change, protect `main` with pull requests, require the complete CI and CodeQL
+check set, dismiss stale approvals, and restrict direct pushes and force-pushes.
+Enable Dependabot alerts and security updates (and secret scanning/push
+protection where available). Re-check these settings on the upstream repository
+and its fork; a checked-in workflow or `dependabot.yml` file alone does not
+enable the corresponding GitHub security service.
+
 ## Reporting a vulnerability
 
 Do not publish exploit details, credentials, private audio, transcripts, or
