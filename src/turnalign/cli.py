@@ -1146,6 +1146,7 @@ def main() -> int:
     production_gate_parser.add_argument(
         "--model-root",
         type=Path,
+        required=True,
         help="Recursively add every retained file under this model root",
     )
     production_gate_parser.add_argument(
@@ -1189,6 +1190,7 @@ def main() -> int:
     host_profile_parser.add_argument(
         "--model-root",
         type=Path,
+        required=True,
         help="Recursively add every retained file under this model root",
     )
     host_profile_parser.add_argument("--output", type=Path, required=True)
