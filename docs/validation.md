@@ -25,6 +25,9 @@ Service-lifecycle hardening follow-up: 2026-09-01, macOS arm64.
   `websockets` 14.0 and on Python 3.12 with `websockets` 17.1. The Python 3.12
   run also passes under `python -O`, so production invariants do not depend on
   removable `assert` statements.
+- GitHub CI additionally covers Python 3.13 on Ubuntu, macOS and Windows with
+  `websockets` 17.1; the Ubuntu 3.13 job also runs the optimized (`python -O`)
+  suite.
 - CI embeds the exact checked-out source commit in the Wheel as a `RECORD`-
   protected file. The aggregate gate rejects an unbound, stale, missing or
   mismatched identity instead of allowing a Wheel from another commit to be
