@@ -760,6 +760,17 @@ def _create_host_profile_locked(
     if model_root is not None:
         if resolved_model_root is None:  # pragma: no cover - guarded by model_root
             raise RuntimeError("model_root resolution lost its value")
+        for path in model_paths:
+            try:
+                resolved_path = path.resolve(strict=True)
+            except (OSError, RuntimeError) as error:
+                raise ValueError(
+                    f"host-profile model artifact is unavailable: {path}"
+                ) from error
+            if resolved_path != path or not resolved_path.is_relative_to(resolved_model_root):
+                raise ValueError(
+                    "host-profile model artifacts must be canonical files under model_root"
+                )
         retained_paths = {
             path.resolve(strict=True) for path in enumerate_model_files(resolved_model_root)
         }
@@ -3427,6 +3438,15 @@ def run_production_gate(
         artifact_snapshots.setdefault(kind, []).append(snapshot)
     if model_root is not None and model_root_valid and effective_model_root is not None:
         try:
+            for path in artifact_paths.get("model", []):
+                resolved_path = path.resolve(strict=True)
+                if (
+                    resolved_path != path
+                    or not resolved_path.is_relative_to(effective_model_root)
+                ):
+                    failures.append(
+                        "model artifacts must be canonical files under model_root"
+                    )
             retained_paths = {
                 path.resolve(strict=True)
                 for path in enumerate_model_files(effective_model_root)
