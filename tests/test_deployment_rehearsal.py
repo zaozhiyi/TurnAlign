@@ -33,6 +33,28 @@ class FakeWebSocketReport:
         }
 
 
+class ReadinessParsingTests(unittest.TestCase):
+    def test_loaded_model_paths_are_canonical_unique_retained_files(self):
+        valid = [{
+            "path": "/var/lib/turnalign/models/model/config.json",
+            "sha256": "a" * 64,
+            "bytes": 1,
+        }]
+        self.assertEqual(rehearsal._parse_loaded_models(valid), tuple(valid))
+        for path in (
+            "/var/lib/turnalign/models/../outside.bin",
+            "/var/lib/turnalign/models/model/./config.json",
+            "/var/lib/turnalign/models/model//config.json",
+        ):
+            with self.subTest(path=path), self.assertRaisesRegex(
+                ValueError, "invalid loaded model entry"
+            ):
+                rehearsal._parse_loaded_models([{**valid[0], "path": path}])
+
+        with self.assertRaisesRegex(ValueError, "invalid loaded model entry"):
+            rehearsal._parse_loaded_models(valid * 2)
+
+
 @unittest.skipUnless(os.name == "posix", "deployment rehearsal is Linux/POSIX-only")
 class DeploymentRehearsalTests(unittest.IsolatedAsyncioTestCase):
     previous = "a" * 40

@@ -15,7 +15,7 @@ import urllib.error
 import urllib.request
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
 
 from .jsonutil import strict_json_loads
@@ -331,23 +331,34 @@ def _parse_loaded_models(value: object) -> tuple[dict[str, object], ...]:
     if not isinstance(value, list):
         raise TypeError("readiness response has invalid loaded_models")
     entries = []
+    seen_paths: set[str] = set()
+    model_root = PurePosixPath("/var/lib/turnalign/models")
     for item in value:
         if not isinstance(item, dict) or set(item) != {"path", "sha256", "bytes"}:
             raise ValueError("readiness response has an invalid loaded model entry")
         path = item.get("path")
         digest = item.get("sha256")
         size = item.get("bytes")
+        parsed_path = PurePosixPath(path) if isinstance(path, str) else None
         if (
             not isinstance(path, str)
-            or not path.startswith("/var/lib/turnalign/models/")
+            or parsed_path is None
+            or not parsed_path.is_absolute()
+            or parsed_path.as_posix() != path
+            or parsed_path == model_root
+            or not parsed_path.is_relative_to(model_root)
+            or any(part in {"", ".", ".."} for part in parsed_path.parts)
+            or any(ord(character) < 32 or ord(character) == 127 for character in path)
             or not isinstance(digest, str)
             or len(digest) != 64
             or any(character not in "0123456789abcdef" for character in digest)
             or isinstance(size, bool)
             or not isinstance(size, int)
             or size <= 0
+            or path in seen_paths
         ):
             raise ValueError("readiness response has an invalid loaded model entry")
+        seen_paths.add(path)
         entries.append({"path": path, "sha256": digest, "bytes": size})
     return tuple(entries)
 

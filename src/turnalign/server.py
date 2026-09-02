@@ -706,9 +706,11 @@ async def serve(
                 default_language=default_language,
                 default_compute_type=default_compute_type,
             )
-            raw_hotwords = request.get("hotwords") or []
-            if isinstance(raw_hotwords, str):
-                raw_hotwords = [raw_hotwords]
+            raw_hotwords = request.get("hotwords", [])
+            if raw_hotwords is None:
+                raw_hotwords = []
+            elif isinstance(raw_hotwords, str):
+                raw_hotwords = [raw_hotwords] if raw_hotwords else []
             if not isinstance(raw_hotwords, list) or not all(
                 isinstance(item, str) for item in raw_hotwords
             ):

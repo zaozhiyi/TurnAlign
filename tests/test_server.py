@@ -792,6 +792,7 @@ class WebSocketTests(unittest.IsolatedAsyncioTestCase):
                     ("partial_seconds", 0),
                     ("partial_seconds", True),
                     ("context", []),
+                    ("hotwords", False),
                 )
                 for key, value in invalid:
                     with self.subTest(key=key, value=value):
