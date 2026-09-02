@@ -405,6 +405,7 @@ def production_gate(args) -> int:
         args.websocket_report,
         source_commit=args.source_commit,
         artifacts=_production_artifacts(args),
+        model_root=args.model_root,
     )
     _emit_gate_report(report, args.report)
     return 0 if report.passed else 1
@@ -514,7 +515,11 @@ def model_manifest(args) -> int:
 
 
 def host_profile(args) -> int:
-    payload = create_host_profile(args.source_commit, _production_artifacts(args))
+    payload = create_host_profile(
+        args.source_commit,
+        _production_artifacts(args),
+        model_root=args.model_root,
+    )
     write_json_report(args.output, payload)
     print(json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False))
     return 0

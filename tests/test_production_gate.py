@@ -1268,6 +1268,7 @@ class ProductionGateTests(unittest.TestCase):
                 websocket,
                 source_commit="b" * 40,
                 artifacts=artifacts,
+                model_root=root,
             )
 
             self.assertFalse(report.passed)

@@ -551,6 +551,7 @@ def create_model_manifest(
 def create_host_profile(
     source_commit: str | None,
     artifacts: list[tuple[str, Path]],
+    model_root: Path | None = None,
 ) -> dict[str, object]:
     """Capture host identity and bind every other retained production artifact."""
 
@@ -560,7 +561,14 @@ def create_host_profile(
     lock_descriptor = _acquire_deployment_lock()
     try:
         _reject_pending_deployment_transaction()
-        return _create_host_profile_locked(source_commit, artifacts, system)
+        if model_root is None:
+            return _create_host_profile_locked(source_commit, artifacts, system)
+        return _create_host_profile_locked(
+            source_commit,
+            artifacts,
+            system,
+            model_root=model_root,
+        )
     finally:
         os.close(lock_descriptor)
 
@@ -674,6 +682,8 @@ def _create_host_profile_locked(
     source_commit: str | None,
     artifacts: list[tuple[str, Path]],
     system: str,
+    *,
+    model_root: Path | None = None,
 ) -> dict[str, object]:
     runtime = _installed_runtime_identity(source_commit)
     bound_commit = runtime["turnalign_source_commit"]
@@ -696,7 +706,11 @@ def _create_host_profile_locked(
     identities = set()
     configuration_snapshots: dict[str, _EvidenceSnapshot] = {}
     model_paths = [path for kind, path in artifacts if kind == "model"]
-    model_root = _model_artifact_root(model_paths)
+    resolved_model_root = (
+        model_root.resolve(strict=True)
+        if model_root is not None
+        else _model_artifact_root(model_paths)
+    )
     for kind, path in artifacts:
         if kind not in expected_kinds:
             raise ValueError(f"unsupported host-profile artifact kind: {kind}")
@@ -718,7 +732,7 @@ def _create_host_profile_locked(
             configuration_snapshots[kind] = snapshot
         else:
             snapshot = _snapshot_evidence(path)
-        identity_name = _artifact_identity_name(kind, path, model_root)
+        identity_name = _artifact_identity_name(kind, path, resolved_model_root)
         identity = (kind, identity_name)
         if identity in identities:
             raise ValueError(
@@ -2103,6 +2117,8 @@ def _validate_model_manifest(
     expected_model_id: object,
     expected_loaded_models: object,
     artifacts: list[ArtifactEvidence],
+    artifact_paths: list[Path],
+    model_root: Path | None,
     failures: list[str],
 ) -> None:
     if snapshot.content is None:
@@ -2180,11 +2196,29 @@ def _validate_model_manifest(
         failures.append("model manifest contains duplicate file paths")
         return
 
-    manifest_contents = sorted(
-        (digest, size) for _path, digest, size in manifest_files
-    )
-    actual_contents = sorted((item.sha256, item.bytes) for item in artifacts)
-    if manifest_contents != actual_contents:
+    actual_files = list(zip(artifact_paths, artifacts, strict=True))
+    if model_root is not None:
+        try:
+            resolved_model_root = model_root.resolve(strict=True)
+            actual_manifest_files = sorted(
+                (
+                    path.resolve(strict=True)
+                    .relative_to(resolved_model_root)
+                    .as_posix(),
+                    evidence.sha256,
+                    evidence.bytes,
+                )
+                for path, evidence in actual_files
+            )
+        except (OSError, ValueError):
+            actual_manifest_files = []
+        if sorted(manifest_files) != actual_manifest_files:
+            failures.append(
+                "model manifest does not match the retained model artifacts or paths"
+            )
+    elif sorted((digest, size) for _path, digest, size in manifest_files) != sorted(
+        (item.sha256, item.bytes) for item in artifacts
+    ):
         failures.append("model manifest does not match the retained model artifacts")
     if not isinstance(expected_loaded_models, list) or not expected_loaded_models:
         failures.append("model manifest is not bound to loaded runtime model evidence")
@@ -3241,6 +3275,7 @@ def run_production_gate(
     *,
     source_commit: str,
     artifacts: list[tuple[str, Path]],
+    model_root: Path | None = None,
 ) -> ProductionGateReport:
     if _COMMIT_PATTERN.fullmatch(source_commit) is None:
         raise ValueError("source_commit must be a lowercase 40-character Git commit")
@@ -3259,9 +3294,11 @@ def run_production_gate(
     artifact_paths: dict[str, list[Path]] = {}
     artifact_digests: dict[str, list[str]] = {}
     artifact_snapshots: dict[str, list[_EvidenceSnapshot]] = {}
-    model_root = _model_artifact_root(
-        [path for kind, path in artifacts if kind == "model"]
-    )
+    effective_model_root = model_root
+    if effective_model_root is None:
+        effective_model_root = _model_artifact_root(
+            [path for kind, path in artifacts if kind == "model"]
+        )
     for kind, path in artifacts:
         if kind not in REQUIRED_ARTIFACT_KINDS:
             raise ValueError(f"unsupported artifact kind: {kind}")
@@ -3281,7 +3318,7 @@ def run_production_gate(
         snapshot = _snapshot_evidence(path, capture_limit=capture_limit)
         evidence = ArtifactEvidence(
             kind,
-            _artifact_identity_name(kind, path, model_root),
+            _artifact_identity_name(kind, path, effective_model_root),
             snapshot.sha256,
             snapshot.size,
         )
@@ -3336,6 +3373,8 @@ def run_production_gate(
             release.get("model"),
             release.get("loaded_models"),
             evidence_by_kind.get("model", []),
+            artifact_paths.get("model", []),
+            effective_model_root,
             failures,
         )
     host_identity: _HostProfileIdentity | None = None
