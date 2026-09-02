@@ -1015,6 +1015,10 @@ class CliIntegrationTests(unittest.TestCase):
             model_root = root / "model"
             model_root.mkdir()
             (model_root / "weights.bin").write_bytes(b"weights")
+            (model_root / "encoder").mkdir()
+            (model_root / "decoder").mkdir()
+            (model_root / "encoder" / "config.json").write_bytes(b"encoder")
+            (model_root / "decoder" / "config.json").write_bytes(b"decoder")
             arguments.extend(("--model-root", str(model_root)))
             arguments.extend(("--output", str(output)))
             runtime_prefix = f"/opt/turnalign/releases/{'a' * 40}/venv"
@@ -1119,6 +1123,14 @@ class CliIntegrationTests(unittest.TestCase):
             self.assertEqual(
                 {item["kind"] for item in payload["artifacts"]},
                 cli.REQUIRED_ARTIFACT_KINDS - {"host-profile"},
+            )
+            self.assertEqual(
+                sorted(
+                    item["name"]
+                    for item in payload["artifacts"]
+                    if item["kind"] == "model"
+                ),
+                ["decoder/config.json", "encoder/config.json", "weights.bin"],
             )
 
     def test_replay_creates_parent_and_valid_end_event(self):

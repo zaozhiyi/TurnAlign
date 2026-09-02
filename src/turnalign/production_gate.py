@@ -243,6 +243,29 @@ def _root_owned_immutable(metadata: os.stat_result) -> bool:
     return metadata.st_uid == 0 and not stat.S_IMODE(metadata.st_mode) & 0o022
 
 
+def _model_artifact_root(paths: list[Path]) -> Path | None:
+    if not paths:
+        return None
+    try:
+        parent_paths = [str(path.resolve(strict=False).parent) for path in paths]
+        return Path(os.path.commonpath(parent_paths))
+    except (OSError, ValueError):
+        return None
+
+
+def _artifact_identity_name(
+    kind: str,
+    path: Path,
+    model_root: Path | None = None,
+) -> str:
+    if kind != "model" or model_root is None:
+        return path.name
+    try:
+        return path.resolve(strict=False).relative_to(model_root).as_posix()
+    except ValueError:
+        return path.name
+
+
 def _open_evidence(path: Path) -> tuple[int, os.stat_result]:
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -641,6 +664,8 @@ def _create_host_profile_locked(
     kinds = set()
     identities = set()
     configuration_snapshots: dict[str, _EvidenceSnapshot] = {}
+    model_paths = [path for kind, path in artifacts if kind == "model"]
+    model_root = _model_artifact_root(model_paths)
     for kind, path in artifacts:
         if kind not in expected_kinds:
             raise ValueError(f"unsupported host-profile artifact kind: {kind}")
@@ -662,16 +687,17 @@ def _create_host_profile_locked(
             configuration_snapshots[kind] = snapshot
         else:
             snapshot = _snapshot_evidence(path)
-        identity = (kind, path.name)
+        identity_name = _artifact_identity_name(kind, path, model_root)
+        identity = (kind, identity_name)
         if identity in identities:
             raise ValueError(
-                f"host-profile artifacts require unique kind/name pairs: {kind}={path.name}"
+                f"host-profile artifacts require unique kind/name pairs: {kind}={identity_name}"
             )
         identities.add(identity)
         kinds.add(kind)
         evidence.append({
             "kind": kind,
-            "name": path.name,
+            "name": identity_name,
             "sha256": snapshot.sha256,
             "bytes": snapshot.size,
         })
@@ -2546,12 +2572,23 @@ def _validate_host_profile(
         name = item.get("name")
         digest = item.get("sha256")
         size = item.get("bytes")
+        valid_name = (
+            isinstance(name, str)
+            and bool(name)
+            and (
+                Path(name).name == name
+                if kind != "model"
+                else (
+                    not PurePosixPath(name).is_absolute()
+                    and PurePosixPath(name).as_posix() == name
+                    and all(part not in {"", ".", ".."} for part in PurePosixPath(name).parts)
+                )
+            )
+        )
         if (
             not isinstance(kind, str)
             or kind not in REQUIRED_ARTIFACT_KINDS - {"host-profile"}
-            or not isinstance(name, str)
-            or not name
-            or Path(name).name != name
+            or not valid_name
             or not isinstance(digest, str)
             or _SHA256_PATTERN.fullmatch(digest) is None
             or not _positive_integer(size)
@@ -2564,7 +2601,7 @@ def _validate_host_profile(
         if kind == "nginx-config" and name != "turnalign.conf":
             failures.append("host profile nginx-config is not the canonical config")
             return None
-        reported.append((kind, name, digest, cast(int, size)))
+        reported.append((kind, cast(str, name), cast(str, digest), cast(int, size)))
     if len({(kind, name) for kind, name, _digest, _size in reported}) != len(
         reported
     ):
@@ -3191,6 +3228,9 @@ def run_production_gate(
     artifact_paths: dict[str, list[Path]] = {}
     artifact_digests: dict[str, list[str]] = {}
     artifact_snapshots: dict[str, list[_EvidenceSnapshot]] = {}
+    model_root = _model_artifact_root(
+        [path for kind, path in artifacts if kind == "model"]
+    )
     for kind, path in artifacts:
         if kind not in REQUIRED_ARTIFACT_KINDS:
             raise ValueError(f"unsupported artifact kind: {kind}")
@@ -3208,7 +3248,12 @@ def run_production_gate(
             "websocket-probe-audio": 16 * 1024 * 1024,
         }.get(kind)
         snapshot = _snapshot_evidence(path, capture_limit=capture_limit)
-        evidence = ArtifactEvidence(kind, path.name, snapshot.sha256, snapshot.size)
+        evidence = ArtifactEvidence(
+            kind,
+            _artifact_identity_name(kind, path, model_root),
+            snapshot.sha256,
+            snapshot.size,
+        )
         artifact_evidence.append(evidence)
         evidence_by_kind.setdefault(kind, []).append(evidence)
         kinds.add(kind)
