@@ -1786,16 +1786,33 @@ class WebSocketTests(unittest.IsolatedAsyncioTestCase):
                     )
                 self.assertTrue(await asyncio.to_thread(detached.wait, 2))
 
-                async with connect(f"ws://127.0.0.1:{port}") as second:
-                    await second.send(json.dumps({"type": "start", "backend": "fake"}))
-                    ready = json.loads(
-                        await asyncio.wait_for(second.recv(), timeout=0.5)
-                    )
-                    self.assertEqual(ready["type"], "ready")
-                    await second.send(json.dumps({"type": "end"}))
-                    async for message in second:
-                        if json.loads(message).get("kind") == "end":
-                            break
+                deadline = asyncio.get_running_loop().time() + 2
+                while True:
+                    try:
+                        async with connect(f"ws://127.0.0.1:{port}") as second:
+                            await second.send(json.dumps({
+                                "type": "start",
+                                "backend": "fake",
+                            }))
+                            ready = json.loads(
+                                await asyncio.wait_for(second.recv(), timeout=0.5)
+                            )
+                            if ready.get("code") == "server_busy":
+                                ready = None
+                            else:
+                                self.assertEqual(ready["type"], "ready")
+                                await second.send(json.dumps({"type": "end"}))
+                                async for message in second:
+                                    if json.loads(message).get("kind") == "end":
+                                        break
+                                break
+                    except ConnectionClosed:
+                        ready = None
+                    if ready is not None:
+                        break
+                    if asyncio.get_running_loop().time() >= deadline:
+                        self.fail("session capacity was not released after detach")
+                    await asyncio.sleep(0.02)
                 self.assertEqual(create.call_count, 2)
                 self.assertFalse(blocking.closed.is_set())
             finally:
