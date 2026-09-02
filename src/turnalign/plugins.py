@@ -47,6 +47,7 @@ class AsrConfig:
     model_path: str | None = None
     extra: dict[str, Any] | None = None
     hints: AsrHints = field(default_factory=AsrHints)
+    require_local_model: bool = False
 
 
 @runtime_checkable

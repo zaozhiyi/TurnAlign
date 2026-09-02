@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 MAX_HOTWORDS = 128
@@ -32,13 +33,21 @@ class AsrHints:
                 seen.add(key)
         if len(normalized) > MAX_HOTWORDS:
             raise ValueError(f"at most {MAX_HOTWORDS} hotwords are allowed per request")
+        if self.context is not None and not isinstance(self.context, str):
+            raise TypeError("context must be a string")
         context = self.context.strip() if self.context else None
         if context and len(context) > MAX_CONTEXT_CHARS:
             raise ValueError(f"context exceeds {MAX_CONTEXT_CHARS} characters")
-        if self.boost is not None and self.boost <= 0:
-            raise ValueError("hotword boost must be positive")
+        boost = self.boost
+        if boost is not None:
+            if isinstance(boost, bool) or not isinstance(boost, (int, float)):
+                raise TypeError("hotword boost must be a number")
+            boost = float(boost)
+            if not math.isfinite(boost) or not 0 < boost <= 1_000:
+                raise ValueError("hotword boost must be finite and between 0 and 1000")
         object.__setattr__(self, "hotwords", tuple(normalized))
         object.__setattr__(self, "context", context)
+        object.__setattr__(self, "boost", boost)
 
     @property
     def active(self) -> bool:

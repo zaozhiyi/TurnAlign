@@ -85,7 +85,7 @@ turnalign transcribe audio.mp3 --backend glm-asr \
 | `transformers-whisper` | Whisper initial prompt | 支持 |
 | `faster-whisper` | 原生 `hotwords` | 支持，通过 `initial_prompt` |
 | `funasr` | 原生 `hotword` | 不支持 |
-| `whisper-cpp` | `--prompt` | 支持 |
+| `whisper-cpp` | `--prompt` | 默认禁用；接受本机进程列表泄露风险后，显式设置 `--backend-option allow_prompt_argv=true` |
 
 实际词表和上下文不会复制到 TurnAlign 事件或 WebSocket ready 消息；只记录使用方式、词条数量和是否使用上下文。不支持的组合会在加载模型权重前失败，不会静默忽略。
 
@@ -137,8 +137,9 @@ turnalign transcribe audio.mp3 --backend glm-asr \
 - 说话人结果没有人工标注真值，暂时无法给出可靠的 DER。
 - 很短的应答、抢话和重叠语音仍可能分到相邻说话人。
 - 在线说话人会话接口已经存在，但仓库尚未内置经过人工 DER 验证的在线说话人模型；CAM++ 仍用于离线全局修正。
-- WebSocket v1 可在同一服务进程内按 `session_id` 断线续传并重放未确认事件；跨进程恢复仍需客户端保留源音频。
-- 公共音频时间线和对齐切片已磁盘化并有界分批；当前 FSMN-VAD/CAM++ 上游离线 API 仍会为模型生成完整浮点输入。
+- WebSocket v1 可在同一服务进程内凭 `session_id` 与独立高熵 `resume_token` 断线续传，并在有界事件窗口内重放未确认事件；确认点过旧或跨进程恢复仍需客户端保留源音频。
+- 公共音频时间线和对齐切片已磁盘化并有界分批；当前 FSMN-VAD/CAM++ 上游离线 API 仍会为模型生成完整浮点输入，因此默认拒绝超过 3 小时的单次输入。可用 `--vad-option max_materialized_seconds=...` 或 `--diarizer-option max_materialized_seconds=...` 显式调整，但应先按部署内存容量测算。
+- whisper.cpp 官方 CLI 只接受命令行 `--prompt`；TurnAlign 因此默认拒绝向该后端传递私有热词或上下文。只有能接受同机用户通过进程列表读取提示词的部署，才应显式设置 `--backend-option allow_prompt_argv=true`。
 - GLM 正文按 30 秒窗口与 Paraformer 时间轴对齐，边界属于近似结果。
 - Vulkan 的设备稳定性取决于具体可执行包、驱动和 GPU；本机核显短样本可运行不代表质量合格，固定 v1.8.4 包的 RX 7650 GRE 路径未通过。
 
@@ -171,14 +172,114 @@ turnalign listen --backend transformers-whisper --model openai/whisper-small --l
 turnalign listen --backend funasr-streaming --model paraformer-zh-streaming --language zh
 turnalign listen --backend funasr-streaming --refinement-backend funasr \
   --refinement-model paraformer-zh --aligner paraformer --diarizer campp
+turnalign release-gate sample-30s.wav --backend funasr-streaming \
+  --model paraformer-zh-streaming --device cpu --output release-events.jsonl \
+  --source-commit "$(git rev-parse HEAD)" --report release-report.json \
+  --max-initialization-seconds 120 --max-first-partial-seconds 3 \
+  --max-first-commit-seconds "$MAX_FIRST_COMMIT_SECONDS" \
+  --require-immutable-model-revision --require-local-model \
+  --model-path /var/lib/turnalign/models/paraformer-zh-streaming \
+  --max-realtime-factor 1
+turnalign quality-gate reference.jsonl release-events.jsonl \
+  --max-cer "$MAX_CER" --min-reference-speech-seconds "$MIN_LABELLED_SECONDS" \
+  --model paraformer-zh-streaming \
+  --source-commit "$(git rev-parse HEAD)" --report quality-report.json
 turnalign audio-devices
 turnalign record sample.wav --duration 10
-turnalign serve --backend glm-asr --device auto
-# 非本机部署必须显式 --allow-remote，并建议配置反向代理 TLS 与认证：
-TURNALIGN_AUTH_TOKEN=replace-me turnalign serve --backend glm-asr \
-  --allow-remote --auth-token-env TURNALIGN_AUTH_TOKEN
+turnalign serve --backend glm-asr --device auto --language zh \
+  --preload --require-local-model --model-path /var/lib/turnalign/models/glm-asr
+# 非本机部署必须显式 --allow-remote，并建议配置反向代理 TLS 与文件型认证：
+turnalign serve --backend glm-asr --language zh --allow-remote \
+  --auth-token-file /path/to/restricted/auth-token --preload \
+  --require-immutable-model-revision --allow-origin https://app.example
+turnalign websocket-gate wss://asr.example/ws --sessions 8 \
+  --audio-seconds 60 --realtime --max-ready-seconds 10 \
+  --max-total-seconds 75 --min-audio-acks 600 \
+  --min-commits 1 --probe-audio probe-60s.wav \
+  --max-dropped-partials 0 --max-backpressure-pauses 0 --verify-recovery \
+  --auth-token-file /path/to/restricted/auth-token \
+  --source-commit "$(git rev-parse HEAD)" --report websocket-report.json
+turnalign model-manifest --model-id paraformer-zh-streaming \
+  --model-revision "$MODEL_REVISION" \
+  --model-root /var/lib/turnalign/models/paraformer-zh-streaming \
+  --output model-manifest.json
+sudo /opt/turnalign/releases/$CANDIDATE_COMMIT/venv/bin/python \
+  -I -B -u -m turnalign.cli deployment-activate \
+  wss://asr.example.com/ws --previous-commit "$PREVIOUS_COMMIT" \
+  --candidate-commit "$CANDIDATE_COMMIT" --backend funasr-streaming \
+  --model paraformer-zh-streaming --probe-audio probe-60s.wav \
+  --auth-token-file /path/to/restricted/auth-token \
+  --report deployment-activation.json
+# 仅当激活或回滚演练被 SIGKILL、断电或重启打断时执行；成功后重跑被中断的操作。
+sudo /opt/turnalign/releases/$CANDIDATE_COMMIT/venv/bin/python \
+  -I -B -u -m turnalign.cli deployment-recover \
+  --backend funasr-streaming --model paraformer-zh-streaming \
+  --probe-audio probe-60s.wav \
+  --auth-token-file /path/to/restricted/auth-token \
+  --report deployment-recovery.json
+sudo /opt/turnalign/current/venv/bin/python -I -B -u -m turnalign.cli \
+  deployment-rehearsal \
+  wss://asr.example.com/ws --previous-commit "$PREVIOUS_COMMIT" \
+  --candidate-commit "$CANDIDATE_COMMIT" --backend funasr-streaming \
+  --model paraformer-zh-streaming --probe-audio probe-60s.wav \
+  --auth-token-file /path/to/restricted/auth-token \
+  --report rollback-rehearsal.json
+sudo /opt/turnalign/current/venv/bin/python -I -B -u -m turnalign.cli \
+  deployment-status --validity-seconds 300 --output deployment-state.json
+sudo /opt/turnalign/current/venv/bin/python -I -B -u -m turnalign.cli host-profile \
+  --artifact wheel=dist/turnalign.whl --artifact dependency-lock=requirements.lock \
+  --artifact sbom=sbom.cdx.json --artifact release-audio=sample-30s.wav \
+  --artifact quality-reference=reference.jsonl \
+  --artifact quality-hypothesis=release-events.jsonl \
+  --model-root /var/lib/turnalign/models/paraformer-zh-streaming \
+  --artifact model-manifest=model-manifest.json \
+  --artifact nginx-config=/etc/nginx/conf.d/turnalign.conf \
+  --artifact service-unit=/etc/systemd/system/turnalign.service \
+  --artifact deployment-activation=deployment-activation.json \
+  --artifact rollback-rehearsal=rollback-rehearsal.json \
+  --artifact websocket-probe-audio=probe-60s.wav \
+  --artifact deployment-state=deployment-state.json \
+  --output host-profile.json
+turnalign production-gate release-report.json quality-report.json websocket-report.json \
+  --source-commit "$(git rev-parse HEAD)" \
+  --artifact wheel=dist/turnalign.whl --artifact dependency-lock=requirements.lock \
+  --artifact sbom=sbom.cdx.json \
+  --artifact release-audio=sample-30s.wav \
+  --artifact quality-reference=reference.jsonl \
+  --artifact quality-hypothesis=release-events.jsonl \
+  --model-root /var/lib/turnalign/models/paraformer-zh-streaming \
+  --artifact model-manifest=model-manifest.json \
+  --artifact nginx-config=/etc/nginx/conf.d/turnalign.conf \
+  --artifact service-unit=/etc/systemd/system/turnalign.service \
+  --artifact deployment-activation=deployment-activation.json \
+  --artifact rollback-rehearsal=rollback-rehearsal.json \
+  --artifact websocket-probe-audio=probe-60s.wav \
+  --artifact deployment-state=deployment-state.json \
+  --artifact host-profile=host-profile.json --report production-report.json
 python examples/websocket_file_client.py sample.wav --backend glm-asr --language zh
 ```
+
+`release-gate` 必须调用真实后端，而不是 mock。它会验证事件状态机、原生流式声明、首个 partial、可选的首次 commit 延迟、最少 commit 数、初始化时间和 RTF，并在任一门槛失败时返回非零退出码。默认要求至少 10 秒音频；应将 `--output` 生成的 JSONL 与命令输出一并保存为发布证据。准确率发布门禁使用人工标注 JSONL 执行 `turnalign quality-gate`：至少配置一项 CER、WER、说话人错误或修订稳定性上限，并按目标场景设定最小标注规模；任一条件失败时返回非零退出码。中文参考没有人工分词时应以 CER 为主。说话人指标是单活跃说话人区间分数，不等同于支持重叠语音与 collar 的标准 DER。阈值必须由实际产品容忍度和代表性语料得出，仓库不提供虚构的通用阈值。`turnalign evaluate` 仍可用于只生成指标、不阻断发布的分析。
+
+`websocket-gate` 使用非静音探测音频并发检查已部署服务的协议、流控、确认、完成率和延迟，不保存识别文本或恢复凭证。开发态无 `--probe-audio` 时会生成确定性的 440 Hz PCM 探测音；生产证据必须显式提供 `--probe-audio`，报告会绑定该 WAV 的 SHA-256、字节数和 RMS。默认要求每会话至少一个 commit 和 ACK 且不允许丢弃 partial，可用 `--min-commits`、`--min-audio-acks`、`--max-dropped-partials` 和 `--max-backpressure-pauses` 收紧目标环境门槛。它只证明传输与生命周期，不证明识别质量；突发测试不加 `--realtime`，长稳测试则加上该参数。生产 TLS 应由反向代理或服务网格终止，门槛直接访问外部 `wss://` 地址。非浏览器客户默认允许；浏览器 Origin 默认拒绝，必须用 `--allow-origin` 精确放行。`GET /healthz` 和 `GET /readyz` 可用作存活/就绪探针；仅回环访问的 `GET /metrics` 提供不含标签、文本和凭证的 Prometheus 运行指标，示例 Nginx 明确拒绝公网 `/metrics`。进程收到 `SIGTERM` 后会停止接入、关闭现有连接并在 `--shutdown-grace-timeout` 后强制取消未退出的处理器。恢复音频默认限制为每会话 512 MiB、每进程 2 GiB，完成后立即释放临时文件；断线会话的默认恢复窗口为 300 秒，超时由后台任务自动清理。相关上限均可通过 `serve --help` 调整。服务进程默认最多接受 32 个会话，但同一模型默认只有一个实例；需要进程内并行时显式设置 `--backend-replicas N`（最多 8，模型内存也近似乘以 N），或部署多个单副本进程。生产服务应加 `--preload`，在监听端口前加载全部副本；配合 `--warmup-file` 可在启动阶段执行真实推理。首次消息、客户端空闲、模型初始化、结束收尾和工作线程退出时间均有界，可通过 `turnalign serve --help` 调整。命令行后端的可执行文件、模型路径和参数可由运维侧通过 `--executable`、`--model-path` 和 `--backend-option KEY=VALUE` 固定，无需开放客户端路径权限。内置后端的私密热词按租约注入并在归还时清空，不同热词会话可复用同一大模型实例。
+
+`model-manifest`、`host-profile` 和 `production-gate` 的 `--model-root` 使用同一套安全递归枚举，自动纳入目录下每个非空普通文件，并拒绝符号链接、特殊文件、空模型树及超出证据上限的模型树。不要再同时传入手工 `model` 工件；这样可以避免真实模型包含嵌套目录或同名配置文件时漏采、压平或错绑证据。
+
+ready 响应会公开非敏感的后端请求名、后端实现名、模型、设备、不可变模型 revision 和已加载本地模型文件的绝对路径/SHA-256/大小。生产服务必须用 `--preload --require-local-model`，把模型放在 root-owned、group/others 不可写且整条祖先路径不可被服务账号替换的 `/var/lib/turnalign/models` 下；可写状态使用独立的 `/var/lib/turnalign-state`。后端如不支持本地加载证据则不会通过生产门禁。`websocket-gate` 要求所有普通及恢复会话观察到完全一致的部署身份和已加载模型集，`production-gate` 再把实际后端实现、模型身份、revision 和逐文件模型证据与 release/quality/模型清单交叉校验，避免公网探测误测到另一套权重。
+
+各门禁和部署命令都可用 `--report` 原子保存 JSON 结论。`deployment-activate` 必须从尚未激活的候选 Wheel 运行：它先在 `/var/lib/turnalign-deployment/pending-activation.json` 落盘 root-only 事务标记，再在全局部署锁内原子切换、重启 systemd，并验证预加载就绪和公网 WebSocket 恢复；普通失败或取消会恢复上一版并重做探测。回滚演练也会在切换前持久化带操作类型的同类事务，安全恢复目标为候选版本。只有报告已安全写盘且最终活动版本正确，CLI 才删除事务标记。若任一操作遭遇 `SIGKILL`、断电或主机重启，使用候选 Wheel 的 `deployment-recover` 读取该标记、恢复并探测记录的安全版本，然后重跑被中断的操作。未恢复的标记会阻止新激活、回滚演练和 `host-profile`。`host-profile` 会全程持有同一把 root-only 部署锁，避免与版本切换并发采证。`production-gate` 只在真实模型、人工标注质量、公网 WebSocket、正式激活和回滚/恢复报告均通过时放行；它要求 wheel、依赖锁、CycloneDX SBOM、发布音频、质量参考/输出、模型文件、模型清单、Nginx、systemd、正式激活、回滚演练和主机规格十五类制品。激活、演练与 `host-profile` 必须绑定同一 Linux boot 和同一对前序/候选版本；激活和演练报告还必须包含合法的持久事务身份，`host-profile` 会绑定 Wheel 版本、版本化 Python 路径和其余十四类工件的名称、大小与 SHA-256。三份模型/质量/传输报告必须绑定同一源码提交，音频、质量输入和模型清单也会逐项校验。Wheel、systemd、Nginx、依赖锁和 SBOM 仍由聚合门禁独立重新解析；`host-profile` 和五分钟内有效的 `deployment-status` 还会调用 `systemctl show` 与 `nginx -T`，拒绝未 reload、非活动服务、systemd drop-in、Nginx warning、未加载或加载多次的规范配置，并把实际生效配置绑定到工件摘要。`production-gate` 仍是离线证据聚合器。缺项、伪造转换、弱化探测、过期报告或身份不一致都会返回非零退出码。
+
+激活、恢复和回滚演练在任何切换前还会递归检查候选版与前序版的完整发布目录，而不只检查顶层目录和提交标识。解释器、TurnAlign 与全部依赖中的目录和普通文件必须由 root 持有且不可被 group/others 写入；符号链接也必须由 root 持有，并沿完全不可写的 root-owned 路径解析。目录链接不得逃逸到发布树之外，外部链接只能指向普通文件（例如标准虚拟环境使用的系统解释器）。可写依赖、特殊文件、悬空链接或指向可变路径的链接都会阻止切换。
+
+`host-profile` 的第 7 版证据还会验证 root-owned `current` 绝对链接确实指向当前候选提交，并逐文件哈希目标机上实际运行的 `turnalign/` 包和锁文件中每个运行时依赖的已安装版本与内容；大型依赖以确定性树摘要记录文件数、总字节和 SHA-256，避免 Torch 等合法运行时因证据 JSON 膨胀而永远无法过门禁。systemd 与 Nginx 制品及整条祖先路径必须 root-owned、不可由 group/others 写入，并位于 `/etc/systemd/system/turnalign.service` 和 `/etc/nginx/conf.d/turnalign.conf`。生效态采证还要求服务 active/running、`NeedDaemonReload=no`、无 systemd drop-in，并要求 `nginx -T` 无 warning 且恰好加载一次字节一致的规范配置。源码目录遮蔽、非活动候选运行时、缺失/替换文件、符号链接、可写安装文件、错误依赖版本和额外 `__pycache__`/`.pyc` 均会失败。生产命令直接使用版本化 Python 的 `-I -B -u -m turnalign.cli`，隔离环境/用户路径、禁止生成字节码并保持日志无缓冲，不信任安装器生成的 console launcher。
+
+上游仓库推送与 `pyproject.toml` 版本完全一致的 `vX.Y.Z` 标签时，专用发布工作流会重新执行静态检查、两次可复现构建、Wheel 全量测试和 SBOM 生成，然后为 Wheel、sdist、SBOM 和校验和生成 GitHub/Sigstore provenance，保留 90 天。fork PR 只运行无写权限的工作流验证，不能签发制品。下载后可用 `gh attestation verify FILE --repo GuanZhengPM/TurnAlign` 复验构建身份。该工作流不会自动发布 PyPI 或创建 GitHub Release。
+
+仓库提供一套范围明确的 [Linux CPU systemd + Nginx 参考部署](deploy/README.md)，包含回环绑定、TLS 代理、速率限制、低权限运行、预加载和发布门禁清单。GPU/MPS 部署必须按目标硬件单独验证，不能直接套用这份 CPU 安全单元。
+
+内置 GLM-ASR、Transformers Whisper 和 Paraformer 别名现在固定到不可变提交。正式发布的 `release-gate` 和 `serve` 都应启用 `--require-immutable-model-revision`；服务会在预加载或首次创建后端时拒绝浮动版本。自定义 Hugging Face 模型用 `--backend-option revision=COMMIT_SHA`，自定义 FunASR 模型用 `--backend-option model_revision=COMMIT_SHA`。不提供提交版本元数据的后端应改用经过校验的本地模型制品，并且不要启用该门禁。
+
+文本比较默认严格区分大小写、标点和 Unicode 表示。只有标注规范明确要求时，才使用 `--unicode-normalization NFC|NFKC`、`--ignore-case` 或 `--ignore-punctuation`；实际策略会写入质量报告，避免预处理变化悄悄改变发布结论。
 
 源码运行：
 
@@ -192,6 +293,7 @@ python -m turnalign.cli replay `
 
 python -m turnalign.cli validate-events demo-events.jsonl
 python -m turnalign.cli evaluate reference.jsonl hypothesis.jsonl
+python -m turnalign.cli quality-gate reference.jsonl hypothesis.jsonl --max-cer "$MAX_CER"
 python -m unittest discover -s tests -v
 ```
 
@@ -290,7 +392,7 @@ turnalign transcribe audio.mp3 --backend glm-asr \
 | `transformers-whisper` | Whisper initial prompt | supported |
 | `faster-whisper` | native `hotwords` | supported through `initial_prompt` |
 | `funasr` | native `hotword` | unsupported |
-| `whisper-cpp` | `--prompt` | supported |
+| `whisper-cpp` | `--prompt` | disabled by default; explicitly set `--backend-option allow_prompt_argv=true` only after accepting local process-list exposure |
 
 TurnAlign events and WebSocket ready messages never copy the actual phrases or context. They report only the application method, phrase count, and whether context was used. Unsupported combinations fail before model weights are loaded instead of being silently ignored.
 
@@ -342,8 +444,9 @@ See [docs/validation.md](docs/validation.md) for the full run log and metrics.
 - The speaker output has no human-labelled reference, so a reliable DER is not available.
 - Very short responses, interruptions, and overlapping speech may be assigned to a neighbouring speaker.
 - The online diarization session contract is implemented, but the repository does not yet ship an online speaker model validated against human-labelled DER; CAM++ remains an offline refinement component.
-- WebSocket v1 resumes by `session_id` and replays unacknowledged events within the same server process; clients still retain source audio for cross-process recovery.
-- The common timeline and alignment slices are disk-backed and bounded in batches; current upstream FSMN-VAD/CAM++ offline APIs still materialize one full float input for the model.
+- WebSocket v1 resumes with both `session_id` and its high-entropy `resume_token`, then replays unacknowledged events within a bounded in-process window; clients retain source audio for stale-window or cross-process recovery.
+- The common timeline and alignment slices are disk-backed and bounded in batches. Current upstream FSMN-VAD/CAM++ offline APIs still materialize one full float input, so TurnAlign rejects inputs longer than three hours by default. Override with `--vad-option max_materialized_seconds=...` or `--diarizer-option max_materialized_seconds=...` only after sizing deployment memory.
+- The official whisper.cpp CLI accepts prompts only through `--prompt`, so TurnAlign rejects private hints for this backend by default. Set `--backend-option allow_prompt_argv=true` only on deployments that accept prompt visibility in the local process list.
 - GLM text is aligned to the Paraformer timeline inside 30-second source windows, so speaker boundaries are approximate.
 - Vulkan device stability is specific to the executable build, driver, and GPU. A runnable integrated-GPU short sample is not a quality result, and the pinned v1.8.4 build did not pass on the RX 7650 GRE.
 
@@ -371,8 +474,267 @@ turnalign listen --backend transformers-whisper --model openai/whisper-small
 turnalign listen --backend funasr-streaming --model paraformer-zh-streaming
 turnalign listen --backend funasr-streaming --refinement-backend funasr \
   --refinement-model paraformer-zh --aligner paraformer --diarizer campp
-turnalign serve --backend glm-asr --device auto
+turnalign release-gate sample-30s.wav --backend funasr-streaming \
+  --model paraformer-zh-streaming --device cpu --output release-events.jsonl \
+  --source-commit "$(git rev-parse HEAD)" --report release-report.json \
+  --max-initialization-seconds 120 --max-first-partial-seconds 3 \
+  --max-first-commit-seconds "$MAX_FIRST_COMMIT_SECONDS" \
+  --require-immutable-model-revision --require-local-model \
+  --model-path /var/lib/turnalign/models/paraformer-zh-streaming \
+  --max-realtime-factor 1
+turnalign quality-gate reference.jsonl release-events.jsonl \
+  --max-cer "$MAX_CER" --min-reference-speech-seconds "$MIN_LABELLED_SECONDS" \
+  --model paraformer-zh-streaming \
+  --source-commit "$(git rev-parse HEAD)" --report quality-report.json
+turnalign serve --backend glm-asr --device auto --language zh \
+  --preload --require-local-model --model-path /var/lib/turnalign/models/glm-asr
+turnalign websocket-gate wss://asr.example/ws --sessions 8 \
+  --audio-seconds 60 --realtime --max-ready-seconds 10 \
+  --max-total-seconds 75 --min-audio-acks 600 \
+  --min-commits 1 --probe-audio probe-60s.wav \
+  --max-dropped-partials 0 --max-backpressure-pauses 0 --verify-recovery \
+  --auth-token-file /path/to/restricted/auth-token \
+  --source-commit "$(git rev-parse HEAD)" --report websocket-report.json
+turnalign model-manifest --model-id paraformer-zh-streaming \
+  --model-revision "$MODEL_REVISION" \
+  --model-root /var/lib/turnalign/models/paraformer-zh-streaming \
+  --output model-manifest.json
+sudo /opt/turnalign/releases/$CANDIDATE_COMMIT/venv/bin/python \
+  -I -B -u -m turnalign.cli deployment-activate \
+  wss://asr.example.com/ws --previous-commit "$PREVIOUS_COMMIT" \
+  --candidate-commit "$CANDIDATE_COMMIT" --backend funasr-streaming \
+  --model paraformer-zh-streaming --probe-audio probe-60s.wav \
+  --auth-token-file /path/to/restricted/auth-token \
+  --report deployment-activation.json
+# Run only after SIGKILL, power loss, or reboot interrupts activation or rehearsal;
+# then rerun the interrupted operation.
+sudo /opt/turnalign/releases/$CANDIDATE_COMMIT/venv/bin/python \
+  -I -B -u -m turnalign.cli deployment-recover \
+  --backend funasr-streaming --model paraformer-zh-streaming \
+  --probe-audio probe-60s.wav \
+  --auth-token-file /path/to/restricted/auth-token \
+  --report deployment-recovery.json
+sudo /opt/turnalign/current/venv/bin/python -I -B -u -m turnalign.cli \
+  deployment-rehearsal \
+  wss://asr.example.com/ws --previous-commit "$PREVIOUS_COMMIT" \
+  --candidate-commit "$CANDIDATE_COMMIT" --backend funasr-streaming \
+  --model paraformer-zh-streaming --probe-audio probe-60s.wav \
+  --auth-token-file /path/to/restricted/auth-token \
+  --report rollback-rehearsal.json
+sudo /opt/turnalign/current/venv/bin/python -I -B -u -m turnalign.cli \
+  deployment-status --validity-seconds 300 --output deployment-state.json
+sudo /opt/turnalign/current/venv/bin/python -I -B -u -m turnalign.cli host-profile \
+  --artifact wheel=dist/turnalign.whl --artifact dependency-lock=requirements.lock \
+  --artifact sbom=sbom.cdx.json --artifact release-audio=sample-30s.wav \
+  --artifact quality-reference=reference.jsonl \
+  --artifact quality-hypothesis=release-events.jsonl \
+  --model-root /var/lib/turnalign/models/paraformer-zh-streaming \
+  --artifact model-manifest=model-manifest.json \
+  --artifact nginx-config=/etc/nginx/conf.d/turnalign.conf \
+  --artifact service-unit=/etc/systemd/system/turnalign.service \
+  --artifact deployment-activation=deployment-activation.json \
+  --artifact rollback-rehearsal=rollback-rehearsal.json \
+  --artifact websocket-probe-audio=probe-60s.wav \
+  --artifact deployment-state=deployment-state.json \
+  --output host-profile.json
+turnalign production-gate release-report.json quality-report.json websocket-report.json \
+  --source-commit "$(git rev-parse HEAD)" \
+  --artifact wheel=dist/turnalign.whl --artifact dependency-lock=requirements.lock \
+  --artifact sbom=sbom.cdx.json \
+  --artifact release-audio=sample-30s.wav \
+  --artifact quality-reference=reference.jsonl \
+  --artifact quality-hypothesis=release-events.jsonl \
+  --model-root /var/lib/turnalign/models/paraformer-zh-streaming \
+  --artifact model-manifest=model-manifest.json \
+  --artifact nginx-config=/etc/nginx/conf.d/turnalign.conf \
+  --artifact service-unit=/etc/systemd/system/turnalign.service \
+  --artifact deployment-activation=deployment-activation.json \
+  --artifact rollback-rehearsal=rollback-rehearsal.json \
+  --artifact websocket-probe-audio=probe-60s.wav \
+  --artifact deployment-state=deployment-state.json \
+  --artifact host-profile=host-profile.json --report production-report.json
 ```
+
+`release-gate` must invoke a real backend rather than a mock. It validates the
+event state machine, native-streaming declaration, first partial, optional
+first-commit latency, minimum commit count, initialization latency, and
+real-time factor, returning a non-zero exit
+code when any threshold fails. The default sample minimum is ten seconds. Keep
+the `--output` JSONL and command report as release evidence. Use
+`--require-immutable-model-revision` for both `release-gate` and `serve` in
+production; built-in model aliases use fixed commit hashes, while custom
+Hugging Face models accept
+`--backend-option revision=COMMIT_SHA` and custom FunASR models accept
+`--backend-option model_revision=COMMIT_SHA`. The server enforces this during
+preload or first backend creation. Backends without revision metadata must use
+a separately verified local model artifact and leave this gate disabled. Use
+`turnalign quality-gate` with human-labelled common-event JSONL for the accuracy
+release decision. Configure at least one CER, WER, speaker-error, or revision
+stability ceiling plus corpus-size minima derived from the actual product and
+target scenarios; any failure returns a non-zero exit code. Prefer CER for
+Mandarin references without word segmentation. The speaker score assumes one
+active speaker and is not an overlap/collar-aware standard DER. The repository
+does not invent universal acceptance values. Use `turnalign evaluate` when a
+non-blocking metric report is sufficient.
+
+Text comparison is strict by default. Enable `--unicode-normalization NFC|NFKC`,
+`--ignore-case`, or `--ignore-punctuation` only when the annotation policy calls
+for it. The selected policy is serialized in the quality report so preprocessing
+changes cannot silently move the release metric.
+
+`websocket-gate` uses non-silent probe audio to validate concurrent deployed-server
+protocol, flow control, acknowledgements, completion and latency without
+retaining transcript text. It is a transport/lifecycle gate, not an accuracy
+test. Development runs without `--probe-audio` generate a deterministic 440 Hz PCM probe; production evidence must supply a retained 16 kHz mono PCM16 WAV and binds its digest, byte count, and RMS. At least one commit and one acknowledgement and zero dropped partials are required by default; these limits are configurable. Run without `--realtime` for bursts and with it for a soak. TLS
+should terminate at a reverse proxy or service mesh, and the gate should target
+the public `wss://` endpoint. A server
+process accepts at most 32 sessions by default, but one model instance per
+configuration serializes same-model inference. Set `--backend-replicas N` (up
+to eight, with roughly N times model memory) or deploy multiple one-replica
+processes for parallel inference. Initial-message, client-idle,
+model-initialization, finalization and worker-shutdown time are bounded; see
+`serve --help`.
+
+Ready responses expose the non-sensitive requested backend, backend
+implementation, model, device, immutable model revision, and the absolute paths,
+SHA-256 digests, and sizes of loaded local model files. Production services must
+preload with `--require-local-model` and root-owned files under
+`/var/lib/turnalign/models` whose complete ancestor path is non-writable by the
+service identity, group, or others. Writable state belongs in the separate
+`/var/lib/turnalign-state` directory. Every normal and recovery session must observe one identical deployment identity and loaded model set, and `production-gate` cross-checks those against release, quality, and model-manifest evidence.
+
+Browser origins are rejected by default; add each trusted exact origin with
+`--allow-origin`. Non-browser clients without an Origin header remain accepted.
+`GET /healthz` and `GET /readyz` provide orchestration probes. The loopback-only
+`GET /metrics` endpoint provides label-free Prometheus counters without text,
+identifiers, model labels or credentials; the reference Nginx server rejects
+the public `/metrics` path. `SIGTERM` stops
+admission, closes existing connections with a service-restart code, and bounds
+handler cleanup with `--shutdown-grace-timeout`.
+Recovery audio is bounded to 512 MiB per session and 2 GiB per process by
+default, and its temporary file is closed immediately when a session completes.
+See `serve --help` for the session, event, per-session audio, and total-audio
+limits.
+Inactive disconnected sessions expire after 300 seconds by default and are
+removed by a background sweeper; configure the resume window with
+`--recovery-ttl-seconds`.
+The server writes timestamped lifecycle logs to stderr at `INFO` by default;
+change verbosity with `--log-level`. Session logs include identifiers and
+transport counts, never transcript text or private hint values.
+Start and control JSON messages are limited to 64 KiB of UTF-8 by default even
+though larger binary PCM frames are supported; tune this separately with
+`--max-control-message-bytes`.
+Recoverable output events are limited to 512 KiB each and 8 MiB retained per
+session by default. The replay window evicts oldest events by both count and
+serialized byte size; an oversized backend result is rejected with a redacted
+session error rather than sent to the client.
+Use `--preload` to load all replicas before opening the listening socket;
+`--warmup-file` additionally runs inference during startup. Production images
+should pre-download and checksum weights instead of downloading on first boot.
+Trusted command-backend defaults can be supplied with `--executable`,
+`--model-path`, and repeated `--backend-option KEY=VALUE`; they do not require
+enabling client-controlled paths. Built-in backends apply private hints per
+lease, clear them on release, and reuse the heavy model across different hint
+sets.
+Add `--verify-recovery` to run one extra fault probe after the normal sessions.
+It disconnects only after audio is durably acknowledged on a zero-buffer
+boundary, retries transient `session_conflict` responses, resumes the same
+session with its per-session secret, and requires continuous audio sequence
+numbers plus a terminal event.
+The report contains only counters and sequence metadata, never transcript text.
+Run the probe through the public load balancer. Since recovery is process-local,
+multi-instance deployments require session affinity for the configured recovery
+TTL; the probe will fail if reconnects reach another instance.
+
+The executable gates and deployment commands accept `--report` to atomically
+persist their JSON verdict. Run `deployment-activate` from the inactive candidate
+Wheel. It first persists a root-only marker at
+`/var/lib/turnalign-deployment/pending-activation.json`; under the global
+deployment lock it then atomically switches the release, restarts systemd, and
+proves preloaded readiness plus public WebSocket recovery. Ordinary failure or
+cancellation restores and reprobes the preceding release. The CLI removes the
+marker only after its report is durable and the expected release is active.
+`deployment-rehearsal` persists the same operation-tagged transaction before it
+switches to the preceding release, then restores and reprobes the candidate. If
+SIGKILL, power loss, or reboot interrupts either command, run
+`deployment-recover` from the candidate Wheel; it restores and reprobes the safe
+release recorded for that operation, then the interrupted operation must be
+rerun. Schema-1 activation markers remain recoverable. A pending marker blocks
+activation, rehearsal, and `host-profile`; host-profile also holds the same
+root-only deployment lock throughout evidence capture. Before any transition,
+activation, recovery, and rehearsal recursively validate
+both complete release trees: directories and regular files must be root-owned
+and non-writable by group or others, while root-owned symbolic links must resolve
+through an equally immutable root-owned path. Directory links cannot escape the
+release tree; external links may target only regular files such as the system
+interpreter used by a standard virtual environment. Mutable dependencies,
+special files, dangling links, and links into writable paths fail before
+`current` changes. `production-gate`
+releases only when the real-model, labelled-quality, public WebSocket, activation
+and rollback/restore reports passed with production-strength requirements. It
+binds the source commit and SHA-256 digests of those reports,
+the wheel, dependency lock, CycloneDX SBOM, release audio, quality reference and
+hypothesis, model files, model manifest, Nginx configuration, systemd unit and
+host profile into one auditable fifteen-artifact verdict. Activation, rehearsal
+and host profile must identify the same Linux boot; activation and rehearsal must
+also identify the same preceding/candidate pair. The deployed and restored
+backend/model identities must match the standalone candidate probe. The model
+manifest must bind the report revision to the exact relative paths, sizes, and
+SHA-256 digests of every retained model artifact. The same `--model-root`
+option safely and recursively expands the complete model tree for
+`model-manifest`, `host-profile`, and `production-gate`; do not combine it with
+manually supplied `model` artifacts. The host
+profile must be generated by the active candidate command on the Linux target
+host. It reads the embedded commit without requiring a production Git checkout
+and binds the installed Wheel version, versioned Python
+paths, platform inventory, source commit, and exact name, size, and SHA-256
+identity of every installed package file and every other retained artifact. The
+host profile and fresh deployment-state snapshot also require the canonical
+systemd unit to be active, reloaded, and free of drop-ins, and require
+`nginx -T` to load the exact canonical configuration once without warnings.
+aggregate gate requires the active package path and complete file set to match
+the retained Wheel exactly, rejecting source-checkout shadowing, modified or
+missing files, symlinks, writable files and added bytecode. Production commands
+use the versioned interpreter's `-I -B -u -m turnalign.cli` path so environment
+and user import paths are isolated, bytecode creation is disabled, logs remain
+unbuffered, and the generated console launcher is outside the trust boundary.
+Every gate report must name the
+same source commit,
+and the recorded input digests
+must match the aggregated evidence, preventing stale-report reuse. Lock entries
+must be exact, SHA-256-protected versions. The wheel must be a bounded,
+path-safe pure-Python TurnAlign archive whose embedded source commit matches the
+aggregate gate and whose console entry point and every `RECORD` SHA-256 digest
+and size independently verify;
+the retained systemd unit is parsed independently of comments and must prove
+loopback binding, credential-file authentication, preload, immutable model
+revision enforcement, bounded capacity/lifecycle settings, network isolation,
+a non-root identity, graceful restart/shutdown, and least privilege; the
+retained self-contained Nginx configuration is parsed into a syntax tree and
+must match the public `wss://` host/path plus the systemd loopback endpoint,
+while proving TLS, WebSocket upgrade, rate and connection limits, private
+metrics, disabled retries, and safe proxy/application timeout ordering;
+the SBOM must identify TurnAlign and the WebSocket runtime, include a dependency
+graph, match every installed runtime component to its locked version, and omit
+build-only tooling.
+Missing or weakened evidence returns a non-zero exit code.
+
+When the upstream repository receives a `vX.Y.Z` tag that exactly matches the
+project version, the dedicated release workflow repeats static checks, two
+reproducible builds, the full Wheel-installed suite and SBOM generation before
+creating GitHub/Sigstore provenance for the Wheel, sdist, SBOM and checksums.
+Fork pull requests run only the read-only workflow validation and cannot attest
+artifacts. Verify a downloaded file with
+`gh attestation verify FILE --repo GuanZhengPM/TurnAlign`. The workflow retains
+artifacts for 90 days, pins its bootstrap installer, and removes pip/setuptools
+before recording the runtime SBOM; it does not
+publish to PyPI or create a GitHub Release.
+
+A scoped [Linux CPU systemd and Nginx reference deployment](deploy/README.md)
+is included with loopback binding, TLS proxying, rate limits, an unprivileged
+service profile, preload, and a release checklist. GPU/MPS deployments require
+a separately validated hardware-specific service definition; do not reuse the
+CPU unit unchanged.
 
 Run from source:
 
@@ -380,6 +742,7 @@ Run from source:
 export PYTHONPATH="$PWD/src"
 python -m turnalign.cli doctor --device auto
 python -m turnalign.cli evaluate reference.jsonl hypothesis.jsonl
+python -m turnalign.cli quality-gate reference.jsonl hypothesis.jsonl --max-cer "$MAX_CER"
 python -m unittest discover -s tests -v
 ```
 

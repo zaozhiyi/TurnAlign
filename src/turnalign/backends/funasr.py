@@ -4,11 +4,17 @@ from collections.abc import Iterable
 
 from ..models import AudioChunk, Hypothesis
 from ..plugins import Accelerator, AsrConfig, BackendCapabilities
-from .common import collect_pcm, pcm_to_float32
+from .common import (
+    collect_pcm,
+    local_model_files,
+    pcm_to_float32,
+    require_local_model_path,
+)
 
 
 class FunAsrBackend:
     name = "funasr"
+    session_hints = True
     capabilities = BackendCapabilities(
         streaming=False,
         word_timestamps=False,
@@ -30,9 +36,31 @@ class FunAsrBackend:
         if device == "auto":
             device = "cuda:0" if self._cuda_available() else "cpu"
         options = dict(config.extra or {})
-        self.model = AutoModel(model=config.model or "paraformer-zh", device=device, **options)
+        self._local_model_path = None
+        if config.require_local_model:
+            self._local_model_path = require_local_model_path(
+                config.model_path,
+                directory=True,
+            )
+            model = str(self._local_model_path)
+        else:
+            model = config.model_path or config.model or "paraformer-zh"
+        options.setdefault("disable_update", True)
+        if model == "paraformer-zh" and self._local_model_path is None:
+            options.setdefault(
+                "model_revision",
+                "71684869ca6d8bfa59057d8a367b3fb7345a0c02",
+            )
+        self.model_revision = options.get("model_revision")
+        self.model = AutoModel(model=model, device=device, **options)
         self.language = config.language
         self.hints = config.hints
+
+    def loaded_model_files(self):
+        return local_model_files(self._local_model_path)
+
+    def set_hints(self, hints) -> None:
+        self.hints = hints
 
     @staticmethod
     def _cuda_available() -> bool:

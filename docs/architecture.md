@@ -93,6 +93,34 @@ and boost-present flag. It must never contain the actual private values. Plugin
 authors should preserve this redaction rule even when an upstream runtime uses a
 different request schema.
 
+Built-in backends expose per-lease `set_hints()` support. Their heavy model pool
+key therefore excludes private hints: different vocabulary requests reuse the
+same bounded model replica, and the hints are cleared before the replica becomes
+idle. A third-party backend that does not declare this capability keeps hints in
+its constructor configuration and is discarded rather than pooled after a
+hinted session, preventing private values from remaining in an idle instance.
+Once an entry is detached for eviction, sensitive-session discard, late
+initialization, or service shutdown, backend `close()` failures are logged and
+isolated. Cleanup continues across every remaining entry, and a third-party
+close exception cannot prevent the session sender sentinel or recovery release.
+Session-sensitive discard and normal service shutdown dispatch idle-backend
+cleanup outside their lifecycle deadline. Active backends are detached without
+concurrent close and left to process teardown if their worker cannot return.
+The same best-effort close boundary covers streaming sessions, VAD, alignment,
+offline and online diarization, two-pass refinement, timelines, and preload
+warmup failures. Every resource is attempted; cleanup errors are retained in
+trusted logs rather than replacing the transcription result or primary failure.
+
+The upstream whisper.cpp CLI accepts prompt text only in process arguments, so
+that backend rejects hints by default. Operators must explicitly set
+`allow_prompt_argv=true` after accepting local process-list exposure; event and
+error payloads remain redacted either way.
+
+FSMN-VAD and CAM++ currently use upstream offline APIs that materialize the full
+model input as float audio. Both enforce a three-hour default
+`max_materialized_seconds` guard before that allocation. Operators may raise the
+component option only after calculating the resulting PCM and float-array peak.
+
 ## Event semantics
 
 - `partial`: visible low-latency hypothesis; replaceable.
@@ -125,9 +153,22 @@ The WebSocket server normalizes arbitrary client frames to 20–100 ms internal
 chunks, waits for model initialization before `ready`, reuses loaded models
 through a serialized pool, and rejects client-controlled paths by default.
 Accepted audio is retained on disk while event replay metadata remains in a
-bounded in-memory recovery store; a reconnect resumes sequence/segment numbering
-and replays only events newer than the client's acknowledgement. The default
-bind remains loopback. See `docs/websocket.md`.
+bounded in-memory recovery store with a per-session replay window; a reconnect
+must present both the public session ID and its independent high-entropy secret,
+then resumes sequence/segment numbering and replays only retained events newer
+than the client's acknowledgement. Stale acknowledgements fail explicitly
+rather than producing a partial replay. Accepted chunks are persisted before
+the inference thread can observe them, so event acknowledgement metadata cannot
+race ahead of the recovery timeline. The default bind remains loopback. See
+`docs/websocket.md`.
+
+On cancellation, cooperative backends receive a cancel hook (the bundled
+whisper.cpp adapter terminates its active process). If a Python runtime cannot
+interrupt an in-flight call, the transport still times out cleanly while the
+recovery session remains active until that worker exits, so a reconnect cannot
+race the old writer. A cancel hook that misses its own deadline is detached from
+the pool and quarantined; the same backend instance is never reused or closed
+concurrently, and best-effort cleanup starts only after the hook returns.
 
 ## Realtime and offline pipelines
 

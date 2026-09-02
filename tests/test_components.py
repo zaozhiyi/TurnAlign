@@ -9,6 +9,7 @@ from turnalign.components.funasr import (
     FsmnVadBackend,
     ParaformerAlignmentBackend,
     _aligned_words,
+    _materialization_limit,
 )
 from turnalign.models import AudioChunk, Hypothesis, SpeechSegment
 from turnalign.plugins import Accelerator, BackendCapabilities
@@ -90,12 +91,18 @@ class VadAuditTests(unittest.TestCase):
 
 
 class FunAsrComponentTests(unittest.TestCase):
+    def test_materialization_limit_must_be_finite(self):
+        for value in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                _materialization_limit(value)
+
     def test_fsmn_regions_are_split_and_keep_original_timestamps(self):
         backend = FsmnVadBackend.__new__(FsmnVadBackend)
         backend.model = FakeModel([{"value": [[1000, 4500]]}])
         backend.model_id = "fake-fsmn"
         backend.batch_size_s = 300
         backend.max_segment_seconds = 2.0
+        backend.max_materialized_seconds = 7_200.0
         source = [chunk(1000, 10.0 + index, 1.0) for index in range(5)]
         with patch("turnalign.components.funasr.pcm_to_float32", return_value=[0.0]):
             segments = list(backend.segment(source))
@@ -139,12 +146,34 @@ class FunAsrComponentTests(unittest.TestCase):
         ]}])
         backend.batch_size_s = 300
         backend.merge_gap_seconds = 0.2
+        backend.max_materialized_seconds = 7_200.0
         with patch("turnalign.components.funasr.pcm_to_float32", return_value=[0.0]):
             turns = list(backend.diarize([chunk(1000, 5.0, 3.0)]))
         self.assertEqual([(turn.start, turn.end, turn.speaker) for turn in turns], [
             (5.0, 7.0, "speaker-1"),
             (7.1, 8.0, "speaker-2"),
         ])
+
+    def test_full_input_components_fail_before_oversized_float_materialization(self):
+        fsmn = FsmnVadBackend.__new__(FsmnVadBackend)
+        fsmn.model = FakeModel([])
+        fsmn.model_id = "fake-fsmn"
+        fsmn.batch_size_s = 300
+        fsmn.max_segment_seconds = 20.0
+        fsmn.max_materialized_seconds = 1.0
+        source = [chunk(1000, 0.0, 1.0), chunk(1000, 1.0, 0.1)]
+        with self.assertRaisesRegex(ValueError, "max_materialized_seconds"):
+            list(fsmn.segment(source))
+        self.assertIsNone(fsmn.model.options)
+
+        campp = CamppDiarizationBackend.__new__(CamppDiarizationBackend)
+        campp.model = FakeModel([])
+        campp.batch_size_s = 300
+        campp.merge_gap_seconds = 0.2
+        campp.max_materialized_seconds = 1.0
+        with self.assertRaisesRegex(ValueError, "max_materialized_seconds"):
+            list(campp.diarize(source))
+        self.assertIsNone(campp.model.options)
 
     def test_first_party_components_are_discoverable(self):
         self.assertIn("fsmn-vad", available("vad"))

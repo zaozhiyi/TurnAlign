@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 from .audio import AudioTimeline
 from .fusion import assign_speakers
 from .models import Hypothesis, SpeakerTurn, TranscriptEvent, Word
 from .plugins import AlignmentBackend, AsrBackend, DiarizationBackend
+from .resources import close_resources
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _merged_hypothesis(items: list[Hypothesis], fallback: TranscriptEvent) -> Hypothesis:
@@ -114,8 +118,8 @@ class OfflineRefinementPipeline:
                             )
                     else:
                         words = [
-                            self.aligner.align(item, hypothesis.text)
-                            for item, hypothesis in requests
+                            self.aligner.align(item, text)
+                            for item, text in requests
                         ]
 
                 for event, hypothesis, refined_words, speaker in zip(
@@ -170,8 +174,8 @@ class OfflineRefinementPipeline:
                         },
                     )
         finally:
-            self.backend.close()
-            for component in (self.aligner, self.diarizer):
-                close = getattr(component, "close", None)
-                if callable(close):
-                    close()
+            close_resources(
+                (self.backend, self.aligner, self.diarizer),
+                logger=LOGGER,
+                reason="offline refinement shutdown",
+            )

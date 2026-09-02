@@ -12,6 +12,11 @@ from pathlib import Path
 from typing import BinaryIO
 
 from .models import AudioChunk
+from .processes import (
+    PROCESS_EXIT_TIMEOUT_SECONDS,
+    process_error_tail,
+    terminate_process,
+)
 
 
 def _chunk_bytes(sample_rate: int, channels: int, chunk_ms: int) -> int:
@@ -50,26 +55,55 @@ class AudioTimeline:
         return self.channels * 2
 
     def append(self, chunk: AudioChunk) -> None:
-        if self._closed:
-            raise ValueError("audio timeline is closed")
-        if self.sample_rate is None:
-            self.sample_rate = chunk.sample_rate
-            self.channels = chunk.channels
-            self.start = chunk.start
-            self.end = chunk.start
-        elif (chunk.sample_rate, chunk.channels) != (self.sample_rate, self.channels):
-            raise ValueError("audio format changed while recording timeline")
-        assert self.start is not None
-        frame_seconds = 1 / chunk.sample_rate
-        if chunk.start < self.end - frame_seconds:
-            raise ValueError("audio timeline chunks must not overlap or move backwards")
-        offset = round((chunk.start - self.start) * chunk.sample_rate) * self.frame_bytes
         with self._lock:
-            self._file.seek(offset)
-            self._file.write(chunk.pcm_s16le)
-            self._file.flush()
-        self.end = max(self.end, chunk.start + chunk.duration)
-        self.chunk_count += 1
+            if self._closed:
+                raise ValueError("audio timeline is closed")
+            first_chunk = self.sample_rate is None
+            if not first_chunk and (chunk.sample_rate, chunk.channels) != (
+                self.sample_rate,
+                self.channels,
+            ):
+                raise ValueError("audio format changed while recording timeline")
+            timeline_start = chunk.start if first_chunk else self.start
+            if timeline_start is None:
+                raise RuntimeError("audio timeline start was not initialized")
+            timeline_end = chunk.start if first_chunk else self.end
+            frame_seconds = 1 / chunk.sample_rate
+            if chunk.start < timeline_end - frame_seconds:
+                raise ValueError(
+                    "audio timeline chunks must not overlap or move backwards"
+                )
+            frame_bytes = chunk.channels * 2
+            offset = (
+                round((chunk.start - timeline_start) * chunk.sample_rate)
+                * frame_bytes
+            )
+            self._file.seek(0, 2)
+            original_size = self._file.tell()
+            try:
+                self._file.seek(offset)
+                written = self._file.write(chunk.pcm_s16le)
+                if written != len(chunk.pcm_s16le):
+                    raise OSError("temporary audio file write was incomplete")
+                self._file.flush()
+            except BaseException:
+                try:
+                    self._file.seek(original_size)
+                    self._file.truncate()
+                except (OSError, ValueError):
+                    self._closed = True
+                    try:
+                        self._file.close()
+                    except OSError:
+                        pass
+                raise
+            if first_chunk:
+                self.sample_rate = chunk.sample_rate
+                self.channels = chunk.channels
+                self.start = chunk.start
+                self.end = chunk.start
+            self.end = max(self.end, chunk.start + chunk.duration)
+            self.chunk_count += 1
 
     def slice(self, start: float, end: float) -> AudioChunk:
         if end < start:
@@ -172,23 +206,34 @@ def file_chunks(path: Path, chunk_ms: int = 500, ffmpeg: str = "ffmpeg") -> Iter
         executable, "-nostdin", "-hide_banner", "-loglevel", "error", "-i", str(path),
         "-f", "s16le", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", "-",
     ]
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    assert process.stdout is not None
-    size = _chunk_bytes(16_000, 1, chunk_ms)
-    start = 0.0
-    try:
-        while True:
-            data = process.stdout.read(size)
-            if not data:
-                break
-            yield AudioChunk(data, start)
-            start += len(data) / 32_000
-    finally:
-        process.stdout.close()
-    stderr = process.stderr.read().decode("utf-8", errors="replace") if process.stderr else ""
-    code = process.wait()
-    if code:
-        raise RuntimeError(f"ffmpeg failed with exit code {code}: {stderr.strip()}")
+    # A pipe for stderr can fill while stdout is being streamed and deadlock the
+    # decoder. A temporary file keeps memory bounded and can absorb diagnostics
+    # independently until the process exits.
+    with tempfile.TemporaryFile(mode="w+b") as error_output:
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=error_output)
+        if process.stdout is None:
+            terminate_process(process)
+            raise RuntimeError("ffmpeg stdout pipe was not created")
+        size = _chunk_bytes(16_000, 1, chunk_ms)
+        start = 0.0
+        try:
+            while True:
+                data = process.stdout.read(size)
+                if not data:
+                    break
+                yield AudioChunk(data, start)
+                start += len(data) / 32_000
+            try:
+                code = process.wait(timeout=PROCESS_EXIT_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired as error:
+                raise RuntimeError("ffmpeg did not exit after closing its output") from error
+            if code:
+                detail = process_error_tail(error_output)
+                suffix = f": {detail}" if detail else ""
+                raise RuntimeError(f"ffmpeg failed with exit code {code}{suffix}")
+        finally:
+            process.stdout.close()
+            terminate_process(process)
 
 
 def microphone_chunks(

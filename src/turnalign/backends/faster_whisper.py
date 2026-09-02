@@ -9,6 +9,7 @@ from .common import collect_pcm, pcm_to_float32
 
 class FasterWhisperBackend:
     name = "faster-whisper"
+    session_hints = True
     capabilities = BackendCapabilities(
         streaming=False,
         word_timestamps=True,
@@ -32,6 +33,9 @@ class FasterWhisperBackend:
         self.language = config.language
         self.hints = config.hints
         self.model = WhisperModel(config.model or "small", device=device, compute_type=compute_type)
+
+    def set_hints(self, hints) -> None:
+        self.hints = hints
 
     def transcribe(self, chunks: Iterable[AudioChunk]) -> Iterable[Hypothesis]:
         data, sample_rate, channels, offset = collect_pcm(chunks)

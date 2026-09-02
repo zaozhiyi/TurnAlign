@@ -5,7 +5,11 @@ from typing import Any
 
 from ..models import AudioChunk, Hypothesis
 from ..plugins import Accelerator, AsrConfig, BackendCapabilities
-from .common import pcm_to_float32
+from .common import (
+    local_model_files,
+    pcm_to_float32,
+    require_local_model_path,
+)
 
 
 class FunAsrStreamingSession:
@@ -88,26 +92,44 @@ class FunAsrStreamingSession:
             del self.pending[:target_bytes]
             yield from self._generate(data, final=False)
         if chunk.is_final:
-            yield from self._generate(bytes(self.pending), final=True)
+            emitted = False
+            for hypothesis in self._generate(bytes(self.pending), final=True):
+                emitted = True
+                yield hypothesis
             self.pending.clear()
             self.finished = True
+            if not emitted:
+                yield from self._synthetic_final()
 
-    def finish(self) -> Iterable[Hypothesis]:
-        if self.finished:
-            return
-        self.finished = True
-        if self.pending:
-            yield from self._generate(bytes(self.pending), final=True)
-            self.pending.clear()
-        elif self.last_text and self.start is not None:
+    def _synthetic_final(self) -> Iterator[Hypothesis]:
+        if self.last_text and self.start is not None:
             yield Hypothesis(
                 text=self.last_text,
                 start=self.start,
                 end=self.end,
                 language=self.backend.language,
                 final=True,
-                metadata={"native_streaming": True, "synthetic_final_flush": True},
+                metadata={
+                    "native_streaming": True,
+                    "synthetic_final_flush": True,
+                },
             )
+
+    def finish(self) -> Iterable[Hypothesis]:
+        if self.finished:
+            return
+        self.finished = True
+        if self.start is not None:
+            # FunASR needs an explicit is_final call to flush its look-ahead and CIF
+            # caches. This must also happen when the input duration is an exact
+            # multiple of chunk_ms and there are no pending samples.
+            emitted = False
+            for hypothesis in self._generate(bytes(self.pending), final=True):
+                emitted = True
+                yield hypothesis
+            self.pending.clear()
+            if not emitted:
+                yield from self._synthetic_final()
 
     def cancel(self) -> None:
         self.finished = True
@@ -125,6 +147,7 @@ class FunAsrStreamingBackend:
     """Native incremental Paraformer backend using one cache per session."""
 
     name = "funasr-streaming"
+    session_hints = True
     capabilities = BackendCapabilities(
         streaming=True,
         word_timestamps=False,
@@ -149,6 +172,22 @@ class FunAsrStreamingBackend:
         if device == "auto":
             device = "cuda:0" if self._cuda_available() else "cpu"
         options = dict(config.extra or {})
+        self._local_model_path = None
+        if config.require_local_model:
+            self._local_model_path = require_local_model_path(
+                config.model_path,
+                directory=True,
+            )
+            model = str(self._local_model_path)
+        else:
+            model = config.model_path or config.model or "paraformer-zh-streaming"
+        options.setdefault("disable_update", True)
+        if model == "paraformer-zh-streaming" and self._local_model_path is None:
+            options.setdefault(
+                "model_revision",
+                "562b758fecc801f13079d846d06b0b024fd670c4",
+            )
+        self.model_revision = options.get("model_revision")
         self.chunk_ms = int(options.pop("chunk_ms", 600))
         if not 20 <= self.chunk_ms <= 2_000:
             raise ValueError("FunASR streaming chunk_ms must be between 20 and 2000")
@@ -156,12 +195,18 @@ class FunAsrStreamingBackend:
         self.encoder_chunk_look_back = int(options.pop("encoder_chunk_look_back", 4))
         self.decoder_chunk_look_back = int(options.pop("decoder_chunk_look_back", 1))
         self.model = AutoModel(
-            model=config.model or "paraformer-zh-streaming",
+            model=model,
             device=device,
             **options,
         )
         self.language = config.language or "zh"
         self.hints = config.hints
+
+    def loaded_model_files(self):
+        return local_model_files(self._local_model_path)
+
+    def set_hints(self, hints) -> None:
+        self.hints = hints
 
     @staticmethod
     def _cuda_available() -> bool:

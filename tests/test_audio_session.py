@@ -1,18 +1,21 @@
+import io
+import subprocess
 import tempfile
 import unittest
 import wave
 from array import array
 from pathlib import Path
 from threading import Event
+from unittest.mock import patch
 
-from turnalign.audio import AudioTimeline, wave_chunks, write_wave
+from turnalign.audio import AudioTimeline, file_chunks, wave_chunks, write_wave
 from turnalign.models import AudioChunk, Hypothesis, SpeakerTurn, TranscriptEvent, Word
 from turnalign.offline import OfflineRefinementPipeline
 from turnalign.pipelines import TwoPassPipeline
 from turnalign.plugins import Accelerator, BackendCapabilities
 from turnalign.realtime import RealtimePipeline
 from turnalign.registry import available
-from turnalign.session import pcm_rms, transcribe_events, utterances
+from turnalign.session import live_windows, pcm_rms, transcribe_events, utterances
 from turnalign.validation import EventStreamValidator
 
 
@@ -141,6 +144,15 @@ class FailingRefinementBackend(FakeBatchBackend):
         raise RuntimeError("offline model failed")
 
 
+class FailingRealtimeBackend(FakeBatchBackend):
+    name = "failing-realtime"
+
+    def transcribe(self, chunks):
+        list(chunks)
+        raise RuntimeError("realtime model failed")
+        yield  # pragma: no cover - keeps this method a generator
+
+
 class FakeOnlineDiarizationSession:
     def __init__(self):
         self.closed = False
@@ -167,6 +179,11 @@ class FakeOnlineDiarizer:
 
     def close(self):
         self.closed = True
+
+
+class FailingOnlineDiarizer(FakeOnlineDiarizer):
+    def start_session(self):
+        raise RuntimeError("online session failed")
 
 
 class FakeAligner:
@@ -220,6 +237,37 @@ class CoordinatedDiarizer(FakeDiarizer):
 
 
 class AudioTests(unittest.TestCase):
+    def test_disk_timeline_rolls_back_an_incomplete_write(self):
+        class ShortWriteFile:
+            def __init__(self, wrapped):
+                self.wrapped = wrapped
+
+            def __getattr__(self, name):
+                return getattr(self.wrapped, name)
+
+            def write(self, data):
+                return self.wrapped.write(data[: len(data) // 2])
+
+        timeline = AudioTimeline()
+        try:
+            first = chunk(1_500, 0)
+            timeline.append(first)
+            timeline._file = ShortWriteFile(timeline._file)
+
+            with self.assertRaisesRegex(OSError, "write was incomplete"):
+                timeline.append(chunk(1_500, 0.1))
+
+            self.assertEqual(timeline.chunk_count, 1)
+            self.assertAlmostEqual(timeline.end, 0.1)
+            timeline._file.seek(0, 2)
+            self.assertEqual(timeline._file.tell(), len(first.pcm_s16le))
+            self.assertEqual(
+                timeline.slice(0, 0.1).pcm_s16le,
+                first.pcm_s16le,
+            )
+        finally:
+            timeline.close()
+
     def test_pcm_rms_distinguishes_voice_and_silence(self):
         self.assertEqual(pcm_rms(chunk(0, 0)), 0)
         self.assertGreater(pcm_rms(chunk(2000, 0)), 0.05)
@@ -234,12 +282,166 @@ class AudioTests(unittest.TestCase):
             with wave.open(str(path), "rb") as source:
                 self.assertEqual((source.getframerate(), source.getnchannels()), (16_000, 1))
 
+    def test_file_decoder_reaps_ffmpeg_when_consumer_stops_early(self):
+        class Process:
+            def __init__(self):
+                self.stdout = io.BytesIO(bytes(64_000))
+                self.returncode = None
+                self.terminated = False
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.terminated = True
+                self.returncode = -15
+
+            def kill(self):
+                self.returncode = -9
+
+            def wait(self, timeout=None):
+                del timeout
+                if self.returncode is None:
+                    self.returncode = 0
+                return self.returncode
+
+        process = Process()
+        with (
+            patch("turnalign.audio.shutil.which", return_value="/usr/bin/ffmpeg"),
+            patch("turnalign.audio.subprocess.Popen", return_value=process),
+        ):
+            decoded = file_chunks(Path("recording.mp3"), chunk_ms=100)
+            next(decoded)
+            decoded.close()
+        self.assertTrue(process.terminated)
+        self.assertTrue(process.stdout.closed)
+
+    def test_file_decoder_bounds_ffmpeg_diagnostics(self):
+        class Process:
+            def __init__(self):
+                self.stdout = io.BytesIO()
+                self.returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = -15
+
+            def kill(self):
+                self.returncode = -9
+
+            def wait(self, timeout=None):
+                del timeout
+                if self.returncode is None:
+                    self.returncode = 1
+                return self.returncode
+
+        process = Process()
+
+        def popen(*_args, **kwargs):
+            kwargs["stderr"].write(bytes(70_000) + b"diagnostic-tail")
+            return process
+
+        with (
+            patch("turnalign.audio.shutil.which", return_value="/usr/bin/ffmpeg"),
+            patch("turnalign.audio.subprocess.Popen", side_effect=popen),
+            self.assertRaisesRegex(RuntimeError, "earlier output truncated.*diagnostic-tail") as error,
+        ):
+            list(file_chunks(Path("broken.mp3")))
+        self.assertLess(len(str(error.exception)), 66_000)
+
+    def test_file_decoder_kills_ffmpeg_after_termination_timeout(self):
+        class Process:
+            def __init__(self):
+                self.stdout = io.BytesIO(bytes(64_000))
+                self.returncode = None
+                self.killed = False
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                return None
+
+            def kill(self):
+                self.killed = True
+                self.returncode = -9
+
+            def wait(self, timeout=None):
+                if timeout is not None and self.returncode is None:
+                    raise subprocess.TimeoutExpired("ffmpeg", timeout)
+                return self.returncode
+
+        process = Process()
+        with (
+            patch("turnalign.audio.shutil.which", return_value="/usr/bin/ffmpeg"),
+            patch("turnalign.audio.subprocess.Popen", return_value=process),
+        ):
+            decoded = file_chunks(Path("recording.mp3"), chunk_ms=100)
+            next(decoded)
+            decoded.close()
+        self.assertTrue(process.killed)
+        self.assertEqual(process.returncode, -9)
+
+    def test_file_decoder_bounds_wait_after_output_closes(self):
+        class Process:
+            def __init__(self):
+                self.stdout = io.BytesIO()
+                self.returncode = None
+                self.terminated = False
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.terminated = True
+                self.returncode = -15
+
+            def kill(self):
+                self.returncode = -9
+
+            def wait(self, timeout=None):
+                if timeout is not None and not self.terminated:
+                    raise subprocess.TimeoutExpired("ffmpeg", timeout)
+                return self.returncode
+
+        process = Process()
+        with (
+            patch("turnalign.audio.shutil.which", return_value="/usr/bin/ffmpeg"),
+            patch("turnalign.audio.subprocess.Popen", return_value=process),
+            self.assertRaisesRegex(RuntimeError, "did not exit after closing its output"),
+        ):
+            list(file_chunks(Path("stalled.mp3")))
+        self.assertTrue(process.terminated)
+
     def test_endpointing_keeps_preroll_and_flushes_speech(self):
         source = [chunk(0, 0), chunk(1200, 0.1), chunk(1200, 0.2)]
         source.extend(chunk(0, 0.3 + index * 0.1) for index in range(7))
         groups = list(utterances(source, silence_seconds=0.6))
         self.assertEqual(len(groups), 1)
         self.assertEqual(groups[0][0].start, 0)
+
+    def test_segmentation_settings_must_be_finite(self):
+        source = [chunk(1000, 0)]
+        for value in (float("nan"), float("inf"), float("-inf")):
+            for setting in ("threshold", "silence_seconds", "max_seconds"):
+                with (
+                    self.subTest(api="utterances", setting=setting, value=value),
+                    self.assertRaises(ValueError),
+                ):
+                    list(utterances(source, **{setting: value}))
+            for setting in (
+                "threshold",
+                "silence_seconds",
+                "max_seconds",
+                "partial_seconds",
+            ):
+                with (
+                    self.subTest(api="live_windows", setting=setting, value=value),
+                    self.assertRaises(ValueError),
+                ):
+                    list(live_windows(source, **{setting: value}))
 
     def test_disk_timeline_slices_by_timestamp_without_chunk_scan(self):
         with AudioTimeline() as timeline:
@@ -409,6 +611,55 @@ class SessionTests(unittest.TestCase):
         self.assertTrue(online_diarizer.session.closed)
         self.assertTrue(online_diarizer.closed)
 
+    def test_component_setup_failures_still_close_owned_resources(self):
+        backend = FakeBatchBackend()
+        online_diarizer = FailingOnlineDiarizer()
+        with self.assertRaisesRegex(RuntimeError, "online session failed"):
+            list(transcribe_events(
+                [chunk(1500, 0)],
+                backend,
+                online_diarizer=online_diarizer,
+            ))
+        self.assertTrue(backend.closed)
+        self.assertTrue(online_diarizer.closed)
+
+        backend = FakeBatchBackend()
+        with self.assertRaisesRegex(ValueError, "parallel diarization"):
+            list(transcribe_events(
+                [chunk(1500, 0)],
+                backend,
+                parallel_diarization=True,
+            ))
+        self.assertTrue(backend.closed)
+
+    def test_recording_setup_failure_closes_owned_resources(self):
+        backend = FakeBatchBackend()
+
+        def failing_recording():
+            yield chunk(1500, 0)
+            raise RuntimeError("recording failed")
+
+        with self.assertRaisesRegex(RuntimeError, "recording failed"):
+            list(transcribe_events(
+                [],
+                backend,
+                aligner=FakeAligner(),
+                recorded_audio=failing_recording(),
+            ))
+        self.assertTrue(backend.closed)
+
+    def test_two_pass_realtime_failure_closes_unused_refinement_backend(self):
+        realtime_backend = FailingRealtimeBackend()
+        refinement_backend = RefinementBackend()
+        pipeline = TwoPassPipeline(
+            RealtimePipeline(realtime_backend, silence_seconds=0.1),
+            OfflineRefinementPipeline(refinement_backend),
+        )
+        with self.assertRaisesRegex(RuntimeError, "realtime model failed"):
+            list(pipeline.events([chunk(1500, 0), chunk(0, 0.1)]))
+        self.assertTrue(realtime_backend.closed)
+        self.assertTrue(refinement_backend.closed)
+
     def test_offline_refinement_emits_consistent_speaker_merge(self):
         with AudioTimeline() as timeline:
             timeline.append(chunk(1500, 0))
@@ -424,6 +675,19 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(events[0].metadata["from_speaker"], "speaker-live")
         self.assertEqual(events[0].metadata["to_speaker"], "speaker-1")
         self.assertEqual(events[1].segment_id, commit.segment_id)
+
+    def test_offline_refinement_falls_back_to_single_item_aligner(self):
+        with AudioTimeline() as timeline:
+            timeline.append(chunk(1500, 0))
+            commit = TranscriptEvent(
+                "commit", "seg-000000", 1, 0, 0.1, "draft"
+            )
+            events = list(OfflineRefinementPipeline(
+                RefinementBackend(),
+                aligner=FakeAligner(),
+            ).refine(timeline, [commit]))
+        self.assertEqual([event.kind for event in events], ["replace"])
+        self.assertEqual(events[0].words[0].text, "refined transcript")
 
     def test_two_pass_pipeline_preserves_draft_when_refinement_fails(self):
         pipeline = TwoPassPipeline(

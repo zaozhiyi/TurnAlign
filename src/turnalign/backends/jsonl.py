@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
+from ..jsonutil import strict_json_object
 from ..models import Hypothesis
 from ..plugins import Accelerator, BackendCapabilities
 
@@ -26,15 +26,18 @@ class JsonlBackend:
                 if not line.strip():
                     continue
                 try:
-                    item = json.loads(line)
+                    item = strict_json_object(
+                        line,
+                        label=f"{self.path}:{line_number}",
+                    )
                     yield Hypothesis(
                         text=str(item.get("text", "")).strip(),
-                        start=float(item["start"]),
-                        end=float(item["end"]),
+                        start=float(str(item["start"])),
+                        end=float(str(item["end"])),
                         final=True,
                         metadata={key: value for key, value in item.items() if key not in {"text", "start", "end"}},
                     )
-                except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                except (KeyError, TypeError, ValueError) as error:
                     raise ValueError(f"{self.path}:{line_number}: {error}") from error
 
     def transcribe(self, chunks):

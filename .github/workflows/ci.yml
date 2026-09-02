@@ -3,34 +3,319 @@ name: cross-platform-core
 on:
   push:
   pull_request:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
+  lint:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - run: python -m pip install ruff==0.16.5 bandit==1.8.6 mypy==1.18.2
+      - run: ruff check src tests hatch_build.py
+      - run: bandit -q -r src hatch_build.py -ll
+      - run: mypy --no-error-summary
+      - name: Lint GitHub Actions workflows
+        env:
+          ACTIONLINT_VERSION: "1.7.12"
+          ACTIONLINT_SHA256: "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+        run: |
+          set -euo pipefail
+          archive=$(mktemp)
+          directory=$(mktemp -d)
+          curl --fail --location --silent --show-error \
+            --output "$archive" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  ${archive}" | sha256sum --check -
+          tar -xzf "$archive" -C "$directory"
+          "$directory/actionlint" .github/workflows/*.yml
+      - name: Verify systemd deployment unit
+        run: |
+          set -euo pipefail
+          if ! getent passwd turnalign >/dev/null; then
+            sudo useradd --system --home /var/lib/turnalign-state --shell /usr/sbin/nologin turnalign
+          fi
+          sudo install -d \
+            /opt/turnalign/current/venv/bin \
+            /etc/turnalign \
+            /var/lib/turnalign/models/paraformer-zh-streaming
+          printf '#!/bin/sh\nexec /usr/bin/sleep infinity\n' | sudo tee \
+            /opt/turnalign/current/venv/bin/python >/dev/null
+          sudo chmod 0755 /opt/turnalign/current/venv/bin/python
+          printf 'ci-only-auth-token\n' | sudo tee /etc/turnalign/auth-token >/dev/null
+          sudo chmod 0600 /etc/turnalign/auth-token
+          sudo touch /var/lib/turnalign/warmup.wav
+          systemd-analyze verify deploy/systemd/turnalign.service
+          sudo install -m 0644 deploy/systemd/turnalign.service \
+            /etc/systemd/system/turnalign.service
+          sudo systemctl daemon-reload
+          sudo systemctl start turnalign.service
+          trap 'sudo systemctl stop turnalign.service' EXIT
+          sudo env PYTHONPATH="$GITHUB_WORKSPACE/src" python3 - <<'PY'
+          from pathlib import Path
+
+          from turnalign.production_gate import (
+              _MAX_DEPLOYMENT_CONFIG_BYTES,
+              _capture_systemd_effective_configuration,
+              _snapshot_evidence,
+          )
+
+          path = Path("/etc/systemd/system/turnalign.service")
+          snapshot = _snapshot_evidence(
+              path,
+              capture_limit=_MAX_DEPLOYMENT_CONFIG_BYTES,
+              hard_limit=_MAX_DEPLOYMENT_CONFIG_BYTES,
+          )
+          identity = _capture_systemd_effective_configuration(snapshot)
+          assert identity["fragment_path"] == str(path)
+          assert identity["drop_in_paths"] == []
+          assert identity["need_daemon_reload"] is False
+          assert identity["active_state"] == "active"
+          assert identity["sub_state"] == "running"
+          assert identity["sha256"] == snapshot.sha256
+          PY
+      - name: Exercise systemd network isolation
+        run: |
+          sudo systemd-run --quiet --collect --wait --pipe \
+            --property=IPAddressDeny=any \
+            --property=IPAddressAllow=localhost \
+            /usr/bin/python3 -c '
+          import errno
+          import socket
+
+          loopback = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+          loopback.bind(("127.0.0.1", 0))
+          loopback.close()
+
+          blocked = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+          try:
+              blocked.connect(("192.0.2.1", 9))
+              blocked.send(b"turnalign-egress-probe")
+          except OSError as error:
+              if error.errno not in {errno.EACCES, errno.EPERM}:
+                  raise
+          else:
+              raise SystemExit("non-loopback egress was not blocked")
+          finally:
+              blocked.close()
+          '
+      - name: Exercise immutable Linux release validation
+        run: |
+          set -euo pipefail
+          release_fixture=$(mktemp -d)
+          commit=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+          release_root="$release_fixture/releases"
+          package_root="$release_root/$commit/venv/lib/python3.12/site-packages/turnalign"
+          sudo chown root:root "$release_fixture"
+          sudo chmod 0755 "$release_fixture"
+          sudo install -d -m 0755 \
+            "$package_root" \
+            "$release_root/$commit/venv/bin"
+          printf '%s\n' "$commit" | sudo tee \
+            "$package_root/_source_commit.txt" >/dev/null
+          printf 'VALUE = 1\n' | sudo tee \
+            "$package_root/../dependency.py" >/dev/null
+          sudo chmod 0644 \
+            "$package_root/_source_commit.txt" \
+            "$package_root/../dependency.py"
+          sudo ln -s /usr/bin/python3 "$release_root/$commit/venv/bin/python"
+          sudo env \
+            PYTHONPATH="$GITHUB_WORKSPACE/src" \
+            RELEASE_ROOT="$release_root" \
+            RELEASE_COMMIT="$commit" \
+            python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          from turnalign.deployment_rehearsal import _validate_release_directory
+
+          root = Path(os.environ["RELEASE_ROOT"])
+          commit = os.environ["RELEASE_COMMIT"]
+          dependency = (
+              root
+              / commit
+              / "venv/lib/python3.12/site-packages/dependency.py"
+          )
+          assert _validate_release_directory(root, commit) == root / commit
+          dependency.chmod(0o666)
+          try:
+              _validate_release_directory(root, commit)
+          except ValueError as error:
+              assert "unsafe or mutable entry" in str(error)
+          else:
+              raise SystemExit("mutable dependency unexpectedly passed validation")
+          PY
+      - name: Verify Nginx deployment configuration
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes nginx-light
+          sudo install -d /etc/letsencrypt/live/asr.example.com
+          sudo openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+            -subj /CN=asr.example.com \
+            -keyout /etc/letsencrypt/live/asr.example.com/privkey.pem \
+            -out /etc/letsencrypt/live/asr.example.com/fullchain.pem
+          sudo install -m 0644 deploy/nginx/turnalign.conf.example \
+            /etc/nginx/conf.d/turnalign.conf
+          sudo nginx -t
+          sudo env PYTHONPATH="$GITHUB_WORKSPACE/src" python3 - <<'PY'
+          from pathlib import Path
+
+          from turnalign.production_gate import (
+              _MAX_DEPLOYMENT_CONFIG_BYTES,
+              _capture_nginx_effective_configuration,
+              _snapshot_evidence,
+          )
+
+          path = Path("/etc/nginx/conf.d/turnalign.conf")
+          snapshot = _snapshot_evidence(
+              path,
+              capture_limit=_MAX_DEPLOYMENT_CONFIG_BYTES,
+              hard_limit=_MAX_DEPLOYMENT_CONFIG_BYTES,
+          )
+          identity = _capture_nginx_effective_configuration(snapshot)
+          assert identity["configuration_path"] == str(path)
+          assert identity["loaded_occurrences"] == 1
+          assert identity["warning_free"] is True
+          assert identity["sha256"] == snapshot.sha256
+          PY
+
   test:
+    if: github.event_name != 'schedule'
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-14]
-        python: ["3.10", "3.12"]
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python }}
       - run: python -m pip install --upgrade pip
       - run: python -m pip install ".[server]"
       - run: python -m unittest discover -s tests -v
+      - if: >-
+          matrix.os == 'ubuntu-latest' &&
+          (matrix.python == '3.12' || matrix.python == '3.13' ||
+          matrix.python == '3.14')
+        run: python -O -m unittest discover -s tests -v
       - run: python -m compileall -q src tests
       - run: turnalign doctor --device cpu
 
   package:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
-      - run: python -m pip install --upgrade pip build
-      - run: python -m build --wheel
-      - run: python -m pip install --force-reinstall dist/*.whl
+      - run: >-
+          python -m pip install --upgrade pip==26.0.1 build==1.4.4 twine==6.2.0
+          cyclonedx-bom==7.3.1
+      - name: Bind reproducible build inputs to the checked-out commit
+        run: |
+          echo "SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)" >> "$GITHUB_ENV"
+          echo "TURNALIGN_SOURCE_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+      - run: python -m build --outdir dist-a
+      - run: python -m build --outdir dist-b
+      - run: cmp dist-a/*.whl dist-b/*.whl && cmp dist-a/*.tar.gz dist-b/*.tar.gz
+      - run: python -m twine check dist-a/*
+      - name: Generate reproducible server SBOM
+        run: |
+          python -m venv sbom-env
+          sbom-env/bin/python -m pip install --upgrade \
+            pip==26.0.1 setuptools==80.9.0
+          sbom-env/bin/python -m pip install dist-a/*.whl "websockets==17.1"
+          sbom-env/bin/python -m pip uninstall --yes pip setuptools
+          cyclonedx-py environment sbom-env/bin/python \
+            --pyproject pyproject.toml --mc-type application --sv 1.6 \
+            --output-reproducible --of JSON -o dist-a/sbom.cdx.json
+          cyclonedx-py environment sbom-env/bin/python \
+            --pyproject pyproject.toml --mc-type application --sv 1.6 \
+            --output-reproducible --of JSON -o /tmp/turnalign-sbom.cdx.json
+          cmp dist-a/sbom.cdx.json /tmp/turnalign-sbom.cdx.json
+      - run: >-
+          cd dist-a &&
+          sha256sum -- ./*.whl ./*.tar.gz ./sbom.cdx.json > SHA256SUMS
+      - run: python -m pip install --force-reinstall dist-a/*.whl "websockets==17.1"
+      - run: >-
+          python -c "import pathlib, turnalign;
+          assert 'site-packages' in str(pathlib.Path(turnalign.__file__))"
+      - name: Verify installed wheel source identity
+        run: >-
+          python -c "import importlib.resources, os;
+          value = importlib.resources.files('turnalign').joinpath('_source_commit.txt').read_text();
+          assert value == os.environ['TURNALIGN_SOURCE_COMMIT'] + '\n'"
+      - run: python -m unittest discover -s tests
       - run: turnalign doctor --device cpu
+      - run: turnalign quality-gate --help
+      - run: turnalign release-gate --help
+      - run: turnalign websocket-gate --help
+      - run: turnalign deployment-activate --help
+      - run: turnalign deployment-recover --help
+      - run: turnalign deployment-rehearsal --help
+      - run: turnalign production-gate --help
+      - run: turnalign model-manifest --help
+      - run: turnalign host-profile --help
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: turnalign-distributions
+          path: dist-a/
+          if-no-files-found: error
+          retention-days: 14
+
+  server-minimum-dependency:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.10"
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install "." "websockets==14.0"
+      - run: >-
+          python -m unittest
+          tests.test_server.ServerConfigurationTests.test_standalone_server_exits_cleanly_on_sigterm
+          tests.test_server.WebSocketTests.test_health_readiness_origin_policy_and_graceful_shutdown
+
+  dependency-audit:
+    strategy:
+      matrix:
+        websockets: ["14.0", "17.1"]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - run: >-
+          python -m pip install --upgrade pip pip-audit==2.9.0
+          build==1.4.4 twine==6.2.0 hatchling==1.27.0
+      - run: python -m pip install "." "websockets==${{ matrix.websockets }}"
+      - run: python -m pip_audit
