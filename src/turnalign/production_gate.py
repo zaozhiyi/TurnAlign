@@ -510,6 +510,44 @@ def enumerate_model_files(model_root: Path) -> list[Path]:
     return entries
 
 
+def _canonical_production_model_root(model_root: Path) -> Path:
+    """Resolve and constrain a model root used by production evidence commands."""
+
+    if (
+        not model_root.is_absolute()
+        or Path(os.path.normpath(str(model_root))) != model_root
+    ):
+        raise ValueError("model_root must be an absolute normalized path")
+    try:
+        canonical_root = _MODEL_EVIDENCE_ROOT.resolve(strict=True)
+        resolved = model_root.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ValueError(
+            "production model_root must be a retained model directory under "
+            f"{_MODEL_EVIDENCE_ROOT}"
+        ) from error
+    try:
+        metadata = model_root.lstat()
+    except OSError as error:
+        raise ValueError(
+            "production model_root must be a retained model directory under "
+            f"{_MODEL_EVIDENCE_ROOT}"
+        ) from error
+    if (
+        resolved != model_root
+        or resolved == canonical_root
+        or not resolved.is_relative_to(canonical_root)
+        or stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISDIR(metadata.st_mode)
+        or not _root_owned_immutable(metadata)
+    ):
+        raise ValueError(
+            "production model_root must be a retained model directory under "
+            f"{_MODEL_EVIDENCE_ROOT}"
+        )
+    return resolved
+
+
 def create_model_manifest(
     model_id: str,
     model_revision: str,
@@ -563,6 +601,12 @@ def create_host_profile(
         _reject_pending_deployment_transaction()
         if model_root is None:
             return _create_host_profile_locked(source_commit, artifacts, system)
+        # Unit/integration callers may construct evidence on a non-production
+        # workstation.  The host-profile command itself is a root-only
+        # production operation, so enforce the canonical retained root when it
+        # is actually running with production privileges.
+        if not hasattr(os, "geteuid") or os.geteuid() == 0:
+            _canonical_production_model_root(model_root)
         return _create_host_profile_locked(
             source_commit,
             artifacts,
@@ -711,6 +755,18 @@ def _create_host_profile_locked(
         if model_root is not None
         else _model_artifact_root(model_paths)
     )
+    if model_root is not None:
+        if resolved_model_root is None:  # pragma: no cover - guarded by model_root
+            raise RuntimeError("model_root resolution lost its value")
+        retained_paths = {
+            path.resolve(strict=True) for path in enumerate_model_files(resolved_model_root)
+        }
+        supplied_paths = {path.resolve(strict=True) for path in model_paths}
+        if retained_paths != supplied_paths:
+            raise ValueError(
+                "host-profile model artifacts do not exactly cover every file under "
+                "model_root"
+            )
     for kind, path in artifacts:
         if kind not in expected_kinds:
             raise ValueError(f"unsupported host-profile artifact kind: {kind}")
@@ -1644,16 +1700,31 @@ def _validate_websocket(report: dict[str, object], failures: list[str]) -> None:
     if not _valid_model_id(device):
         failures.append("websocket report has no valid observed device identity")
     loaded_models = report.get("loaded_models")
-    if not isinstance(loaded_models, list) or not loaded_models or any(
-        not isinstance(item, dict)
-        or set(item) != {"path", "sha256", "bytes"}
-        or not isinstance(item.get("path"), str)
-        or not item["path"].startswith("/var/lib/turnalign/models/")
-        or not isinstance(item.get("sha256"), str)
-        or _SHA256_PATTERN.fullmatch(item["sha256"]) is None
-        or not _positive_integer(item.get("bytes"))
-        for item in loaded_models
-    ):
+    loaded_model_paths: set[str] = set()
+    loaded_models_valid = isinstance(loaded_models, list) and bool(loaded_models)
+    if loaded_models_valid:
+        for item in cast(list[object], loaded_models):
+            path = item.get("path") if isinstance(item, dict) else None
+            parsed_path = PurePosixPath(path) if isinstance(path, str) else None
+            valid = (
+                isinstance(item, dict)
+                and set(item) == {"path", "sha256", "bytes"}
+                and isinstance(path, str)
+                and parsed_path is not None
+                and parsed_path.is_absolute()
+                and parsed_path.as_posix() == path
+                and path.startswith("/var/lib/turnalign/models/")
+                and all(part not in {"", ".", ".."} for part in parsed_path.parts)
+                and isinstance(item.get("sha256"), str)
+                and _SHA256_PATTERN.fullmatch(item["sha256"]) is not None
+                and _positive_integer(item.get("bytes"))
+                and path not in loaded_model_paths
+            )
+            if not valid:
+                loaded_models_valid = False
+            elif isinstance(path, str):
+                loaded_model_paths.add(path)
+    if not loaded_models_valid:
         failures.append("websocket report has no bound loaded model evidence")
     probe_sha256 = report.get("probe_audio_sha256")
     if not isinstance(probe_sha256, str) or _SHA256_PATTERN.fullmatch(probe_sha256) is None:
@@ -2230,6 +2301,7 @@ def _validate_model_manifest(
     )
     loaded_files: list[tuple[str, object, object]] = []
     loaded_paths_valid = expected_model_root is not None
+    loaded_path_strings: set[str] = set()
     for item in expected_loaded_models:
         if not isinstance(item, dict) or not isinstance(item.get("path"), str):
             loaded_paths_valid = False
@@ -2243,9 +2315,11 @@ def _validate_model_manifest(
             or expected_model_root is None
             or loaded_path == expected_model_root
             or not loaded_path.is_relative_to(expected_model_root)
+            or raw_loaded_path in loaded_path_strings
         ):
             loaded_paths_valid = False
             continue
+        loaded_path_strings.add(raw_loaded_path)
         loaded_files.append((
             loaded_path.relative_to(expected_model_root).as_posix(),
             item.get("sha256"),
@@ -2826,20 +2900,31 @@ def _validate_rehearsal_readiness(
             f"{label} did not prove preloaded readiness"
         )
     loaded_models = payload.get("loaded_models")
-    if (
-        not isinstance(loaded_models, list)
-        or not loaded_models
-        or any(
-            not isinstance(item, dict)
-            or set(item) != {"path", "sha256", "bytes"}
-            or not isinstance(item.get("path"), str)
-            or not item["path"].startswith("/var/lib/turnalign/models/")
-            or not isinstance(item.get("sha256"), str)
-            or _SHA256_PATTERN.fullmatch(item["sha256"]) is None
-            or not _positive_integer(item.get("bytes"))
-            for item in loaded_models
-        )
-    ):
+    loaded_paths: set[str] = set()
+    loaded_models_valid = isinstance(loaded_models, list) and bool(loaded_models)
+    if loaded_models_valid:
+        for item in cast(list[object], loaded_models):
+            path = item.get("path") if isinstance(item, dict) else None
+            parsed_path = PurePosixPath(path) if isinstance(path, str) else None
+            valid = (
+                isinstance(item, dict)
+                and set(item) == {"path", "sha256", "bytes"}
+                and isinstance(path, str)
+                and parsed_path is not None
+                and parsed_path.is_absolute()
+                and parsed_path.as_posix() == path
+                and path.startswith("/var/lib/turnalign/models/")
+                and all(part not in {"", ".", ".."} for part in parsed_path.parts)
+                and isinstance(item.get("sha256"), str)
+                and _SHA256_PATTERN.fullmatch(item["sha256"]) is not None
+                and _positive_integer(item.get("bytes"))
+                and path not in loaded_paths
+            )
+            if not valid:
+                loaded_models_valid = False
+            elif isinstance(path, str):
+                loaded_paths.add(path)
+    if not loaded_models_valid:
         failures.append(f"{label} did not retain loaded model evidence")
 
 
@@ -3295,6 +3380,16 @@ def run_production_gate(
     artifact_digests: dict[str, list[str]] = {}
     artifact_snapshots: dict[str, list[_EvidenceSnapshot]] = {}
     effective_model_root = model_root
+    model_root_valid = model_root is None
+    if model_root is not None:
+        try:
+            effective_model_root = _canonical_production_model_root(model_root)
+            model_root_valid = True
+        except ValueError as error:
+            # Keep aggregating the remaining evidence so callers receive one
+            # complete verdict, while never allowing an out-of-tree model root
+            # to produce a passing production gate.
+            failures.append(str(error))
     if effective_model_root is None:
         effective_model_root = _model_artifact_root(
             [path for kind, path in artifacts if kind == "model"]
@@ -3328,6 +3423,22 @@ def run_production_gate(
         artifact_paths.setdefault(kind, []).append(path)
         artifact_digests.setdefault(kind, []).append(snapshot.sha256)
         artifact_snapshots.setdefault(kind, []).append(snapshot)
+    if model_root is not None and model_root_valid and effective_model_root is not None:
+        try:
+            retained_paths = {
+                path.resolve(strict=True)
+                for path in enumerate_model_files(effective_model_root)
+            }
+            supplied_paths = {
+                path.resolve(strict=True)
+                for path in artifact_paths.get("model", [])
+            }
+            if retained_paths != supplied_paths:
+                failures.append(
+                    "model artifacts do not exactly cover every file under model_root"
+                )
+        except (OSError, RuntimeError, ValueError) as error:
+            failures.append(f"cannot validate retained model tree: {error}")
     for missing in sorted(REQUIRED_ARTIFACT_KINDS - kinds):
         failures.append(f"missing required artifact kind: {missing}")
     for kind in sorted(REQUIRED_ARTIFACT_KINDS - {"model"}):

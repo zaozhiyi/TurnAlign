@@ -1099,6 +1099,18 @@ class ProductionGateTests(unittest.TestCase):
                     "websocket and release reports identify different backends",
                 ),
                 (
+                    lambda payload: payload["loaded_models"].append(
+                        dict(payload["loaded_models"][0])
+                    ),
+                    "no bound loaded model evidence",
+                ),
+                (
+                    lambda payload: payload["loaded_models"][0].update(
+                        path="/var/lib/turnalign/models//paraformer-zh-streaming/model.evidence"
+                    ),
+                    "no bound loaded model evidence",
+                ),
+                (
                     lambda payload: payload.update(ready_seconds_p95=1.0),
                     "latency p95 does not match per-session evidence",
                 ),
@@ -1280,6 +1292,12 @@ class ProductionGateTests(unittest.TestCase):
                 "loaded runtime model evidence does not exactly match the retained "
                 "model manifest",
                 report.failures,
+            )
+            self.assertTrue(
+                any(
+                    "production model_root must be a retained model directory" in failure
+                    for failure in report.failures
+                )
             )
 
     def test_rejects_invalid_or_record_tampered_wheel(self):
