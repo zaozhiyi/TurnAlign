@@ -28,6 +28,11 @@ For the reference CPU profile, create a target-specific, hash-locked dependency
 set and install each source commit into a new release directory before the
 wheel. Never update the active virtual environment in place:
 
+The commands below intentionally resolve `websockets==17.1`, which requires
+Python 3.11 or newer; use Python 3.12 for this reference profile. A Python 3.10
+deployment must resolve a compatible WebSocket release and regenerate both the
+lock file and SBOM for that target instead of reusing this lock.
+
 ```bash
 uv pip compile pyproject.toml --extra server --extra funasr \
   --generate-hashes --output-file requirements.lock
