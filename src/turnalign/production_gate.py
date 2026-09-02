@@ -605,7 +605,9 @@ def create_host_profile(
         # workstation.  The host-profile command itself is a root-only
         # production operation, so enforce the canonical retained root when it
         # is actually running with production privileges.
-        if not hasattr(os, "geteuid") or os.geteuid() == 0:
+        if os.name != "nt" and platform.system() == "Linux" and (
+            not hasattr(os, "geteuid") or os.geteuid() == 0
+        ):
             _canonical_production_model_root(model_root)
         return _create_host_profile_locked(
             source_commit,
