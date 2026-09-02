@@ -19,6 +19,7 @@ from turnalign.production_gate import (
     REQUIRED_ARTIFACT_KINDS,
     create_deployment_state,
     create_host_profile,
+    enumerate_model_files,
     run_production_gate,
     write_json_report,
 )
@@ -1210,6 +1211,22 @@ class ProductionGateTests(unittest.TestCase):
                 with self.subTest(expected=expected):
                     self.assertFalse(report.passed)
                     self.assertIn(expected, "\n".join(report.failures))
+
+    def test_model_tree_enforces_immutability_under_canonical_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "models"
+            root.mkdir()
+            (root / "weights.bin").write_bytes(b"weights")
+            with patch.object(
+                production_gate_module,
+                "_MODEL_EVIDENCE_ROOT",
+                root.resolve(),
+            ), patch.object(
+                production_gate_module,
+                "_root_owned_immutable",
+                return_value=False,
+            ), self.assertRaisesRegex(ValueError, "canonical model root"):
+                enumerate_model_files(root)
 
     def test_loaded_model_path_is_bound_to_model_identity_and_file_name(self):
         with tempfile.TemporaryDirectory() as directory:

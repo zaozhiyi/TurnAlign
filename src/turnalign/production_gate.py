@@ -440,6 +440,11 @@ def _valid_model_id(value: object) -> bool:
 def enumerate_model_files(model_root: Path) -> list[Path]:
     """Safely enumerate every regular file retained under a model root."""
 
+    if (
+        not model_root.is_absolute()
+        or Path(os.path.normpath(str(model_root))) != model_root
+    ):
+        raise ValueError("model_root must be an absolute normalized path")
     try:
         resolved_root = model_root.resolve(strict=True)
         root_metadata = model_root.lstat()
@@ -447,6 +452,24 @@ def enumerate_model_files(model_root: Path) -> list[Path]:
         raise ValueError(f"model_root is unavailable: {model_root}") from error
     if stat.S_ISLNK(root_metadata.st_mode) or not resolved_root.is_dir():
         raise ValueError(f"model_root must be a non-symlink directory: {model_root}")
+    immutable_required = (
+        resolved_root == _MODEL_EVIDENCE_ROOT
+        or resolved_root.is_relative_to(_MODEL_EVIDENCE_ROOT)
+    )
+    if immutable_required:
+        for ancestor in tuple(reversed(resolved_root.parents)) + (resolved_root,):
+            try:
+                metadata = ancestor.lstat()
+            except OSError as error:
+                raise ValueError(
+                    f"model root ancestor is unavailable: {ancestor}"
+                ) from error
+            if not stat.S_ISDIR(metadata.st_mode) or not _root_owned_immutable(metadata):
+                raise ValueError(
+                    "canonical model root and all ancestors must be root-owned "
+                    "and not writable by group/others: "
+                    f"{ancestor}"
+                )
 
     entries: list[Path] = []
     total_size = 0
@@ -461,12 +484,20 @@ def enumerate_model_files(model_root: Path) -> list[Path]:
         for name in directory_names:
             child = directory_path / name
             metadata = child.lstat()
-            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISDIR(metadata.st_mode)
+                or (immutable_required and not _root_owned_immutable(metadata))
+            ):
                 raise ValueError(f"model tree contains an unsafe directory: {child}")
         for name in file_names:
             child = directory_path / name
             metadata = child.lstat()
-            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISREG(metadata.st_mode)
+                or (immutable_required and not _root_owned_immutable(metadata))
+            ):
                 raise ValueError(f"model tree contains an unsafe file: {child}")
             if metadata.st_size <= 0:
                 raise ValueError(f"model tree contains an empty file: {child}")

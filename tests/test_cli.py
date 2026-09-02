@@ -949,6 +949,28 @@ class CliIntegrationTests(unittest.TestCase):
             ]), self.assertRaisesRegex(ValueError, "contains no regular files"):
                 cli.main()
 
+    def test_model_manifest_requires_absolute_normalized_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "model.bin").write_bytes(b"model")
+            arguments = [
+                "turnalign",
+                "model-manifest",
+                "--model-id",
+                "model",
+                "--model-revision",
+                "a" * 40,
+                "--model-root",
+                str(root / ".." / root.name),
+                "--output",
+                str(root / "manifest.json"),
+            ]
+            with patch("sys.argv", arguments), self.assertRaisesRegex(
+                ValueError,
+                "absolute normalized",
+            ):
+                cli.main()
+
     def test_model_root_cannot_duplicate_explicit_model_artifacts(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
