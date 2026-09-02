@@ -88,6 +88,16 @@ class MetricsAccessTests(unittest.TestCase):
                 "sha256": "a" * 64,
                 "bytes": 12,
             }])
+        for path in (
+            "/var/lib/turnalign/models/../model.bin",
+            "/var/lib/turnalign/models/model//weights.bin",
+        ):
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                _loaded_models([{
+                    "path": path,
+                    "sha256": "a" * 64,
+                    "bytes": 12,
+                }])
 
     def test_probe_audio_is_non_silent_and_length_bound(self):
         audio = _probe_audio_material(

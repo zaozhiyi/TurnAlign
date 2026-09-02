@@ -11,7 +11,7 @@ import wave
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from math import ceil, isfinite
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from time import perf_counter
 from typing import cast
 from urllib.parse import urlsplit
@@ -165,9 +165,17 @@ def _loaded_model_entry(value: object) -> dict[str, object] | None:
     path = value.get("path")
     digest = value.get("sha256")
     size = value.get("bytes")
+    parsed_path = PurePosixPath(path) if isinstance(path, str) else None
+    model_root = PurePosixPath("/var/lib/turnalign/models")
     if (
         not isinstance(path, str)
-        or not path.startswith("/var/lib/turnalign/models/")
+        or parsed_path is None
+        or not parsed_path.is_absolute()
+        or parsed_path.as_posix() != path
+        or parsed_path == model_root
+        or not parsed_path.is_relative_to(model_root)
+        or any(part in {"", ".", ".."} for part in parsed_path.parts)
+        or any(ord(character) < 32 or ord(character) == 127 for character in path)
         or not isinstance(digest, str)
         or len(digest) != 64
         or not all(character in "0123456789abcdef" for character in digest)
